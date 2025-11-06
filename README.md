@@ -37,8 +37,13 @@ The project provides forward **and** backward paths, single-node multi-GPU execu
 │  │  ├─ nccl_comm.h
 │  │  └─ nccl_comm.cpp          </span><span># EP group + A2A/Gather/RS/AR helpers</span><span>
 │  ├─ attention/
-│  │  ├─ flash_dmla_fwd.cu
-│  │  └─ flash_dmla_bwd.cu
+│  │  ├─ vanalla_attn.cu
+│  │  ├─ fa_fwd.cu
+│  │  ├─ fa2_fwd.cu
+│  │  ├─ fa2_bwd.cu
+│  │  ├─ fa2_bwd_mpi.cu
+│  │  ├─ fa2_dmla_fwd.cu
+│  │  └─ fa2_dmla_bwd.cu
 │  └─ moe/
 │     ├─ router_topk.cu
 │     ├─ pack_dispatch.cu
