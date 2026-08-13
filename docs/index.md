@@ -23,6 +23,10 @@
 | [8. 对称内存与 One-sided MoE](chapters/08-one-sided-symmetric-memory.md) | PGAS、data/flag 协议、时间缓冲与内存代价 | `symmetric_memory.py` |
 | [练习](exercises.md) | 从公式、reference 到 kernel 的递进任务 | 全仓库 |
 
+面试准备可先阅读[AI Infra 面试整理](infra-interview-guide.md)，再使用
+[AI Infra 高压模拟面试](infra-mock-interview.md)限时作答。两者基于根目录 notebook 和当前
+仓库事实，把已验证结果、个人贡献与设计目标分开。
+
 第零章只要求线性代数和基本并发概念；第一、二章在此基础上进入在线 Softmax 与 tiled
 Attention。第三至七章还需要了解 Transformer、MPI/NCCL 集合通信、PyTorch autograd
 与 dispatcher；第八章在 EP 基线上进一步讨论 one-sided 通信与显式同步。

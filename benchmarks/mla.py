@@ -25,7 +25,9 @@ def parse_args() -> argparse.Namespace:
         default="float32",
     )
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--implementation", choices=("naive", "absorbed"), default="absorbed")
+    parser.add_argument(
+        "--implementation", choices=("naive", "absorbed", "cuda"), default="absorbed"
+    )
     parser.add_argument(
         "--workload",
         choices=(

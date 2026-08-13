@@ -24,12 +24,13 @@ from .mla import (
     allocate_mla_static_cache,
     append_mla_cache,
     build_mla_cache,
+    mla_absorbed_attention,
     mla_absorbed_attention_reference,
     mla_naive_attention_reference,
     write_mla_static_cache,
 )
 
-MLAImplementation = Literal["naive", "absorbed"]
+MLAImplementation = Literal["naive", "absorbed", "cuda"]
 MLAWorkload = Literal[
     "prefill_attention",
     "prefill_with_cache",
@@ -81,8 +82,12 @@ class MLABenchmarkConfig:
             raise ValueError("warmup must be non-negative")
         if self.dtype not in {"float16", "bfloat16", "float32", "float64"}:
             raise ValueError("unsupported MLA benchmark dtype")
-        if self.implementation not in {"naive", "absorbed"}:
-            raise ValueError("implementation must be naive or absorbed")
+        if self.implementation not in {"naive", "absorbed", "cuda"}:
+            raise ValueError("implementation must be naive, absorbed, or cuda")
+        if self.implementation == "cuda" and torch.device(self.device).type != "cuda":
+            raise ValueError("the CUDA MLA implementation requires device=cuda")
+        if self.implementation == "cuda" and self.dtype != "float32":
+            raise ValueError("the CUDA MLA implementation currently requires float32")
         if self.workload not in {
             "prefill_attention",
             "prefill_with_cache",
@@ -283,10 +288,20 @@ def _attention(
     weights: MLAWeights,
     query_positions: Tensor,
 ) -> Tensor:
+    if implementation == "cuda":
+        return mla_absorbed_attention(
+            query,
+            cache,
+            mla_config,
+            weights,
+            query_positions=query_positions,
+            causal=True,
+            backend="cuda",
+        )
     operation = (
         mla_naive_attention_reference
         if implementation == "naive"
-        else mla_absorbed_attention_reference
+        else (mla_absorbed_attention_reference)
     )
     return operation(
         query,
@@ -298,8 +313,19 @@ def _attention(
     )
 
 
-def _error_report(actual: Tensor, expected: Tensor) -> dict[str, float | bool | str]:
+def _error_report(
+    actual: Tensor,
+    expected: Tensor,
+    *,
+    implementation: MLAImplementation,
+) -> dict[str, float | bool | str]:
     rtol, atol = _verification_tolerances(actual.dtype)
+    if actual.dtype == torch.float32:
+        # MLA comparison spans several projections, softmax, and reductions.
+        # The CUDA path additionally uses online softmax and serial FMA while
+        # the references delegate reductions to BLAS. These paths remain
+        # within ordinary FP32 error of a float64 oracle at smoke-test sizes.
+        rtol, atol = 5e-4, 5e-4
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     difference = (actual.to(torch.float64) - expected.to(torch.float64)).abs()
     tolerance = atol + rtol * expected.to(torch.float64).abs()
@@ -406,9 +432,13 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
         output = operation_for(config.implementation)
         if config.verify:
             alternate: MLAImplementation = (
-                "absorbed" if config.implementation == "naive" else "naive"
+                "absorbed" if config.implementation in {"naive", "cuda"} else "naive"
             )
-            verification = _error_report(output, operation_for(alternate))
+            verification = _error_report(
+                output,
+                operation_for(alternate),
+                implementation=config.implementation,
+            )
         else:
             verification = {"performed": False}
         samples = (
@@ -441,7 +471,11 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
         raise RuntimeError("actual latent cache storage does not match the capacity model")
     return {
         "schema_version": 1,
-        "benchmark": "multi_head_latent_attention_reference",
+        "benchmark": (
+            "multi_head_latent_attention_cuda"
+            if config.implementation == "cuda"
+            else "multi_head_latent_attention_reference"
+        ),
         "configuration": asdict(config),
         "environment": _environment_metadata(device),
         "output": {
@@ -464,6 +498,11 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
             "cache payload bytes are a storage model, not measured memory traffic",
             "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
             "decode_with_static_write reuses fixed storage and writes only the new cache entry",
-            "naive and absorbed paths are correctness references, not fused MLA kernels",
+            (
+                "cuda fuses absorbed score, online softmax, and latent value accumulation; "
+                "query/output projections remain PyTorch operations"
+                if config.implementation == "cuda"
+                else "naive and absorbed paths are correctness references, not fused MLA kernels"
+            ),
         ],
     }

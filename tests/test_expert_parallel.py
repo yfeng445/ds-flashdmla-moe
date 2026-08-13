@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import socket
 import tempfile
 
 import pytest
@@ -427,14 +428,33 @@ def _expert_parallel_worker(rank: int, world_size: int, init_file: str) -> None:
         dist.destroy_process_group()
 
 
+def _loopback_interface() -> str | None:
+    available = {name for _, name in socket.if_nameindex()}
+    for candidate in ("lo", "lo0"):
+        if candidate in available:
+            return candidate
+    return None
+
+
 @pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="Gloo distributed backend is unavailable",
 )
 def test_two_rank_gloo_expert_parallel_protocol() -> None:
+    loopback = _loopback_interface()
+    if loopback is None:
+        pytest.skip("no loopback network interface is available")
     with tempfile.TemporaryDirectory() as directory:
         init_file = os.path.join(directory, "process-group-init")
-        mp.spawn(_expert_parallel_worker, args=(2, init_file), nprocs=2, join=True)
+        previous_interface = os.environ.get("GLOO_SOCKET_IFNAME")
+        os.environ["GLOO_SOCKET_IFNAME"] = loopback
+        try:
+            mp.spawn(_expert_parallel_worker, args=(2, init_file), nprocs=2, join=True)
+        finally:
+            if previous_interface is None:
+                os.environ.pop("GLOO_SOCKET_IFNAME", None)
+            else:
+                os.environ["GLOO_SOCKET_IFNAME"] = previous_interface
 
 
 def test_expert_parallel_requires_an_initialized_process_group() -> None:

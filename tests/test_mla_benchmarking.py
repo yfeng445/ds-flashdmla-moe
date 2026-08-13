@@ -1,11 +1,24 @@
 import pytest
+import torch
 
 from ds_flash_mla_moe.mla_benchmarking import (
     MLABenchmarkConfig,
+    _error_report,
     benchmark_mla,
     mla_cache_storage_estimate,
     mla_work_estimate,
 )
+
+
+@pytest.mark.parametrize("implementation", ["naive", "absorbed", "cuda"])
+def test_mla_error_report_uses_composed_fp32_tolerance(implementation: str) -> None:
+    expected = torch.tensor([1.0], dtype=torch.float32)
+    actual = expected + 4e-4
+
+    report = _error_report(actual, expected, implementation=implementation)  # type: ignore[arg-type]
+
+    assert report["rtol"] == report["atol"] == 5e-4
+    assert report["max_tolerance_ratio"] <= 1
 
 
 def _small_config(**overrides) -> MLABenchmarkConfig:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from setuptools import setup
@@ -13,6 +14,8 @@ def native_build_configuration() -> dict[str, object]:
         return {}
 
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+    cxx_args = ["/O2", "/std:c++17"] if sys.platform == "win32" else ["-O3", "-std=c++17"]
 
     extension = CUDAExtension(
         name="ds_flash_mla_moe._C",
@@ -25,9 +28,10 @@ def native_build_configuration() -> dict[str, object]:
             "csrc/moe/expert_major_pack_cuda.cu",
             "csrc/moe/grouped_topk_cuda.cu",
             "csrc/moe/swiglu_experts_cuda.cu",
+            "csrc/mla/mla_absorbed_attention_cuda.cu",
         ],
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"],
+            "cxx": cxx_args,
             "nvcc": ["-O3", "-std=c++17", "-lineinfo"],
         },
     )
@@ -49,6 +53,7 @@ def assert_native_sources_present() -> None:
         Path("csrc/moe/expert_major_pack_cuda.cu"),
         Path("csrc/moe/grouped_topk_cuda.cu"),
         Path("csrc/moe/swiglu_experts_cuda.cu"),
+        Path("csrc/mla/mla_absorbed_attention_cuda.cu"),
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:

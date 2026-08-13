@@ -21,6 +21,7 @@ from .moe import RoutingResult, deepseek_grouped_topk, pack_routes_reference
 
 AttentionBackend = Literal["auto", "cuda", "reference"]
 GEMMBackend = Literal["auto", "cuda", "reference"]
+MLABackend = Literal["auto", "cuda", "reference"]
 
 _LIBRARY_HANDLES: list[torch.library.Library] = []
 _NATIVE_EXTENSION_LOADED = False
@@ -101,6 +102,11 @@ _GROUPED_TOPK_SCHEMA = (
     "grouped_topk(Tensor x, Tensor gate_weight, int topk, int n_groups, "
     "int topk_groups, Tensor? score_bias, float route_scale) -> (Tensor, Tensor)"
 )
+_MLA_ABSORBED_ATTENTION_SCHEMA = (
+    "mla_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv, Tensor pe, "
+    "Tensor key_up, Tensor value_up, Tensor query_positions, Tensor key_positions, "
+    "bool causal, float scale) -> Tensor"
+)
 _SCHEMAS = {
     "attention_forward": _FORWARD_SCHEMA,
     "attention_backward": _BACKWARD_SCHEMA,
@@ -110,6 +116,7 @@ _SCHEMAS = {
     "swiglu_experts": _SWIGLU_EXPERTS_SCHEMA,
     "expert_major_pack": _EXPERT_MAJOR_PACK_SCHEMA,
     "grouped_topk": _GROUPED_TOPK_SCHEMA,
+    "mla_absorbed_attention": _MLA_ABSORBED_ATTENTION_SCHEMA,
 }
 _missing_schemas = {
     operator: schema for operator, schema in _SCHEMAS.items() if not _operator_is_defined(operator)
@@ -291,6 +298,47 @@ def _composite_grouped_topk(
     return routing.weights, routing.indices
 
 
+def _composite_mla_absorbed_attention(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv: Tensor,
+    pe: Tensor,
+    key_up: Tensor,
+    value_up: Tensor,
+    query_positions: Tensor,
+    key_positions: Tensor,
+    causal: bool,
+    scale: float,
+) -> Tensor:
+    compute_dtype = torch.float64 if q_nope.dtype == torch.float64 else torch.float32
+    q_nope_compute = q_nope.to(compute_dtype)
+    q_pe_compute = q_pe.to(compute_dtype)
+    kv_compute = kv.to(compute_dtype)
+    pe_compute = pe.to(compute_dtype)
+    q_latent = torch.einsum("bshd,hdr->bshr", q_nope_compute, key_up.to(compute_dtype))
+    scores = (
+        torch.einsum("bshr,btr->bhst", q_latent, kv_compute)
+        + torch.einsum("bshd,btd->bhst", q_pe_compute, pe_compute)
+    ) * scale
+    if causal:
+        keep = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+        scores = scores.masked_fill(~keep, -torch.inf)
+    row_max = scores.amax(dim=-1, keepdim=True)
+    finite_row = torch.isfinite(row_max)
+    shifted = torch.where(finite_row, scores - row_max, torch.full_like(scores, -torch.inf))
+    numerators = torch.exp(shifted)
+    denominator = numerators.sum(dim=-1, keepdim=True)
+    probabilities = torch.where(
+        denominator > 0,
+        numerators / denominator.clamp_min(torch.finfo(compute_dtype).tiny),
+        torch.zeros_like(numerators),
+    )
+    latent_output = torch.einsum("bhst,btr->bshr", probabilities, kv_compute)
+    return torch.einsum("bshr,hdr->bshd", latent_output, value_up.to(compute_dtype)).to(
+        q_nope.dtype
+    )
+
+
 def _tensorized_swiglu_experts_reference(
     activations: Tensor,
     expert_offsets: Tensor,
@@ -452,6 +500,51 @@ def _fake_grouped_topk(
     )
 
 
+def _fake_mla_absorbed_attention(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv: Tensor,
+    pe: Tensor,
+    key_up: Tensor,
+    value_up: Tensor,
+    query_positions: Tensor,
+    key_positions: Tensor,
+    causal: bool,
+    scale: float,
+) -> Tensor:
+    del causal
+    torch._check(q_nope.ndim == 4 and q_pe.ndim == 4)
+    torch._check(kv.ndim == 3 and pe.ndim == 3)
+    torch._check(key_up.ndim == 3 and value_up.ndim == 3)
+    torch._check(query_positions.ndim == 1 and key_positions.ndim == 1)
+    torch._check(q_nope.shape[:3] == q_pe.shape[:3])
+    torch._check(kv.shape[:2] == pe.shape[:2])
+    torch._check(q_nope.shape[0] == kv.shape[0])
+    torch._check(q_nope.shape[2] == key_up.shape[0])
+    torch._check(key_up.shape[0] == value_up.shape[0])
+    torch._check(q_nope.shape[3] == key_up.shape[1])
+    torch._check(q_pe.shape[3] == pe.shape[2])
+    torch._check(kv.shape[2] == key_up.shape[2])
+    torch._check(key_up.shape[2] == value_up.shape[2])
+    torch._check(query_positions.shape[0] == q_nope.shape[1])
+    torch._check(key_positions.shape[0] == kv.shape[1])
+    torch._check(
+        q_nope.device
+        == q_pe.device
+        == kv.device
+        == pe.device
+        == key_up.device
+        == value_up.device
+        == query_positions.device
+        == key_positions.device
+    )
+    for tensor in (q_nope, q_pe, kv, pe, key_up, value_up):
+        torch._check(tensor.is_floating_point())
+    torch._check(query_positions.dtype == torch.long and key_positions.dtype == torch.long)
+    torch._check(math.isfinite(scale))
+    return q_nope.new_empty((q_nope.shape[0], q_nope.shape[1], q_nope.shape[2], value_up.shape[1]))
+
+
 composite_explicit = torch.library.Library("ds_flash_mla_moe", "IMPL", "CompositeExplicitAutograd")
 composite_explicit.impl("attention_forward", _composite_attention_forward)
 composite_explicit.impl("route_pack", _composite_route_pack)
@@ -460,6 +553,7 @@ composite_explicit.impl("tiled_gemm", _composite_tiled_gemm)
 composite_explicit.impl("swiglu_experts", _composite_swiglu_experts)
 composite_explicit.impl("expert_major_pack", _composite_expert_major_pack)
 composite_explicit.impl("grouped_topk", _composite_grouped_topk)
+composite_explicit.impl("mla_absorbed_attention", _composite_mla_absorbed_attention)
 _LIBRARY_HANDLES.append(composite_explicit)
 
 composite_implicit = torch.library.Library("ds_flash_mla_moe", "IMPL", "CompositeImplicitAutograd")
@@ -473,6 +567,9 @@ torch.library.register_fake("ds_flash_mla_moe::tiled_gemm", _fake_tiled_gemm)
 torch.library.register_fake("ds_flash_mla_moe::swiglu_experts", _fake_swiglu_experts)
 torch.library.register_fake("ds_flash_mla_moe::expert_major_pack", _fake_expert_major_pack)
 torch.library.register_fake("ds_flash_mla_moe::grouped_topk", _fake_grouped_topk)
+torch.library.register_fake(
+    "ds_flash_mla_moe::mla_absorbed_attention", _fake_mla_absorbed_attention
+)
 
 
 def _attention_setup_context(ctx, inputs, output) -> None:
@@ -508,7 +605,7 @@ def _attention_backward(context, grad_output: Tensor):
             None,
         )
     with torch.enable_grad():
-        gradients = torch.ops.ds_flash_mla_moe.attention_backward.default(
+        gradients = _composite_attention_backward(
             grad_output, q, k, v, context.causal, context.scale
         )
     return (*gradients, None, None)
@@ -722,6 +819,47 @@ torch.library.register_autograd(
 )
 
 
+def _mla_absorbed_attention_setup_context(ctx, inputs, output) -> None:
+    del output
+    ctx.save_for_backward(*inputs[:8])
+    ctx.causal = inputs[8]
+    ctx.scale = inputs[9]
+
+
+def _mla_absorbed_attention_backward(context, grad_output: Tensor):
+    tensors = context.saved_tensors
+    requested = [
+        tensor for index, tensor in enumerate(tensors[:6]) if context.needs_input_grad[index]
+    ]
+    requested_positions = [index for index in range(6) if context.needs_input_grad[index]]
+    if not requested:
+        return (None,) * 10
+    with torch.enable_grad():
+        reference = _composite_mla_absorbed_attention(
+            *tensors,
+            context.causal,
+            context.scale,
+        )
+        requested_gradients = torch.autograd.grad(
+            reference,
+            requested,
+            grad_output,
+            create_graph=torch.is_grad_enabled(),
+            allow_unused=True,
+        )
+    gradients: list[Tensor | None] = [None] * 10
+    for position, gradient in zip(requested_positions, requested_gradients, strict=True):
+        gradients[position] = gradient
+    return tuple(gradients)
+
+
+torch.library.register_autograd(
+    "ds_flash_mla_moe::mla_absorbed_attention",
+    _mla_absorbed_attention_backward,
+    setup_context=_mla_absorbed_attention_setup_context,
+)
+
+
 def native_extension_loaded() -> bool:
     """Return whether this installation contains and loaded the native library."""
 
@@ -741,6 +879,112 @@ def cuda_gemm_available() -> bool:
         _NATIVE_EXTENSION_LOADED
         and torch.cuda.is_available()
         and _operator_has_cuda_kernel("tiled_gemm")
+    )
+
+
+def cuda_mla_available() -> bool:
+    """Return whether the native absorbed MLA attention kernel can be executed."""
+
+    return (
+        _NATIVE_EXTENSION_LOADED
+        and torch.cuda.is_available()
+        and _operator_has_cuda_kernel("mla_absorbed_attention")
+    )
+
+
+def _mla_cuda_ineligibility_reason(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv: Tensor,
+    pe: Tensor,
+    key_up: Tensor,
+    value_up: Tensor,
+    query_positions: Tensor,
+    key_positions: Tensor,
+) -> str | None:
+    tensors = (q_nope, q_pe, kv, pe, key_up, value_up, query_positions, key_positions)
+    if not _NATIVE_EXTENSION_LOADED:
+        return "the native extension is not installed"
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        return "all MLA tensors must be CUDA tensors"
+    if any(tensor.dtype != torch.float32 for tensor in tensors[:6]):
+        return "the CUDA MLA kernel currently supports float32 only"
+    if query_positions.dtype != torch.long or key_positions.dtype != torch.long:
+        return "MLA positions must use int64"
+    if not _operator_has_cuda_kernel("mla_absorbed_attention"):
+        return "the loaded native extension does not register a CUDA MLA kernel"
+    return None
+
+
+def mla_absorbed_attention(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv: Tensor,
+    pe: Tensor,
+    key_up: Tensor,
+    value_up: Tensor,
+    *,
+    query_positions: Tensor,
+    key_positions: Tensor,
+    causal: bool = True,
+    scale: float,
+    backend: MLABackend = "auto",
+) -> Tensor:
+    """Evaluate absorbed MLA attention, selecting the native fused CUDA path when eligible."""
+
+    if backend not in {"auto", "cuda", "reference"}:
+        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+    if not math.isfinite(scale):
+        raise ValueError("scale must be finite")
+    reason = _mla_cuda_ineligibility_reason(
+        q_nope,
+        q_pe,
+        kv,
+        pe,
+        key_up,
+        value_up,
+        query_positions,
+        key_positions,
+    )
+    if backend == "cuda":
+        if reason is not None:
+            raise RuntimeError(f"CUDA MLA is unavailable: {reason}")
+        return torch.ops.ds_flash_mla_moe.mla_absorbed_attention.default(
+            q_nope,
+            q_pe,
+            kv,
+            pe,
+            key_up,
+            value_up,
+            query_positions,
+            key_positions,
+            causal,
+            scale,
+        )
+    if backend == "auto" and reason is None:
+        return torch.ops.ds_flash_mla_moe.mla_absorbed_attention.default(
+            q_nope,
+            q_pe,
+            kv,
+            pe,
+            key_up,
+            value_up,
+            query_positions,
+            key_positions,
+            causal,
+            scale,
+        )
+    return _composite_mla_absorbed_attention(
+        q_nope,
+        q_pe,
+        kv,
+        pe,
+        key_up,
+        value_up,
+        query_positions,
+        key_positions,
+        causal,
+        scale,
     )
 
 

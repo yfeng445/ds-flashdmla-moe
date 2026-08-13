@@ -24,7 +24,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Blockwise online attention | yes | CPU | FP32 forward/backward source | no |
 | DeepSeek grouped Top-K gate | yes | CPU | FP32 sigmoid source | replicated in EP |
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
-| MLA prefill/decode | naive + absorbed | CPU | not yet | no |
+| MLA prefill/decode | naive + absorbed | CPU + CUDA smoke | FP32 fused absorbed attention core | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
 | One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
 
@@ -105,6 +105,14 @@ The current one-thread-per-token selector uses serial candidate scans, so it
 establishes routing, stream, dispatcher, and autograd semantics rather than a
 production-performance claim.
 
+`mla_absorbed_attention(..., backend="cuda")` keeps the compressed latent cache
+in `[B,S,r_kv]` form and fuses absorbed content/position scoring, absolute-position
+causal masking, online softmax, and latent value accumulation. Query/RoPE and
+output projections remain PyTorch operations, and backward recomputes the
+traceable absorbed specification. The first native path supports FP32 and no
+explicit attention mask; it is a correctness kernel, not yet an FA2/FA3-class
+throughput claim.
+
 ## Repository layout
 
 ```text
@@ -112,6 +120,7 @@ production-performance claim.
 ├── csrc/
 │   ├── attention/                # native CUDA operator source
 │   ├── gemm/                     # fixed-tile CUDA teaching kernel
+│   ├── mla/                      # compressed-cache absorbed MLA kernel
 │   ├── moe/                      # route and active-row SwiGLU kernels
 │   └── experimental/attention/   # unverified course-era CUDA prototypes
 ├── benchmarks/                   # structured latency and environment reports
@@ -188,6 +197,10 @@ python benchmarks/mla.py --device cpu --dtype float64 \
 
 Use `decode_with_append` with the same shape to expose the linear prefix-copy
 cost of a functional cache baseline.
+
+On a native CUDA build, use `--device cuda --dtype float32 --implementation
+cuda` to exercise the fused absorbed attention core. Verification compares it
+against the absorbed PyTorch specification.
 
 Expert-major SwiGLU has a standalone benchmark whose comma-separated counts
 make skew and empty experts explicit:

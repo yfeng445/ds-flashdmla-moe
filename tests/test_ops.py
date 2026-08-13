@@ -340,6 +340,9 @@ def test_cuda_backward_matches_analytic_reference(
     not cuda_kernel_available(),
     reason="requires a built native extension and a CUDA device",
 )
+@pytest.mark.filterwarnings(
+    "ignore:Attempting to run cuBLAS, but there was no current CUDA context!:UserWarning"
+)
 @pytest.mark.cuda
 def test_deterministic_mode_uses_reference_backward() -> None:
     inputs = [torch.randn(1, 2, 5, 8, device="cuda", requires_grad=True) for _ in range(3)]
