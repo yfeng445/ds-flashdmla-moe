@@ -1,3 +1,4 @@
+// Experimental teaching kernel. It is not part of the supported Python API.
 // vanilla_attention.cu
 #include <cuda_runtime.h>
 #include <math_constants.h>

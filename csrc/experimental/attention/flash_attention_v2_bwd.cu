@@ -1,3 +1,4 @@
+// Experimental teaching kernel. Correctness and performance are not yet certified.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>

@@ -1,3 +1,4 @@
+// Experimental teaching kernel. Correctness and performance are not yet certified.
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <cmath>

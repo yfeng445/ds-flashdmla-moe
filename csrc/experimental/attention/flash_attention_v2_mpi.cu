@@ -1,3 +1,4 @@
+// Experimental host-staging MPI path kept for instructional comparison only.
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <vector>
