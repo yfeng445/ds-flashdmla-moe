@@ -135,7 +135,7 @@ heads 间共享。若实现还保存 `[S]` 的 int64 positions，额外容量为
 
 ## 3.8 Prefill 与 decode 的计时边界
 
-同一个“MLA latency”至少包含五种不同实验：
+同一个“MLA latency”至少包含六种不同实验：
 
 | workload | query 长度 | cache 操作是否计时 |
 | --- | ---: | --- |
@@ -144,8 +144,9 @@ heads 间共享。若实现还保存 `[S]` 的 int64 positions，额外容量为
 | `decode_attention` | `1` | cache 已含当前 token |
 | `decode_with_append` | `1` | append 当前 token 后做 attention |
 | `decode_with_static_write` | `1` | 原位写入当前 token 后做 attention |
+| `decode_with_paged_write` | `1` | 覆盖一个物理 slot 后按 block table 做 attention |
 
-五者不能放在同一列直接比较。特别是函数式 cache 使用 `torch.cat`，一次 append
+六者不能放在同一列直接比较。特别是函数式 cache 使用 `torch.cat`，一次 append
 会读取旧 prefix 并写出完整新 cache，拷贝量随上下文长度线性增长。这是易验证的语义实现，
 不是生产 decode cache。`MLAStaticCache` 则预分配 KV、RoPE 和 position storage，维护
 一个 valid cursor，并将新 chunk 原位写入 `[cursor:cursor+L]`。storage 地址在 decode
@@ -160,6 +161,11 @@ B(R_{kv}+D_{rope})e + 8\quad\text{bytes}.
 生产 continuous batching 还需为每个 batch slot 分别维护有效长度、请求生命周期和 page
 映射。静态写入会修改 storage，因此 API 明确限定在 `torch.no_grad()` 或
 `torch.inference_mode()` 下使用，而不伪装成可微操作。
+
+`MLAPagedCache` 进一步把 latent payload 拆成固定大小的物理页，并用 per-row length 与
+block table 描述逻辑序列。它允许同一 batch 中各行长度不同，也允许 logical page 在物理上
+不连续；decode 只覆盖一个全局 physical slot。该路径同样是 inference-only，但不再要求整个
+batch 共享一个连续 cursor。
 
 ## 3.9 两条路径的 FLOPs 边界
 
@@ -199,17 +205,21 @@ FLOPs 计数约定和所有 raw samples。若要观察函数式 cache 复制造�
 2. LoRA query projection + RMSNorm + RoPE；
 3. latent KV projection + RMSNorm + RoPE；
 4. projection 后直接写入预分配 static cache；
-5. absorbed score、causal mask、online softmax、latent value reduction；
-6. head output projection。
+5. projection 后按 slot mapping 写入 paged cache；
+6. 连续 latent cache 上的 absorbed score、causal mask、online softmax、latent value reduction；
+7. 直接按 block table 读取 paged latent cache 的 absorbed attention；
+8. head output projection。
 
-`backend="cuda"` 要求这六个阶段全部可用，不再只替换 attention core。out-of-place 算子的
+连续 staged 路径要求原有六个阶段全部可用；paged 路径复用 query/output projection，并要求
+两个 paged 原生算子可用，不再把 payload 临时 materialize 成连续 K/V。out-of-place 算子的
 backward 通过可追踪 PyTorch specification 重计算，以便先固定一阶梯度语义；static cache
-写入会修改 storage，因此仍严格限定为 inference-only。该实现证明了完整 prefill/decode
+和 paged cache 写入会修改 storage，因此仍严格限定为 inference-only。该实现证明了完整 prefill/decode
 数据流和 dispatcher 契约。同一次 native 请求中的输入、权重、cache 和 stage 输出使用统一
 storage dtype；linear reduction、RMSNorm 统计、RoPE、在线 Softmax 和 latent/value 累积使用
-FP32，每个公开 stage 再写回 storage dtype。absorbed-attention 已有按 head 维度选择的 warp
-specialization，但还不是生产内核：prefill/decode 尚未使用各自专用调度，也没有 paged cache、
-continuous-batching slot 生命周期或 profiler 驱动的跨算子融合。
+FP32，每个公开 stage 再写回 storage dtype。连续 absorbed-attention 已有按 head 维度选择的 warp
+specialization；paged attention 目前是 correctness-first 的 one-CTA-per-query/head kernel。两者都
+还不是生产内核：prefill/decode 尚未使用完整的专用调度，也没有 continuous-batching 请求/page
+生命周期、prefix-sharing 策略或 profiler 驱动的跨算子融合。
 
 ## 3.11 位置校验也可能成为 GPU 同步边界
 
@@ -270,3 +280,31 @@ causal/non-causal、非连续 last-dimension stride，以及 latent、RoPE、val
 所占比例也降到 41.8%/44.3%。这只是相同固定 case 的本机 kernel 观察：它不包含可泛化的 Nsight
 counter，也不能当作端到端或其它 shape/hardware 的加速比。下一步仍需用 Nsight Compute 检查
 occupancy、memory traffic 和指令分布，再决定 prefill/decode 专用调度与融合边界。
+
+## 3.13 Paged latent cache 的数据与错误契约
+
+物理 storage 不再带 batch 维，而是：
+
+```text
+kv_storage:       [num_pages, page_size, R_kv]
+pe_storage:       [num_pages, page_size, D_rope]
+position_storage: [num_pages, page_size]
+```
+
+全局 slot `s` 对应 `page=s//page_size`、`offset=s%page_size`。一次
+`write_mla_paged_cache` 接受 `[B,S]` slot mapping；同一次调用中的 slot 必须互不重复且位于
+容量内，避免并行 scatter race。后续调用可以有意覆盖旧 slot，latent、RoPE payload 与 absolute
+position 会一起替换。
+
+读取侧使用 `block_table[B,max_logical_pages]` 与 `sequence_lengths[B]`。每行实际使用的 page id
+必须在范围内且不得重复，未使用表项必须为 `-1`；不同 batch 行可以共享物理页。有效 logical
+slot 必须已经写入，absolute positions 必须在每行严格递增。causal mask 比较的是这些 absolute
+positions，而不是物理 slot id。
+
+CUDA kernel 直接在 key loop 中把 logical token 映射到 `(physical_page,page_offset)`，以 FP32
+完成 absorbed query、score、online softmax、latent numerator 和 value projection，再写回 storage
+dtype。测试覆盖 ragged batch、非连续物理页、重复/越界 slot、覆盖语义、未写入和非单调位置，
+以及 `S=257,page_size=16` 的尾页。Python 公共 API 校验后，native op 可跳过重复的 host-side
+防御检查；校验缓存只在 tensor identity/version 未变化时有效，直接原地修改会触发重新检查。
+当前尚未实现 page allocator、请求回收、eviction、prefix-sharing scheduler 或多请求 continuous
+batching，因此这是 paged storage/compute primitive，不是完整 serving runtime。

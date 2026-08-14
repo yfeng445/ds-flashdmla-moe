@@ -218,6 +218,24 @@ python benchmarks/matrix.py \
 误差与一条全程 FP32 的基线混在一起。逐 stage CUDA 回归仍使用更严格的普通 FP16/BF16 容差；
 端到端 benchmark 另用组合流水线容差处理多级量化在未缩放随机权重下的累积。
 
+### 7.7.3 paged MLA decode 矩阵
+
+`mla-paged` profile 把一次 per-slot projection write 和随后直接按 block table 读取 cache 的
+attention 放在同一计时边界。它包含两个独立 paired case：BF16 `S=257,page_size=16` 的长序列
+尾页，以及 FP16 `S=129,page_size=16` 的非整页维度组合。baseline 使用同 dtype 的 PyTorch
+paged specification，最终输出仍对连续 absorbed reference 校验：
+
+```bash
+python benchmarks/matrix.py \
+  --device cuda --profile mla-paged \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/operator-matrix-mla-paged.json
+```
+
+该 profile 单独存在，不改变默认 20-case manifest。报告同时记录 physical payload write bytes
+和 page-table metadata bytes；二者是计数模型，不是 profiler 实测 HBM traffic。这里测到的是
+当前 correctness-first API 边界，包括校验缓存与 dispatcher，不代表完整 serving scheduler。
+
 ## 7.8 从 Kineto 定位到 Nsight 取证
 
 shape matrix 回答“哪些固定 workload 能正确运行、延迟分布如何”，但不能解释时间消耗在

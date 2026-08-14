@@ -69,6 +69,8 @@ jobs:
               "mla_query_lora_projection",
               "mla_cache_projection",
               "mla_cache_projection_write",
+              "mla_cache_projection_write_slots",
+              "mla_paged_absorbed_attention",
               "mla_output_projection",
           ):
               qualified = f"ds_flash_mla_moe::{operator}"

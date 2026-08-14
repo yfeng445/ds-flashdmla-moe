@@ -45,6 +45,7 @@ def _small_config(**overrides) -> MLABenchmarkConfig:
     values = {
         "batch": 2,
         "sequence_length": 5,
+        "page_size": 2,
         "model_dim": 8,
         "n_heads": 3,
         "q_lora_rank": 4,
@@ -86,6 +87,7 @@ def test_mla_work_estimate_distinguishes_prefill_decode_and_append_copy() -> Non
     decode = mla_work_estimate(_small_config(workload="decode_attention"))
     append = mla_work_estimate(_small_config(workload="decode_with_append"))
     static = mla_work_estimate(_small_config(workload="decode_with_static_write"))
+    paged = mla_work_estimate(_small_config(workload="decode_with_paged_write"))
 
     assert prefill["query_length"] == 5
     assert decode["query_length"] == 1
@@ -94,6 +96,7 @@ def test_mla_work_estimate_distinguishes_prefill_decode_and_append_copy() -> Non
     assert decode["cache_projection_matrix_flops"] == 0
     assert append["cache_projection_matrix_flops"] == 2 * 2 * 1 * 8 * (3 + 2)
     assert static["cache_projection_matrix_flops"] == append["cache_projection_matrix_flops"]
+    assert paged["cache_projection_matrix_flops"] == append["cache_projection_matrix_flops"]
     assert append["functional_append_copy_bytes_lower_bound"] == (
         2 * 2 * 5 * (3 + 2) * 8 + 2 * 5 * 8
     )
@@ -101,6 +104,8 @@ def test_mla_work_estimate_distinguishes_prefill_decode_and_append_copy() -> Non
     assert append["static_cache_storage_write_bytes"] == 0
     assert static["functional_append_copy_bytes_lower_bound"] == 0
     assert static["static_cache_storage_write_bytes"] == 2 * (3 + 2) * 8 + 8
+    assert paged["paged_cache_storage_write_bytes"] == 2 * (3 + 2) * 8 + 2 * 2 * 8
+    assert paged["page_table_metadata_bytes"] == 2 * (3 + 1) * 8
 
 
 @pytest.mark.parametrize(
@@ -135,6 +140,17 @@ def test_small_mla_benchmark_reports_verified_workloads(
     assert report["cache_storage"]["payload_compression_ratio"] > 1
 
 
+def test_small_paged_mla_benchmark_reports_verified_reference_workload() -> None:
+    config = _small_config(workload="decode_with_paged_write", implementation="absorbed")
+
+    report = benchmark_mla(config)
+
+    assert report["configuration"]["page_size"] == 2
+    assert report["output"]["shape"] == [config.batch, 1, config.model_dim]
+    assert report["verification"]["performed"] is True
+    assert report["verification"]["max_tolerance_ratio"] <= 1
+
+
 def test_mla_benchmark_can_skip_verification() -> None:
     report = benchmark_mla(_small_config(verify=False))
     assert report["verification"] == {"performed": False}
@@ -154,11 +170,13 @@ def test_cuda_mla_benchmark_rejects_float64_storage() -> None:
     "config",
     [
         _small_config(sequence_length=0),
+        _small_config(page_size=0),
         _small_config(q_lora_rank=-1),
         _small_config(qk_rope_head_dim=3),
         _small_config(iterations=0),
         _small_config(workload="unknown"),  # type: ignore[arg-type]
         _small_config(implementation="unknown"),  # type: ignore[arg-type]
+        _small_config(workload="decode_with_paged_write", implementation="naive"),
     ],
 )
 def test_invalid_mla_benchmark_configuration_is_rejected(config: MLABenchmarkConfig) -> None:

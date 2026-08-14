@@ -39,5 +39,9 @@ TORCH_LIBRARY(ds_flash_mla_moe, m) {
       "mla_cache_projection(Tensor x, Tensor wkv_a, Tensor kv_norm_weight, Tensor positions, int kv_lora_rank, float rope_theta, float rms_norm_eps) -> (Tensor, Tensor)");
   m.def(
       "mla_cache_projection_write(Tensor x, Tensor wkv_a, Tensor kv_norm_weight, Tensor positions, Tensor(a!) kv_storage, Tensor(b!) pe_storage, Tensor(c!) position_storage, int start, float rope_theta, float rms_norm_eps) -> ()");
+  m.def(
+      "mla_cache_projection_write_slots(Tensor x, Tensor wkv_a, Tensor kv_norm_weight, Tensor positions, Tensor slot_mapping, Tensor(a!) kv_storage, Tensor(b!) pe_storage, Tensor(c!) position_storage, bool metadata_validated, float rope_theta, float rms_norm_eps) -> ()");
+  m.def(
+      "mla_paged_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv_storage, Tensor pe_storage, Tensor position_storage, Tensor block_table, Tensor sequence_lengths, Tensor key_up, Tensor value_up, Tensor query_positions, bool metadata_validated, bool causal, float scale) -> Tensor");
   m.def("mla_output_projection(Tensor heads, Tensor wo) -> Tensor");
 }

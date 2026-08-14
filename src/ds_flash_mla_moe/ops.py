@@ -12,6 +12,7 @@ from torch import Tensor
 from .attention import (
     _broadcast_mask,
     _causal_keep_mask,
+    _stable_probabilities,
     _validate_attention_inputs,
     blockwise_attention,
     scaled_dot_product_attention_backward_reference,
@@ -126,6 +127,18 @@ _MLA_CACHE_PROJECTION_WRITE_SCHEMA = (
     "Tensor positions, Tensor(a!) kv_storage, Tensor(b!) pe_storage, "
     "Tensor(c!) position_storage, int start, float rope_theta, float rms_norm_eps) -> ()"
 )
+_MLA_CACHE_PROJECTION_WRITE_SLOTS_SCHEMA = (
+    "mla_cache_projection_write_slots(Tensor x, Tensor wkv_a, Tensor kv_norm_weight, "
+    "Tensor positions, Tensor slot_mapping, Tensor(a!) kv_storage, Tensor(b!) pe_storage, "
+    "Tensor(c!) position_storage, bool metadata_validated, float rope_theta, "
+    "float rms_norm_eps) -> ()"
+)
+_MLA_PAGED_ABSORBED_ATTENTION_SCHEMA = (
+    "mla_paged_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv_storage, "
+    "Tensor pe_storage, Tensor position_storage, Tensor block_table, Tensor sequence_lengths, "
+    "Tensor key_up, Tensor value_up, Tensor query_positions, bool metadata_validated, "
+    "bool causal, float scale) -> Tensor"
+)
 _MLA_OUTPUT_PROJECTION_SCHEMA = "mla_output_projection(Tensor heads, Tensor wo) -> Tensor"
 _SCHEMAS = {
     "attention_forward": _FORWARD_SCHEMA,
@@ -141,6 +154,8 @@ _SCHEMAS = {
     "mla_query_lora_projection": _MLA_QUERY_LORA_PROJECTION_SCHEMA,
     "mla_cache_projection": _MLA_CACHE_PROJECTION_SCHEMA,
     "mla_cache_projection_write": _MLA_CACHE_PROJECTION_WRITE_SCHEMA,
+    "mla_cache_projection_write_slots": _MLA_CACHE_PROJECTION_WRITE_SLOTS_SCHEMA,
+    "mla_paged_absorbed_attention": _MLA_PAGED_ABSORBED_ATTENTION_SCHEMA,
     "mla_output_projection": _MLA_OUTPUT_PROJECTION_SCHEMA,
 }
 _missing_schemas = {
@@ -381,9 +396,11 @@ def _composite_mla_rope(x: Tensor, positions: Tensor, theta: float) -> Tensor:
     compute_dtype = _mla_projection_compute_dtype(x)
     pair_index = torch.arange(0, x.shape[-1], 2, device=x.device, dtype=compute_dtype)
     inverse_frequency = theta ** (-pair_index / x.shape[-1])
-    angles = positions.to(compute_dtype).unsqueeze(-1) * inverse_frequency.unsqueeze(0)
-    cosine = torch.cos(angles).view(1, x.shape[1], 1, -1)
-    sine = torch.sin(angles).view(1, x.shape[1], 1, -1)
+    angles = positions.to(compute_dtype).unsqueeze(-1) * inverse_frequency
+    if positions.ndim == 1:
+        angles = angles.unsqueeze(0)
+    cosine = torch.cos(angles).unsqueeze(2)
+    sine = torch.sin(angles).unsqueeze(2)
     x_compute = x.to(compute_dtype)
     even = x_compute[..., 0::2]
     odd = x_compute[..., 1::2]
@@ -509,6 +526,110 @@ def _composite_mla_cache_projection_write(
     kv_storage[:, start:end].copy_(kv)
     pe_storage[:, start:end].copy_(pe)
     position_storage[start:end].copy_(positions)
+
+
+def _composite_mla_cache_projection_write_slots(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    slot_mapping: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    metadata_validated: bool,
+    rope_theta: float,
+    rms_norm_eps: float,
+) -> None:
+    del metadata_validated
+    token_count = x.shape[0] * x.shape[1]
+    flat_x = x.reshape(1, token_count, x.shape[2])
+    flat_positions = positions.reshape(token_count)
+    kv, pe = _composite_mla_cache_projection(
+        flat_x,
+        wkv_a,
+        kv_norm_weight,
+        flat_positions,
+        kv_norm_weight.numel(),
+        rope_theta,
+        rms_norm_eps,
+    )
+    flat_slots = slot_mapping.reshape(token_count)
+    kv_storage.view(-1, kv_storage.shape[-1]).index_copy_(
+        0,
+        flat_slots,
+        kv.reshape(token_count, kv.shape[-1]),
+    )
+    pe_storage.view(-1, pe_storage.shape[-1]).index_copy_(
+        0,
+        flat_slots,
+        pe.reshape(token_count, pe.shape[-1]),
+    )
+    position_storage.view(-1).index_copy_(0, flat_slots, flat_positions)
+
+
+def _composite_mla_paged_absorbed_attention(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+    key_up: Tensor,
+    value_up: Tensor,
+    query_positions: Tensor,
+    metadata_validated: bool,
+    causal: bool,
+    scale: float,
+) -> Tensor:
+    del metadata_validated
+    batch_size = q_nope.shape[0]
+    max_key_length = int(sequence_lengths.max().item()) if batch_size else 0
+    value_dim = value_up.shape[1]
+    if max_key_length == 0:
+        return q_nope.new_zeros((batch_size, q_nope.shape[1], q_nope.shape[2], value_dim))
+
+    page_size = kv_storage.shape[1]
+    logical_indices = torch.arange(max_key_length, device=q_nope.device)
+    logical_pages = torch.div(logical_indices, page_size, rounding_mode="floor")
+    offsets = logical_indices.remainder(page_size)
+    valid_keys = logical_indices.unsqueeze(0) < sequence_lengths.unsqueeze(1)
+    pages = block_table[:, logical_pages]
+    safe_pages = torch.where(valid_keys, pages, torch.zeros_like(pages))
+    physical_slots = safe_pages * page_size + offsets.unsqueeze(0)
+    kv = kv_storage.view(-1, kv_storage.shape[-1])[physical_slots]
+    pe = pe_storage.view(-1, pe_storage.shape[-1])[physical_slots]
+    key_positions = position_storage.view(-1)[physical_slots]
+
+    compute_dtype = _mla_projection_compute_dtype(q_nope)
+    q_latent = torch.einsum(
+        "bshd,hdr->bshr",
+        q_nope.to(compute_dtype),
+        key_up.to(compute_dtype),
+    )
+    scores = torch.einsum("bshr,btr->bhst", q_latent, kv.to(compute_dtype))
+    scores = scores + torch.einsum(
+        "bshd,btd->bhst",
+        q_pe.to(compute_dtype),
+        pe.to(compute_dtype),
+    )
+    scores = scores * scale
+    keep = valid_keys[:, None, None, :]
+    if causal:
+        keep = keep & (key_positions[:, None, None, :] <= query_positions[:, None, :, None])
+    scores = scores.masked_fill(~keep, -torch.inf)
+    probabilities, _ = _stable_probabilities(scores)
+    latent_output = torch.einsum("bhst,btr->bshr", probabilities, kv.to(compute_dtype))
+    return (
+        torch.einsum(
+            "bshr,hdr->bshd",
+            latent_output,
+            value_up.to(compute_dtype),
+        )
+        .to(q_nope.dtype)
+        .contiguous()
+    )
 
 
 def _composite_mla_output_projection(heads: Tensor, wo: Tensor) -> Tensor:
@@ -734,8 +855,11 @@ def _fake_mla_query_outputs(
     qk_rope_head_dim: int,
     rope_theta: float,
 ) -> tuple[Tensor, Tensor]:
-    torch._check(x.ndim == 3 and positions.ndim == 1)
-    torch._check(positions.shape[0] == x.shape[1])
+    torch._check(x.ndim == 3 and positions.ndim in {1, 2})
+    if positions.ndim == 1:
+        torch._check(positions.shape[0] == x.shape[1])
+    else:
+        torch._check(positions.shape[0] == x.shape[0] and positions.shape[1] == x.shape[1])
     torch._check(x.device == positions.device)
     torch._check(x.is_floating_point() and positions.dtype == torch.long)
     torch._check(n_heads > 0 and qk_nope_head_dim > 0)
@@ -862,6 +986,110 @@ def _fake_mla_cache_projection_write(
     torch._check(start >= 0 and start + x.shape[1] <= kv_storage.shape[1])
 
 
+def _fake_mla_cache_projection_write_slots(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    slot_mapping: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    metadata_validated: bool,
+    rope_theta: float,
+    rms_norm_eps: float,
+) -> None:
+    del metadata_validated
+    torch._check(x.ndim == 3 and positions.ndim == 2 and slot_mapping.ndim == 2)
+    torch._check(positions.shape == x.shape[:2] and slot_mapping.shape == x.shape[:2])
+    token_count = x.shape[0] * x.shape[1]
+    flat_x = x.reshape(1, token_count, x.shape[2])
+    kv, pe = _fake_mla_cache_projection(
+        flat_x,
+        wkv_a,
+        kv_norm_weight,
+        positions.reshape(token_count),
+        kv_norm_weight.shape[0],
+        rope_theta,
+        rms_norm_eps,
+    )
+    torch._check(kv_storage.ndim == 3 and pe_storage.ndim == 3)
+    torch._check(position_storage.ndim == 2 and position_storage.dtype == torch.long)
+    torch._check(kv_storage.shape[:2] == pe_storage.shape[:2])
+    torch._check(kv_storage.shape[:2] == position_storage.shape)
+    torch._check(kv_storage.shape[2] == kv.shape[2] and pe_storage.shape[2] == pe.shape[2])
+    torch._check(slot_mapping.dtype == torch.long)
+    torch._check(
+        kv_storage.device
+        == pe_storage.device
+        == position_storage.device
+        == positions.device
+        == slot_mapping.device
+        == x.device
+        and kv_storage.dtype == pe_storage.dtype == x.dtype
+    )
+
+
+def _fake_mla_paged_absorbed_attention(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+    key_up: Tensor,
+    value_up: Tensor,
+    query_positions: Tensor,
+    metadata_validated: bool,
+    causal: bool,
+    scale: float,
+) -> Tensor:
+    del metadata_validated, causal
+    torch._check(q_nope.ndim == 4 and q_pe.ndim == 4)
+    torch._check(kv_storage.ndim == 3 and pe_storage.ndim == 3)
+    torch._check(position_storage.ndim == 2 and block_table.ndim == 2)
+    torch._check(sequence_lengths.ndim == 1 and query_positions.ndim == 2)
+    torch._check(q_nope.shape[:3] == q_pe.shape[:3])
+    torch._check(kv_storage.shape[:2] == pe_storage.shape[:2])
+    torch._check(kv_storage.shape[:2] == position_storage.shape)
+    torch._check(block_table.shape[0] == sequence_lengths.shape[0] == q_nope.shape[0])
+    torch._check(query_positions.shape[:2] == q_nope.shape[:2])
+    torch._check(q_nope.shape[2] == key_up.shape[0] == value_up.shape[0])
+    torch._check(q_nope.shape[3] == key_up.shape[1])
+    torch._check(q_pe.shape[3] == pe_storage.shape[2])
+    torch._check(kv_storage.shape[2] == key_up.shape[2] == value_up.shape[2])
+    torch._check(
+        position_storage.dtype
+        == block_table.dtype
+        == sequence_lengths.dtype
+        == query_positions.dtype
+        == torch.long
+    )
+    torch._check(
+        q_nope.device
+        == q_pe.device
+        == kv_storage.device
+        == pe_storage.device
+        == position_storage.device
+        == block_table.device
+        == sequence_lengths.device
+        == key_up.device
+        == value_up.device
+        == query_positions.device
+    )
+    torch._check(
+        q_nope.dtype
+        == q_pe.dtype
+        == kv_storage.dtype
+        == pe_storage.dtype
+        == key_up.dtype
+        == value_up.dtype
+    )
+    torch._check(math.isfinite(scale))
+    return q_nope.new_empty((q_nope.shape[0], q_nope.shape[1], q_nope.shape[2], value_up.shape[1]))
+
+
 def _fake_mla_output_projection(heads: Tensor, wo: Tensor) -> Tensor:
     torch._check(heads.ndim == 4 and wo.ndim == 2)
     torch._check(wo.shape[1] == heads.shape[2] * heads.shape[3])
@@ -883,6 +1111,10 @@ composite_explicit.impl("mla_query_projection", _composite_mla_query_projection)
 composite_explicit.impl("mla_query_lora_projection", _composite_mla_query_lora_projection)
 composite_explicit.impl("mla_cache_projection", _composite_mla_cache_projection)
 composite_explicit.impl("mla_cache_projection_write", _composite_mla_cache_projection_write)
+composite_explicit.impl(
+    "mla_cache_projection_write_slots", _composite_mla_cache_projection_write_slots
+)
+composite_explicit.impl("mla_paged_absorbed_attention", _composite_mla_paged_absorbed_attention)
 composite_explicit.impl("mla_output_projection", _composite_mla_output_projection)
 _LIBRARY_HANDLES.append(composite_explicit)
 
@@ -907,6 +1139,14 @@ torch.library.register_fake(
 torch.library.register_fake("ds_flash_mla_moe::mla_cache_projection", _fake_mla_cache_projection)
 torch.library.register_fake(
     "ds_flash_mla_moe::mla_cache_projection_write", _fake_mla_cache_projection_write
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::mla_cache_projection_write_slots",
+    _fake_mla_cache_projection_write_slots,
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::mla_paged_absorbed_attention",
+    _fake_mla_paged_absorbed_attention,
 )
 torch.library.register_fake("ds_flash_mla_moe::mla_output_projection", _fake_mla_output_projection)
 
@@ -1430,6 +1670,18 @@ def cuda_mla_available() -> bool:
     )
 
 
+def cuda_paged_mla_available() -> bool:
+    """Return whether native paged-cache write and attention kernels can execute."""
+
+    return cuda_mla_available() and all(
+        _operator_has_cuda_kernel(operator)
+        for operator in (
+            "mla_cache_projection_write_slots",
+            "mla_paged_absorbed_attention",
+        )
+    )
+
+
 def _validate_mla_backend(backend: MLABackend) -> None:
     if backend not in {"auto", "cuda", "reference"}:
         raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
@@ -1642,6 +1894,69 @@ def mla_cache_projection_write(
     _composite_mla_cache_projection_write(*arguments)
 
 
+def mla_cache_projection_write_slots(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    slot_mapping: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    *,
+    rope_theta: float,
+    rms_norm_eps: float,
+    backend: MLABackend = "auto",
+    _metadata_validated: bool = False,
+) -> None:
+    """Project tokens into distinct physical slots of a paged cache."""
+
+    _validate_mla_backend(backend)
+    floating = (x, wkv_a, kv_norm_weight, kv_storage, pe_storage)
+    reason = _mla_projection_cuda_ineligibility_reason(
+        "mla_cache_projection_write_slots",
+        floating,
+        positions,
+        contiguous_tensors=(
+            wkv_a,
+            kv_norm_weight,
+            positions,
+            slot_mapping,
+            kv_storage,
+            pe_storage,
+            position_storage,
+        ),
+    )
+    integer_tensors = (positions, slot_mapping, position_storage)
+    if reason is None and (
+        any(tensor.device.type != "cuda" or tensor.device != x.device for tensor in integer_tensors)
+        or any(tensor.dtype != torch.long for tensor in integer_tensors)
+    ):
+        reason = "paged MLA positions and slot mappings must be int64 CUDA tensors"
+    arguments = (
+        x,
+        wkv_a,
+        kv_norm_weight,
+        positions,
+        slot_mapping,
+        kv_storage,
+        pe_storage,
+        position_storage,
+        _metadata_validated,
+        rope_theta,
+        rms_norm_eps,
+    )
+    if backend == "cuda":
+        if reason is not None:
+            raise RuntimeError(f"CUDA MLA is unavailable: paged cache write: {reason}")
+        torch.ops.ds_flash_mla_moe.mla_cache_projection_write_slots.default(*arguments)
+        return
+    if backend == "auto" and reason is None:
+        torch.ops.ds_flash_mla_moe.mla_cache_projection_write_slots.default(*arguments)
+        return
+    _composite_mla_cache_projection_write_slots(*arguments)
+
+
 def mla_output_projection(
     heads: Tensor,
     wo: Tensor,
@@ -1763,6 +2078,95 @@ def mla_absorbed_attention(
         causal,
         scale,
     )
+
+
+def _mla_paged_cuda_ineligibility_reason(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+    key_up: Tensor,
+    value_up: Tensor,
+    query_positions: Tensor,
+) -> str | None:
+    floating = (q_nope, q_pe, kv_storage, pe_storage, key_up, value_up)
+    integer = (position_storage, block_table, sequence_lengths, query_positions)
+    if not _NATIVE_EXTENSION_LOADED:
+        return "the native extension is not installed"
+    if any(tensor.device.type != "cuda" for tensor in (*floating, *integer)):
+        return "all paged MLA tensors must be CUDA tensors"
+    if q_nope.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        return "the CUDA paged MLA kernel supports float16, bfloat16, and float32"
+    if any(tensor.dtype != q_nope.dtype for tensor in floating[1:]):
+        return "all floating-point paged MLA tensors must have the same dtype"
+    if any(tensor.dtype != torch.long for tensor in integer):
+        return "paged MLA metadata must use int64"
+    if len({tensor.device for tensor in (*floating, *integer)}) != 1:
+        return "all paged MLA tensors must share a CUDA device"
+    if not _operator_has_cuda_kernel("mla_paged_absorbed_attention"):
+        return "the loaded native extension does not register paged MLA attention"
+    return None
+
+
+def mla_paged_absorbed_attention(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+    key_up: Tensor,
+    value_up: Tensor,
+    *,
+    query_positions: Tensor,
+    causal: bool = True,
+    scale: float,
+    backend: MLABackend = "auto",
+    _metadata_validated: bool = False,
+) -> Tensor:
+    """Evaluate absorbed MLA directly through a logical-to-physical page table."""
+
+    _validate_mla_backend(backend)
+    if not math.isfinite(scale):
+        raise ValueError("scale must be finite")
+    reason = _mla_paged_cuda_ineligibility_reason(
+        q_nope,
+        q_pe,
+        kv_storage,
+        pe_storage,
+        position_storage,
+        block_table,
+        sequence_lengths,
+        key_up,
+        value_up,
+        query_positions,
+    )
+    arguments = (
+        q_nope,
+        q_pe,
+        kv_storage,
+        pe_storage,
+        position_storage,
+        block_table,
+        sequence_lengths,
+        key_up,
+        value_up,
+        query_positions,
+        _metadata_validated,
+        causal,
+        scale,
+    )
+    if backend == "cuda":
+        if reason is not None:
+            raise RuntimeError(f"CUDA MLA is unavailable: paged attention: {reason}")
+        return torch.ops.ds_flash_mla_moe.mla_paged_absorbed_attention.default(*arguments)
+    if backend == "auto" and reason is None:
+        return torch.ops.ds_flash_mla_moe.mla_paged_absorbed_attention.default(*arguments)
+    return _composite_mla_paged_absorbed_attention(*arguments)
 
 
 def _gemm_cuda_ineligibility_reason(a: Tensor, b: Tensor, c: Tensor | None) -> str | None:

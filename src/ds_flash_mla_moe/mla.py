@@ -108,6 +108,56 @@ class MLAStaticCache:
         self.valid_length = valid_length
 
 
+@dataclass
+class MLAPagedCache:
+    """Inference cache stored as globally addressable fixed-size pages.
+
+    ``position_storage == -1`` marks an unwritten physical slot. Logical
+    sequences are described separately by a block table and per-row lengths.
+    """
+
+    kv_storage: Tensor
+    pe_storage: Tensor
+    position_storage: Tensor
+
+    @property
+    def num_pages(self) -> int:
+        return self.kv_storage.shape[0]
+
+    @property
+    def page_size(self) -> int:
+        return self.kv_storage.shape[1]
+
+    @property
+    def capacity(self) -> int:
+        return self.num_pages * self.page_size
+
+    def clear(self) -> None:
+        """Mark every physical slot unused without reallocating storage."""
+
+        with torch.no_grad():
+            self.position_storage.fill_(-1)
+
+
+@dataclass(frozen=True)
+class MLAPagedCacheView:
+    """Padded logical view materialized from a paged cache."""
+
+    kv: Tensor
+    pe: Tensor
+    positions: Tensor
+    sequence_lengths: Tensor
+
+    @property
+    def max_sequence_length(self) -> int:
+        return self.kv.shape[1]
+
+    @property
+    def valid_mask(self) -> Tensor:
+        logical_indices = torch.arange(self.max_sequence_length, device=self.kv.device)
+        return logical_indices.unsqueeze(0) < self.sequence_lengths.unsqueeze(1)
+
+
 def _compute_dtype(tensor: Tensor) -> torch.dtype:
     return torch.float64 if tensor.dtype == torch.float64 else torch.float32
 
@@ -198,6 +248,42 @@ def _validate_positions(
     return positions
 
 
+def _validate_batched_positions(
+    positions: Tensor,
+    batch_size: int,
+    length: int,
+    device: torch.device,
+    *,
+    values_validated: bool = False,
+) -> Tensor:
+    """Validate shared ``[S]`` or per-row ``[B,S]`` token positions."""
+
+    if positions.ndim == 1:
+        return _validate_positions(
+            positions,
+            length,
+            device,
+            values_validated=values_validated,
+        )
+    if positions.ndim != 2 or tuple(positions.shape) != (batch_size, length):
+        raise ValueError("positions must have shape [sequence] or [batch, sequence]")
+    positions = positions.to(device=device, dtype=torch.long)
+    if not positions.numel() or values_validated:
+        return positions
+
+    first_nonnegative = torch.all(positions[:, 0] >= 0)
+    strictly_increasing = (
+        torch.all(positions[:, 1:] > positions[:, :-1])
+        if length > 1
+        else torch.ones((), device=device, dtype=torch.bool)
+    )
+    if not bool(first_nonnegative & strictly_increasing):
+        if not bool(first_nonnegative):
+            raise ValueError("positions must be non-negative")
+        raise ValueError("positions must be strictly increasing within each batch row")
+    return positions
+
+
 def _tensor_version(tensor: Tensor) -> int | None:
     try:
         return tensor._version
@@ -274,8 +360,9 @@ def _apply_rope(
 
     if x.ndim != 4 or x.shape[-1] % 2 != 0:
         raise ValueError("RoPE input must be [batch, sequence, heads, even_dim]")
-    positions = _validate_positions(
+    positions = _validate_batched_positions(
         positions,
+        x.shape[0],
         x.shape[1],
         x.device,
         values_validated=_positions_validated,
@@ -283,9 +370,11 @@ def _apply_rope(
     compute_dtype = _compute_dtype(x)
     pair_index = torch.arange(0, x.shape[-1], 2, device=x.device, dtype=compute_dtype)
     inverse_frequency = theta ** (-pair_index / x.shape[-1])
-    angles = positions.to(compute_dtype).unsqueeze(-1) * inverse_frequency.unsqueeze(0)
-    cos = torch.cos(angles).view(1, x.shape[1], 1, -1)
-    sin = torch.sin(angles).view(1, x.shape[1], 1, -1)
+    angles = positions.to(compute_dtype).unsqueeze(-1) * inverse_frequency
+    if positions.ndim == 1:
+        angles = angles.unsqueeze(0)
+    cos = torch.cos(angles).unsqueeze(2)
+    sin = torch.sin(angles).unsqueeze(2)
 
     x_compute = x.to(compute_dtype)
     even = x_compute[..., 0::2]
@@ -307,8 +396,9 @@ def _project_query(
     _validate_weights(config, weights, model_dim)
     if x.ndim != 3:
         raise ValueError("MLA query input must have shape [batch, sequence, model_dim]")
-    positions = _validate_positions(
+    positions = _validate_batched_positions(
         positions,
+        x.shape[0],
         x.shape[1],
         x.device,
         values_validated=_positions_validated,
@@ -618,6 +708,411 @@ def write_mla_static_cache(
     return cache.as_latent_cache(_validated_query_positions=positions)
 
 
+def allocate_mla_paged_cache(
+    *,
+    num_pages: int,
+    page_size: int,
+    config: MLAConfig,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> MLAPagedCache:
+    """Allocate inference storage addressed by global physical token slots."""
+
+    config.validate()
+    if num_pages <= 0:
+        raise ValueError("paged cache num_pages must be positive")
+    if page_size <= 0:
+        raise ValueError("paged cache page_size must be positive")
+    if not dtype.is_floating_point:
+        raise TypeError("paged cache dtype must be floating point")
+    device = torch.device(device)
+    return MLAPagedCache(
+        kv_storage=torch.empty(
+            num_pages,
+            page_size,
+            config.kv_lora_rank,
+            device=device,
+            dtype=dtype,
+        ),
+        pe_storage=torch.empty(
+            num_pages,
+            page_size,
+            config.qk_rope_head_dim,
+            device=device,
+            dtype=dtype,
+        ),
+        position_storage=torch.full(
+            (num_pages, page_size),
+            -1,
+            device=device,
+            dtype=torch.long,
+        ),
+    )
+
+
+def _validate_paged_cache_layout(cache: MLAPagedCache, config: MLAConfig | None = None) -> None:
+    if cache.kv_storage.ndim != 3 or cache.pe_storage.ndim != 3:
+        raise ValueError("paged K/V and positional storage must be rank 3")
+    if cache.position_storage.ndim != 2:
+        raise ValueError("paged position storage must be rank 2")
+    if cache.kv_storage.shape[:2] != cache.pe_storage.shape[:2] or tuple(
+        cache.kv_storage.shape[:2]
+    ) != tuple(cache.position_storage.shape):
+        raise ValueError("paged cache page dimensions are inconsistent")
+    if cache.num_pages <= 0 or cache.page_size <= 0:
+        raise ValueError("paged cache must contain positive page and page-size dimensions")
+    if not cache.kv_storage.is_floating_point() or not cache.pe_storage.is_floating_point():
+        raise TypeError("paged cache K/V and positional payloads must be floating point")
+    if cache.position_storage.dtype != torch.long:
+        raise TypeError("paged cache position storage must use int64")
+    if (
+        cache.kv_storage.device != cache.pe_storage.device
+        or cache.kv_storage.device != cache.position_storage.device
+    ):
+        raise ValueError("paged cache storage tensors must share a device")
+    if cache.kv_storage.dtype != cache.pe_storage.dtype:
+        raise ValueError("paged cache payload tensors must share a dtype")
+    if not all(
+        tensor.is_contiguous()
+        for tensor in (cache.kv_storage, cache.pe_storage, cache.position_storage)
+    ):
+        raise ValueError("paged cache storage tensors must be contiguous")
+    if config is not None:
+        if cache.kv_storage.shape[-1] != config.kv_lora_rank:
+            raise ValueError("paged cache latent rank does not match config")
+        if cache.pe_storage.shape[-1] != config.qk_rope_head_dim:
+            raise ValueError("paged cache positional dimension does not match config")
+
+
+def _paged_value_tensor_is_current(cache: MLAPagedCache, name: str, tensor: Tensor) -> bool:
+    return tensor is getattr(cache, f"_{name}", None) and _validation_is_current(
+        tensor,
+        getattr(cache, f"_{name}_validation_version", None),
+    )
+
+
+def _remember_paged_value_tensor(cache: MLAPagedCache, name: str, tensor: Tensor) -> None:
+    object.__setattr__(cache, f"_{name}", tensor)
+    object.__setattr__(
+        cache,
+        f"_{name}_validation_version",
+        _tensor_version(tensor),
+    )
+
+
+def _paged_metadata_is_current(
+    cache: MLAPagedCache,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+) -> bool:
+    return (
+        block_table is getattr(cache, "_paged_block_table", None)
+        and sequence_lengths is getattr(cache, "_paged_sequence_lengths", None)
+        and _validation_is_current(
+            block_table,
+            getattr(cache, "_paged_block_table_validation_version", None),
+        )
+        and _validation_is_current(
+            sequence_lengths,
+            getattr(cache, "_paged_sequence_lengths_validation_version", None),
+        )
+        and getattr(cache, "_paged_metadata_num_pages", None) == cache.num_pages
+        and getattr(cache, "_paged_metadata_page_size", None) == cache.page_size
+    )
+
+
+def _remember_paged_metadata(
+    cache: MLAPagedCache,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+    length_values: list[int],
+) -> None:
+    object.__setattr__(cache, "_paged_block_table", block_table)
+    object.__setattr__(
+        cache,
+        "_paged_block_table_validation_version",
+        _tensor_version(block_table),
+    )
+    object.__setattr__(cache, "_paged_sequence_lengths", sequence_lengths)
+    object.__setattr__(
+        cache,
+        "_paged_sequence_lengths_validation_version",
+        _tensor_version(sequence_lengths),
+    )
+    object.__setattr__(cache, "_paged_metadata_num_pages", cache.num_pages)
+    object.__setattr__(cache, "_paged_metadata_page_size", cache.page_size)
+    object.__setattr__(cache, "_paged_length_values", tuple(length_values))
+
+
+def _paged_logical_validation_is_current(
+    cache: MLAPagedCache,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+) -> bool:
+    return _paged_metadata_is_current(
+        cache,
+        block_table,
+        sequence_lengths,
+    ) and _validation_is_current(
+        cache.position_storage,
+        getattr(cache, "_paged_logical_positions_validation_version", None),
+    )
+
+
+def _remember_paged_logical_validation(cache: MLAPagedCache) -> None:
+    object.__setattr__(
+        cache,
+        "_paged_logical_positions_validation_version",
+        _tensor_version(cache.position_storage),
+    )
+
+
+def _validate_paged_metadata(
+    cache: MLAPagedCache,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+) -> list[int]:
+    _validate_paged_cache_layout(cache)
+    if block_table.ndim != 2:
+        raise ValueError("block_table must have shape [batch, logical_pages]")
+    if sequence_lengths.ndim != 1 or sequence_lengths.numel() != block_table.shape[0]:
+        raise ValueError("sequence_lengths must contain one entry per block-table row")
+    if block_table.dtype != torch.long or sequence_lengths.dtype != torch.long:
+        raise TypeError("block_table and sequence_lengths must use int64")
+    if (
+        block_table.device != cache.kv_storage.device
+        or sequence_lengths.device != block_table.device
+    ):
+        raise ValueError("paged metadata and cache storage must share a device")
+    if _paged_metadata_is_current(cache, block_table, sequence_lengths):
+        return list(cache._paged_length_values)
+
+    length_values = [int(value) for value in sequence_lengths.detach().cpu().tolist()]
+    table_values = block_table.detach().cpu().tolist()
+    logical_capacity = block_table.shape[1] * cache.page_size
+    for row_index, (length, row) in enumerate(zip(length_values, table_values, strict=True)):
+        if not 0 <= length <= logical_capacity:
+            raise ValueError(f"sequence_lengths[{row_index}] exceeds the block-table capacity")
+        required_pages = (length + cache.page_size - 1) // cache.page_size
+        used_pages = row[:required_pages]
+        if any(page < 0 or page >= cache.num_pages for page in used_pages):
+            raise ValueError(f"block_table row {row_index} contains an out-of-range page")
+        if len(set(used_pages)) != len(used_pages):
+            raise ValueError(f"block_table row {row_index} repeats a physical page")
+        if any(page != -1 for page in row[required_pages:]):
+            raise ValueError(f"unused block_table entries in row {row_index} must be -1")
+    _remember_paged_metadata(cache, block_table, sequence_lengths, length_values)
+    return length_values
+
+
+def _paged_logical_slots(
+    cache: MLAPagedCache,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+    *,
+    _length_values: list[int] | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    length_values = (
+        _validate_paged_metadata(cache, block_table, sequence_lengths)
+        if _length_values is None
+        else _length_values
+    )
+    values_validated = _paged_logical_validation_is_current(
+        cache,
+        block_table,
+        sequence_lengths,
+    )
+    batch_size = block_table.shape[0]
+    max_length = max(length_values, default=0)
+    if max_length == 0:
+        empty_slots = torch.empty((batch_size, 0), device=block_table.device, dtype=torch.long)
+        empty_mask = torch.empty((batch_size, 0), device=block_table.device, dtype=torch.bool)
+        empty_positions = torch.empty_like(empty_slots)
+        if not values_validated:
+            _remember_paged_logical_validation(cache)
+        return empty_slots, empty_mask, empty_positions
+
+    logical_indices = torch.arange(max_length, device=block_table.device)
+    logical_pages = torch.div(logical_indices, cache.page_size, rounding_mode="floor")
+    offsets = logical_indices.remainder(cache.page_size)
+    pages = block_table[:, logical_pages]
+    valid_mask = logical_indices.unsqueeze(0) < sequence_lengths.unsqueeze(1)
+    safe_pages = torch.where(valid_mask, pages, torch.zeros_like(pages))
+    physical_slots = safe_pages * cache.page_size + offsets.unsqueeze(0)
+    flat_positions = cache.position_storage.view(-1)
+    positions = flat_positions[physical_slots]
+    positions = torch.where(valid_mask, positions, torch.full_like(positions, -1))
+
+    if not values_validated:
+        has_unwritten = torch.any(valid_mask & (positions < 0))
+        has_nonmonotonic = torch.zeros((), device=positions.device, dtype=torch.bool)
+        if max_length > 1:
+            adjacent_valid = logical_indices[:-1].unsqueeze(0) < (sequence_lengths.unsqueeze(1) - 1)
+            increasing = positions[:, 1:] > positions[:, :-1]
+            has_nonmonotonic = torch.any(adjacent_valid & ~increasing)
+        if not bool(~has_unwritten & ~has_nonmonotonic):
+            if bool(has_unwritten):
+                raise ValueError("block_table references an unwritten paged-cache slot")
+            raise ValueError("paged cache positions must increase within each logical sequence")
+        _remember_paged_logical_validation(cache)
+    return physical_slots, valid_mask, positions
+
+
+def _validate_paged_logical_cache(
+    cache: MLAPagedCache,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+) -> None:
+    length_values = _validate_paged_metadata(cache, block_table, sequence_lengths)
+    if not _paged_logical_validation_is_current(cache, block_table, sequence_lengths):
+        _paged_logical_slots(
+            cache,
+            block_table,
+            sequence_lengths,
+            _length_values=length_values,
+        )
+
+
+def materialize_mla_paged_cache(
+    cache: MLAPagedCache,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+) -> MLAPagedCacheView:
+    """Gather a padded logical view for validation and reference execution."""
+
+    physical_slots, valid_mask, positions = _paged_logical_slots(
+        cache,
+        block_table,
+        sequence_lengths,
+    )
+    batch_size, max_length = physical_slots.shape
+    latent_dim = cache.kv_storage.shape[-1]
+    rope_dim = cache.pe_storage.shape[-1]
+    if max_length == 0:
+        kv = cache.kv_storage.new_empty((batch_size, 0, latent_dim))
+        pe = cache.pe_storage.new_empty((batch_size, 0, rope_dim))
+    else:
+        kv = cache.kv_storage.view(-1, latent_dim)[physical_slots]
+        pe = cache.pe_storage.view(-1, rope_dim)[physical_slots]
+        kv = torch.where(valid_mask.unsqueeze(-1), kv, torch.zeros_like(kv))
+        pe = torch.where(valid_mask.unsqueeze(-1), pe, torch.zeros_like(pe))
+    return MLAPagedCacheView(
+        kv=kv.contiguous(),
+        pe=pe.contiguous(),
+        positions=positions.contiguous(),
+        sequence_lengths=sequence_lengths,
+    )
+
+
+def write_mla_paged_cache(
+    cache: MLAPagedCache,
+    x: Tensor,
+    config: MLAConfig,
+    weights: MLAWeights,
+    *,
+    positions: Tensor,
+    slot_mapping: Tensor,
+    backend: MLABackend = "auto",
+) -> MLAPagedCache:
+    """Project tokens and overwrite distinct global physical slots.
+
+    Duplicate slots in one call are rejected because parallel writes would race.
+    A later call may intentionally overwrite a previously populated slot; all
+    latent, positional, and position fields are replaced together.
+    """
+
+    if backend not in {"auto", "cuda", "reference"}:
+        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+    if torch.is_grad_enabled() and (
+        x.requires_grad
+        or any(
+            tensor is not None and tensor.requires_grad
+            for tensor in (
+                weights.wkv_a,
+                weights.kv_norm_weight,
+                weights.wkv_b,
+                weights.wo,
+                weights.wq,
+                weights.wq_a,
+                weights.q_norm_weight,
+                weights.wq_b,
+            )
+        )
+    ):
+        raise RuntimeError("MLAPagedCache is inference-only and does not support autograd")
+    if x.ndim != 3:
+        raise ValueError("paged cache input must have shape [batch, sequence, model_dim]")
+    _validate_weights(config, weights, x.shape[-1])
+    _validate_paged_cache_layout(cache, config)
+    if x.device != cache.kv_storage.device or x.dtype != cache.kv_storage.dtype:
+        raise ValueError("paged cache input must match storage device and dtype")
+
+    positions_are_current = _paged_value_tensor_is_current(
+        cache,
+        "paged_write_positions",
+        positions,
+    )
+    positions = _validate_batched_positions(
+        positions,
+        x.shape[0],
+        x.shape[1],
+        x.device,
+        values_validated=positions_are_current,
+    )
+    validated_positions = positions
+    if slot_mapping.ndim != 2 or tuple(slot_mapping.shape) != tuple(x.shape[:2]):
+        raise ValueError("slot_mapping must have shape [batch, sequence]")
+    if slot_mapping.dtype != torch.long:
+        raise TypeError("slot_mapping must use int64")
+    if slot_mapping.device != x.device:
+        raise ValueError("slot_mapping must share the input device")
+    slots_are_current = _paged_value_tensor_is_current(
+        cache,
+        "paged_write_slot_mapping",
+        slot_mapping,
+    )
+    if not slots_are_current:
+        slot_values = [int(value) for value in slot_mapping.detach().cpu().reshape(-1).tolist()]
+        if any(slot < 0 or slot >= cache.capacity for slot in slot_values):
+            raise ValueError("slot_mapping contains an out-of-range physical slot")
+        if len(set(slot_values)) != len(slot_values):
+            raise ValueError("slot_mapping must not contain duplicate physical slots in one write")
+
+    repeated_position_write = (
+        positions_are_current
+        and slots_are_current
+        and _validation_is_current(
+            cache.position_storage,
+            getattr(cache, "_paged_logical_positions_validation_version", None),
+        )
+    )
+
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0).expand(x.shape[0], -1)
+    from .ops import mla_cache_projection_write_slots
+
+    with torch.no_grad():
+        mla_cache_projection_write_slots(
+            x,
+            weights.wkv_a,
+            weights.kv_norm_weight,
+            positions.contiguous(),
+            slot_mapping.contiguous(),
+            cache.kv_storage,
+            cache.pe_storage,
+            cache.position_storage,
+            rope_theta=config.rope_theta,
+            rms_norm_eps=config.rms_norm_eps,
+            backend=backend,
+            _metadata_validated=True,
+        )
+    _remember_paged_value_tensor(cache, "paged_write_positions", validated_positions)
+    _remember_paged_value_tensor(cache, "paged_write_slot_mapping", slot_mapping)
+    if repeated_position_write:
+        _remember_paged_logical_validation(cache)
+    return cache
+
+
 def _attention_probabilities(
     scores: Tensor,
     query_positions: Tensor,
@@ -870,4 +1365,104 @@ def mla_absorbed_attention(
     )
     from .ops import mla_output_projection
 
+    return mla_output_projection(heads, weights.wo, backend=backend).to(query_x.dtype)
+
+
+def mla_paged_attention(
+    query_x: Tensor,
+    cache: MLAPagedCache,
+    block_table: Tensor,
+    sequence_lengths: Tensor,
+    config: MLAConfig,
+    weights: MLAWeights,
+    *,
+    query_positions: Tensor,
+    causal: bool = True,
+    backend: MLABackend = "auto",
+) -> Tensor:
+    """Run inference-time absorbed MLA directly over a paged latent cache."""
+
+    if backend not in {"auto", "cuda", "reference"}:
+        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+    if torch.is_grad_enabled() and (
+        query_x.requires_grad
+        or any(
+            tensor is not None and tensor.requires_grad
+            for tensor in (
+                weights.wkv_a,
+                weights.kv_norm_weight,
+                weights.wkv_b,
+                weights.wo,
+                weights.wq,
+                weights.wq_a,
+                weights.q_norm_weight,
+                weights.wq_b,
+            )
+        )
+    ):
+        raise RuntimeError("MLAPagedCache is inference-only and does not support autograd")
+    if query_x.ndim != 3:
+        raise ValueError("query_x must have shape [batch, sequence, model_dim]")
+    _validate_weights(config, weights, query_x.shape[-1])
+    _validate_paged_cache_layout(cache, config)
+    if block_table.shape[0] != query_x.shape[0]:
+        raise ValueError("block_table batch dimension must match query_x")
+    if query_x.device != cache.kv_storage.device or query_x.dtype != cache.kv_storage.dtype:
+        raise ValueError("query and paged cache must share device and dtype")
+    _validate_paged_logical_cache(cache, block_table, sequence_lengths)
+    query_positions_are_current = _paged_value_tensor_is_current(
+        cache,
+        "paged_query_positions",
+        query_positions,
+    ) or _paged_value_tensor_is_current(
+        cache,
+        "paged_write_positions",
+        query_positions,
+    )
+    query_positions = _validate_batched_positions(
+        query_positions,
+        query_x.shape[0],
+        query_x.shape[1],
+        query_x.device,
+        values_validated=query_positions_are_current,
+    )
+    _remember_paged_value_tensor(cache, "paged_query_positions", query_positions)
+    if query_positions.ndim == 1:
+        query_positions = query_positions.unsqueeze(0).expand(query_x.shape[0], -1)
+    query_positions = query_positions.contiguous()
+
+    q_nope, q_pe = _project_query(
+        query_x,
+        config,
+        weights,
+        query_positions,
+        backend=backend,
+        _positions_validated=True,
+    )
+    up = weights.wkv_b.reshape(
+        config.n_heads,
+        config.qk_nope_head_dim + config.v_head_dim,
+        config.kv_lora_rank,
+    )
+    key_up = up[:, : config.qk_nope_head_dim]
+    value_up = up[:, config.qk_nope_head_dim :]
+
+    from .ops import mla_output_projection, mla_paged_absorbed_attention
+
+    heads = mla_paged_absorbed_attention(
+        q_nope,
+        q_pe,
+        cache.kv_storage,
+        cache.pe_storage,
+        cache.position_storage,
+        block_table.contiguous(),
+        sequence_lengths.contiguous(),
+        key_up,
+        value_up,
+        query_positions=query_positions,
+        causal=causal,
+        scale=config.qk_head_dim**-0.5,
+        backend=backend,
+        _metadata_validated=True,
+    )
     return mla_output_projection(heads, weights.wo, backend=backend).to(query_x.dtype)

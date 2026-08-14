@@ -24,8 +24,8 @@
 reference 固定数值语义，再逐步替换为 CUDA 和分布式实现。目前包括：
 
 - 分块 online-softmax attention，以及 FP16/BF16/FP32 CUDA forward/backward；
-- MLA 的 naive/absorbed prefill、compressed cache decode，以及直接消费 latent cache 的
-  FP16/BF16/FP32 staged CUDA pipeline；
+- MLA 的 naive/absorbed prefill、compressed static/paged cache decode，以及直接消费 latent
+  cache 的 FP16/BF16/FP32 staged CUDA pipeline；
 - DeepSeek 风格 grouped Top-K、route pack/combine、expert-major SwiGLU；
 - FP32 CUDA-core 与 FP16 WMMA expert kernel；
 - 两 rank Gloo reference，以及代码层面的 NCCL variable All-to-All/chunk pipeline。
@@ -35,8 +35,10 @@ reference 固定数值语义，再逐步替换为 CUDA 和分布式实现。目�
 我在做一个 correctness-first 的 DeepSeek MLA + MoE 算子项目。我的方法不是先写一个看起来
 很快的 kernel，而是先用 PyTorch reference 固定 forward、backward、mask、路由身份和
 determinism 语义，再把已验证边界接入 PyTorch dispatcher 和 CUDA。当前最完整的一条链路是
-MLA：从 naive/absorbed 等价推导、compressed static cache，到由 native query/cache projection、
-RoPE、absorbed attention 和 output projection 组成的 staged FP16/BF16/FP32 CUDA pipeline。它已经在单张
+MLA：从 naive/absorbed 等价推导、compressed static cache，到 per-slot paged cache，再到由 native
+query/cache projection、RoPE、absorbed attention 和 output projection 组成的 staged
+FP16/BF16/FP32 CUDA pipeline。paged attention 直接按 block table 读取 latent pages，不先展开连续
+K/V。它已经在单张
 RTX 5090、CUDA 12.8 环境中完成原生构建和数值测试；out-of-place backward 仍是 reference
 recompute，多卡 NCCL 与 NVSHMEM 也不能说成已经实机验证。这个项目主要证明的是我能把算法
 语义、PyTorch 算子契约和 CUDA 执行边界连起来，而不是宣称已经做出生产级 FA3。
@@ -154,7 +156,9 @@ absorbed: q_latent^h = q_nope^h W_K^h
   形式完全绕过显式重建。
 
 本项目缓存 `latent kv + positional pe + absolute positions`。Functional append 用
-`torch.cat` 会复制前缀；static cache 预分配 storage，只写新增条目。
+`torch.cat` 会复制前缀；static cache 预分配连续 storage，只写新增条目；paged cache 则将 payload
+存成 `[physical_page,page_offset,latent_dim]`，写入由 slot mapping 指定，读取由 block table 和
+per-row sequence length 指定。
 
 ### 2.4 当前 CUDA MLA kernel 怎么讲
 
@@ -171,6 +175,11 @@ positions。一个 block 负责一个 `(batch, head, query)` row：
 FP16/BF16/FP32 storage；query/cache projection、RoPE、attention 和最终 `W_O` 已分别接入
 native CUDA stage，
 out-of-place backward 走可追踪的 absorbed reference recompute。
+
+paged kernel 保持同一数学核心，但 key loop 先把 logical token 通过 block table 映射到物理页。
+causal 比较仍使用 absolute position，而不是 slot id；因此页在显存中的顺序不会改变 attention
+语义。当前实现支持 ragged row length 和尾页，但 page allocator、eviction、prefix sharing 与
+continuous-batching scheduler 仍不属于这个仓库。
 
 ### 2.5 用维度证明 absorbed 等价
 
@@ -199,7 +208,22 @@ sum_t p_t (W_V c_t) = W_V (sum_t p_t c_t)
 RoPE 部分不能随便吸收，因为旋转与位置相关；本实现单独缓存 `pe` 并单独计算 positional
 score。面试官若问前提，要说清这是线性结合律/分配律，且 `W_K/W_V` 对 token 共享。
 
-### 2.6 当前单卡性能证据怎么说
+### 2.6 paged cache 贡献怎么按“动作—能力—证据—边界”表达
+
+- **动作**：定义 physical page、global slot、block table 与 per-row length 契约，并实现 reference、
+  per-slot CUDA projection write 和直接 paged absorbed-attention kernel。
+- **系统能力**：decode 不再要求 batch 共享连续 cursor，也不用为了计算把 latent cache 先 gather
+  成连续 K/V；同一调用拒绝重复/越界 slot，读取拒绝无效页、未写入和非单调 absolute position。
+- **结果证据**：CPU/CUDA 对照覆盖 ragged batch、非连续物理页、覆盖写和 257-token 尾页；Kineto
+  还暴露并推动消除了重复 D2H metadata validation。
+- **个人边界**：这是 cache primitive 与 correctness kernel，不是完整 vLLM-style allocator/runtime，
+  也没有 Nsight counter 支撑生产吞吐结论。
+
+面试官若追问“为什么需要 positions”，回答 causal 语义属于逻辑 token 时间轴；physical slot
+只是存储地址。若追问“为什么同一次写禁止重复 slot、跨调用却允许覆盖”，回答前者会产生并行
+scatter race，后者是明确的生命周期操作，会一起替换 latent、RoPE 和 position 三类字段。
+
+### 2.7 当前单卡性能证据怎么说
 
 可以准确说：在 RTX 5090、PyTorch `2.10.0+cu128`、CUDA 12.8、FP32，配置
 `B=1, S=128, D=128, H=4, r_kv=32`，5 次 warmup、20 次采样：
@@ -216,7 +240,7 @@ score。面试官若问前提，要说清这是线性结合律/分配律，且 `
 包含 Python/PyTorch 周边操作，不能单独归因于 CUDA core。报告位于 `benchmark-results/`；
 没有这些限定时，不要只说“提升 1.21x”。
 
-### 2.7 如果被问“为什么目前只快一点”
+### 2.8 如果被问“为什么目前只快一点”
 
 合理回答不是找借口，而是指出当前结构：一个 block 负责一个 `(batch, head, query)` row；
 每个 key 都进行 block reduction 和同步；latent query、numerator 与 reduction buffer 放在 shared
@@ -408,7 +432,7 @@ x -> RMSNorm -> Attention -> residual add
 | “MLA 快了 1.21x” | “在 RTX 5090 的一个 B1/S128 FP32 smoke shape 下，median 相对项目 absorbed baseline 为约 1.21x” | 两份同 harness benchmark JSON | shape 很小；非生产模型；开发态源码 |
 | “做了多卡通信计算重叠” | “实现了 NCCL-only chunk/async 软件协议；物理 overlap 尚待多卡 timeline 验证” | async All-to-All 与 chunk pipeline 代码；Gloo 两 rank语义测试 | 本地只有单卡，不能声称多卡性能 |
 | “支持反向” | “CUDA forward 的一阶梯度通过可追踪 absorbed reference recompute 获得” | custom-op autograd 注册及梯度对照测试 | 不是 fused native MLA backward |
-| “支持任意输入” | “高层 API 可 fallback；原生 MLA 当前限定同 dtype CUDA FP16/BF16/FP32、无显式 mask” | 输入契约和失败测试 | 不支持 mixed dtype、任意 mask、paged cache 或生产尺寸调优 |
+| “支持任意输入” | “高层 API 可 fallback；原生 MLA 当前限定同 dtype CUDA FP16/BF16/FP32、无显式 mask，并提供 paged latent-cache primitive” | 输入契约、paged 边界测试和 CUDA 对照 | 不支持 mixed dtype、任意 mask、完整 page allocator/continuous batching 或生产尺寸调优 |
 | “低精度 Attention 已经很快” | “native Attention 已完成 FP16/BF16 correctness contract；正式四组 paired 快照里 FA4 三组 median 更低、native 一组更低，样本波动使其不能外推” | CUDA forward/backward 测试与可选 FA4 matrix | 单机小 shape；尚无 Nsight/CUTLASS 或生产调度 |
 | “实现了 NVSHMEM FlashMoE” | “实现的是 symmetric-buffer 分析模型；NVSHMEM actor backend 是研究目标” | `symmetric_memory.py` 与讲义 | 没有 one-sided runtime backend |
 

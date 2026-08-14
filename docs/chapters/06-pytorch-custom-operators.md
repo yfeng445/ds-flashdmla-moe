@@ -28,6 +28,21 @@ tiled_gemm(Tensor a, Tensor b, Tensor? c,
 `βC` 没有定义。Python、FakeTensor 与 CUDA wrapper 都执行同一个检查；不能只在 native
 路径校验，否则 backend fallback 会改变错误行为。
 
+会原地修改 cache 的 schema 还必须标出 alias/mutation：
+
+```text
+mla_cache_projection_write_slots(...,
+    Tensor(a!) kv_storage, Tensor(b!) pe_storage,
+    Tensor(c!) position_storage,
+    bool metadata_validated, ...) -> ()
+```
+
+`a!`/`b!`/`c!` 告诉 dispatcher、FakeTensor 与编译器这些输入会被修改。paged attention 自身
+是 out-of-place，但与 slot write 都带一个内部 `metadata_validated` 标记：高层 API 完整检查
+slot/page/position 值后传 `true`，避免 CUDA wrapper 再把相同 metadata 读回 host；直接调用 raw
+operator 的测试传 `false`，保留越界、重复和页表防御检查。这个标记不是跳过公开 API 契约的
+用户选项；高层只在 Tensor identity/version 仍匹配已验证记录时复用结果。
+
 `TORCH_LIBRARY` 只定义 schema，`TORCH_LIBRARY_IMPL(..., CUDA, ...)` 为 CUDA dispatch
 key 注册实现。二者分开以后，同一算子可以拥有 CPU、CUDA、Meta 或其他 backend，调用
 方不必手写设备分支去直接调用 pybind 函数。
@@ -211,4 +226,5 @@ attention、MLA、router 与 expert wrapper 延续同一约定，并各自公开
 3. Linux + NVIDIA GPU：运行多 shape 数值矩阵、current-stream 测试和 reference backward。
 
 第二层通过不代表 kernel 数值正确，第三层通过也不替代不同 SM、dtype 和极限 shape 的
-覆盖。把证据拆开记录，才能准确说清“源码可编译”和“算子已在 GPU 验证”的区别。
+覆盖。当前扩展注册 16 个 CUDA operator，其中两个是 paged MLA 的 per-slot write 与直接页表
+attention。把证据拆开记录，才能准确说清“源码可编译”和“算子已在 GPU 验证”的区别。

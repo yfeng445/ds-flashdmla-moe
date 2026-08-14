@@ -20,14 +20,18 @@ from .mla import (
     MLABackend,
     MLAConfig,
     MLALatentCache,
+    MLAPagedCache,
     MLAStaticCache,
     MLAWeights,
+    allocate_mla_paged_cache,
     allocate_mla_static_cache,
     append_mla_cache,
     build_mla_cache,
     mla_absorbed_attention,
     mla_absorbed_attention_reference,
     mla_naive_attention_reference,
+    mla_paged_attention,
+    write_mla_paged_cache,
     write_mla_static_cache,
 )
 
@@ -38,6 +42,7 @@ MLAWorkload = Literal[
     "decode_attention",
     "decode_with_append",
     "decode_with_static_write",
+    "decode_with_paged_write",
 ]
 
 
@@ -45,6 +50,7 @@ MLAWorkload = Literal[
 class MLABenchmarkConfig:
     batch: int = 1
     sequence_length: int = 128
+    page_size: int = 16
     model_dim: int = 128
     n_heads: int = 4
     q_lora_rank: int = 32
@@ -65,6 +71,7 @@ class MLABenchmarkConfig:
         positive = (
             self.batch,
             self.sequence_length,
+            self.page_size,
             self.model_dim,
             self.n_heads,
             self.kv_lora_rank,
@@ -99,8 +106,11 @@ class MLABenchmarkConfig:
             "decode_attention",
             "decode_with_append",
             "decode_with_static_write",
+            "decode_with_paged_write",
         }:
             raise ValueError("unsupported MLA workload")
+        if self.workload == "decode_with_paged_write" and self.implementation == "naive":
+            raise ValueError("paged MLA benchmarking supports absorbed or cuda implementations")
 
     def mla_config(self) -> MLAConfig:
         self.validate()
@@ -210,7 +220,11 @@ def mla_work_estimate(config: MLABenchmarkConfig) -> dict[str, int]:
     cache_tokens = 0
     if config.workload == "prefill_with_cache":
         cache_tokens = key_length
-    elif config.workload in {"decode_with_append", "decode_with_static_write"}:
+    elif config.workload in {
+        "decode_with_append",
+        "decode_with_static_write",
+        "decode_with_paged_write",
+    }:
         cache_tokens = 1
     cache_projection = (
         2
@@ -234,6 +248,17 @@ def mla_work_estimate(config: MLABenchmarkConfig) -> dict[str, int]:
             batch * (config.kv_lora_rank + config.qk_rope_head_dim) * dtype_size
             + torch.empty((), dtype=torch.long).element_size()
         )
+    paged_write_bytes = 0
+    page_table_metadata_bytes = 0
+    if config.workload == "decode_with_paged_write":
+        paged_write_bytes = (
+            batch * (config.kv_lora_rank + config.qk_rope_head_dim) * dtype_size
+            + 2 * batch * torch.empty((), dtype=torch.long).element_size()
+        )
+        pages_per_sequence = (key_length + config.page_size - 1) // config.page_size
+        page_table_metadata_bytes = (
+            batch * (pages_per_sequence + 1) * torch.empty((), dtype=torch.long).element_size()
+        )
     total = query_projection + path_flops + output_projection + cache_projection
     return {
         "query_length": query_length,
@@ -245,6 +270,8 @@ def mla_work_estimate(config: MLABenchmarkConfig) -> dict[str, int]:
         "total_matrix_flops": total,
         "functional_append_copy_bytes_lower_bound": append_copy_bytes,
         "static_cache_storage_write_bytes": static_write_bytes,
+        "paged_cache_storage_write_bytes": paged_write_bytes,
+        "page_table_metadata_bytes": page_table_metadata_bytes,
     }
 
 
@@ -397,6 +424,10 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
         else None
     )
     static_cache: MLAStaticCache | None = None
+    paged_cache: MLAPagedCache | None = None
+    paged_block_table: Tensor | None = None
+    paged_sequence_lengths: Tensor | None = None
+    paged_slot_mapping: Tensor | None = None
     static_prefix_length = max(config.sequence_length - 1, 0)
     if config.workload == "decode_with_static_write":
         static_cache = allocate_mla_static_cache(
@@ -416,13 +447,81 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
                     positions=positions[:-1],
                     backend=configured_backend,
                 )
+    if config.workload == "decode_with_paged_write":
+        pages_per_sequence = (config.sequence_length + config.page_size - 1) // config.page_size
+        paged_cache = allocate_mla_paged_cache(
+            num_pages=config.batch * pages_per_sequence,
+            page_size=config.page_size,
+            config=mla_config,
+            device=device,
+            dtype=dtype,
+        )
+        paged_block_table = torch.arange(
+            config.batch * pages_per_sequence,
+            device=device,
+        ).reshape(config.batch, pages_per_sequence)
+        logical_indices = torch.arange(config.sequence_length, device=device)
+        logical_pages = torch.div(logical_indices, config.page_size, rounding_mode="floor")
+        page_offsets = logical_indices.remainder(config.page_size)
+        paged_slot_mapping = paged_block_table[
+            :, logical_pages
+        ] * config.page_size + page_offsets.unsqueeze(0)
+        paged_sequence_lengths = torch.full(
+            (config.batch,),
+            config.sequence_length,
+            device=device,
+            dtype=torch.long,
+        )
+        if static_prefix_length:
+            with torch.inference_mode():
+                write_mla_paged_cache(
+                    paged_cache,
+                    context[:, :-1],
+                    mla_config,
+                    weights,
+                    positions=positions[:-1],
+                    slot_mapping=paged_slot_mapping[:, :-1],
+                    backend=configured_backend,
+                )
 
     is_decode = config.workload.startswith("decode")
     query = context[:, -1:] if is_decode else context
     query_positions = positions[-1:] if is_decode else positions
+    paged_query_positions: Tensor | None = None
+    paged_decode_slot_mapping: Tensor | None = None
+    if config.workload == "decode_with_paged_write":
+        assert paged_slot_mapping is not None
+        paged_query_positions = query_positions.unsqueeze(0).expand(config.batch, -1)
+        paged_decode_slot_mapping = paged_slot_mapping[:, -1:]
 
     def operation_for(implementation: MLAImplementation) -> Tensor:
         projection_backend = _projection_backend(implementation)
+        if config.workload == "decode_with_paged_write":
+            assert paged_cache is not None
+            assert paged_block_table is not None
+            assert paged_sequence_lengths is not None
+            assert paged_query_positions is not None
+            assert paged_decode_slot_mapping is not None
+            write_mla_paged_cache(
+                paged_cache,
+                query,
+                mla_config,
+                weights,
+                positions=paged_query_positions,
+                slot_mapping=paged_decode_slot_mapping,
+                backend=projection_backend,
+            )
+            return mla_paged_attention(
+                query,
+                paged_cache,
+                paged_block_table,
+                paged_sequence_lengths,
+                mla_config,
+                weights,
+                query_positions=paged_query_positions,
+                causal=True,
+                backend=projection_backend,
+            )
         if config.workload == "prefill_with_cache":
             cache = build_mla_cache(
                 context,
@@ -466,12 +565,29 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
     with torch.inference_mode():
         output = operation_for(config.implementation)
         if config.verify:
-            alternate: MLAImplementation = (
-                "absorbed" if config.implementation in {"naive", "cuda"} else "naive"
-            )
+            if config.workload == "decode_with_paged_write":
+                expected = mla_absorbed_attention_reference(
+                    query,
+                    build_mla_cache(
+                        context,
+                        mla_config,
+                        weights,
+                        positions=positions,
+                        backend="reference",
+                    ),
+                    mla_config,
+                    weights,
+                    query_positions=query_positions,
+                    causal=True,
+                )
+            else:
+                alternate: MLAImplementation = (
+                    "absorbed" if config.implementation in {"naive", "cuda"} else "naive"
+                )
+                expected = operation_for(alternate)
             verification = _error_report(
                 output,
-                operation_for(alternate),
+                expected,
                 implementation=config.implementation,
             )
         else:
@@ -533,6 +649,7 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
             "cache payload bytes are a storage model, not measured memory traffic",
             "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
             "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+            "decode_with_paged_write overwrites one physical slot and reads through a block table",
             (
                 "cuda covers query projection, cache projection/static write, absorbed online "
                 "attention, and output projection with same-dtype native operators and FP32 "

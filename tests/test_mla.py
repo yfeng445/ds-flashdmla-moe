@@ -5,15 +5,21 @@ import torch
 
 from ds_flash_mla_moe import (
     MLAConfig,
+    MLAPagedCache,
     MLAStaticCache,
     MLAWeights,
+    allocate_mla_paged_cache,
     allocate_mla_static_cache,
     append_mla_cache,
     build_mla_cache,
     cuda_mla_available,
+    cuda_paged_mla_available,
+    materialize_mla_paged_cache,
     mla_absorbed_attention,
     mla_absorbed_attention_reference,
     mla_naive_attention_reference,
+    mla_paged_attention,
+    write_mla_paged_cache,
     write_mla_static_cache,
 )
 from ds_flash_mla_moe.ops import (
@@ -67,6 +73,13 @@ def make_fixture(*, direct_query: bool = False):
         )
     x = torch.randn(batch, sequence, model_dim, dtype=dtype)
     return x, config, weights
+
+
+def physical_slots(pages: list[int], length: int, page_size: int) -> torch.Tensor:
+    return torch.tensor(
+        [pages[index // page_size] * page_size + index % page_size for index in range(length)],
+        dtype=torch.long,
+    )
 
 
 def cuda_weights(
@@ -1288,3 +1301,706 @@ def test_static_cache_is_explicitly_inference_only() -> None:
     )
     with pytest.raises(RuntimeError, match="inference-only"):
         write_mla_static_cache(static, x.requires_grad_(), config, weights)
+
+
+def test_paged_cache_allocation_layout_and_clear_contract() -> None:
+    _, config, _ = make_fixture()
+    cache = allocate_mla_paged_cache(
+        num_pages=5,
+        page_size=3,
+        config=config,
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    assert cache.kv_storage.shape == (5, 3, config.kv_lora_rank)
+    assert cache.pe_storage.shape == (5, 3, config.qk_rope_head_dim)
+    assert cache.position_storage.shape == (5, 3)
+    assert cache.num_pages == 5 and cache.page_size == 3 and cache.capacity == 15
+    assert torch.all(cache.position_storage == -1)
+    cache.position_storage[2, 1] = 17
+    cache.clear()
+    assert torch.all(cache.position_storage == -1)
+
+
+def test_paged_cache_slot_writes_materialize_variable_logical_lengths() -> None:
+    x, config, weights = make_fixture()
+    page_size = 2
+    cache = allocate_mla_paged_cache(
+        num_pages=6,
+        page_size=page_size,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    page_rows = ([3, 0, 5], [2, 4])
+    lengths = torch.tensor([6, 4])
+    block_table = torch.tensor([[3, 0, 5], [2, 4, -1]])
+    position_rows = (torch.arange(10, 16), torch.arange(20, 24))
+    expected = []
+
+    with torch.inference_mode():
+        for batch_index, (pages, length, positions) in enumerate(
+            zip(page_rows, lengths.tolist(), position_rows, strict=True)
+        ):
+            write_mla_paged_cache(
+                cache,
+                x[batch_index : batch_index + 1, :length],
+                config,
+                weights,
+                positions=positions,
+                slot_mapping=physical_slots(list(pages), length, page_size).unsqueeze(0),
+                backend="reference",
+            )
+            expected.append(
+                build_mla_cache(
+                    x[batch_index : batch_index + 1, :length],
+                    config,
+                    weights,
+                    positions=positions,
+                    backend="reference",
+                )
+            )
+        view = materialize_mla_paged_cache(cache, block_table, lengths)
+
+    assert view.kv.shape == (2, 6, config.kv_lora_rank)
+    assert view.pe.shape == (2, 6, config.qk_rope_head_dim)
+    assert view.positions.tolist() == [[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, -1, -1]]
+    assert view.valid_mask.tolist() == [
+        [True, True, True, True, True, True],
+        [True, True, True, True, False, False],
+    ]
+    for batch_index, length in enumerate(lengths.tolist()):
+        torch.testing.assert_close(
+            view.kv[batch_index : batch_index + 1, :length], expected[batch_index].kv
+        )
+        torch.testing.assert_close(
+            view.pe[batch_index : batch_index + 1, :length], expected[batch_index].pe
+        )
+    assert torch.count_nonzero(view.kv[1, 4:]) == 0
+    assert torch.count_nonzero(view.pe[1, 4:]) == 0
+
+
+def test_paged_attention_matches_per_sequence_contiguous_reference() -> None:
+    x, config, weights = make_fixture()
+    cache = allocate_mla_paged_cache(
+        num_pages=6,
+        page_size=2,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    page_rows = ([3, 0, 5], [2, 4])
+    lengths = torch.tensor([6, 4])
+    block_table = torch.tensor([[3, 0, 5], [2, 4, -1]])
+    position_rows = (torch.arange(10, 16), torch.arange(20, 24))
+    query_x = torch.cat((x[0:1, 4:6], x[1:2, 2:4]), dim=0)
+    query_positions = torch.tensor([[14, 15], [22, 23]])
+    expected_outputs = []
+
+    with torch.inference_mode():
+        for batch_index, (pages, length, positions) in enumerate(
+            zip(page_rows, lengths.tolist(), position_rows, strict=True)
+        ):
+            row_x = x[batch_index : batch_index + 1, :length]
+            write_mla_paged_cache(
+                cache,
+                row_x,
+                config,
+                weights,
+                positions=positions,
+                slot_mapping=physical_slots(list(pages), length, cache.page_size).unsqueeze(0),
+                backend="reference",
+            )
+            contiguous = build_mla_cache(
+                row_x,
+                config,
+                weights,
+                positions=positions,
+                backend="reference",
+            )
+            expected_outputs.append(
+                mla_absorbed_attention_reference(
+                    query_x[batch_index : batch_index + 1],
+                    contiguous,
+                    config,
+                    weights,
+                    query_positions=query_positions[batch_index],
+                    causal=True,
+                )
+            )
+        actual = mla_paged_attention(
+            query_x,
+            cache,
+            block_table,
+            lengths,
+            config,
+            weights,
+            query_positions=query_positions,
+            causal=True,
+            backend="reference",
+        )
+
+    torch.testing.assert_close(actual, torch.cat(expected_outputs, dim=0), rtol=1e-10, atol=1e-10)
+
+
+def test_paged_attention_long_context_tail_page_matches_contiguous_reference() -> None:
+    _, config, weights = make_fixture()
+    sequence_length = 257
+    page_size = 8
+    required_pages = (sequence_length + page_size - 1) // page_size
+    logical_pages = list(range(0, required_pages, 2)) + list(range(1, required_pages, 2))
+    x = torch.randn(1, sequence_length, weights.wkv_a.shape[1], dtype=weights.wkv_a.dtype)
+    positions = torch.arange(100, 100 + sequence_length * 2, 2)
+    cache = allocate_mla_paged_cache(
+        num_pages=required_pages + 3,
+        page_size=page_size,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    block_table = torch.tensor([logical_pages])
+    lengths = torch.tensor([sequence_length])
+
+    with torch.inference_mode():
+        write_mla_paged_cache(
+            cache,
+            x,
+            config,
+            weights,
+            positions=positions,
+            slot_mapping=physical_slots(logical_pages, sequence_length, page_size).unsqueeze(0),
+            backend="reference",
+        )
+        contiguous = build_mla_cache(
+            x,
+            config,
+            weights,
+            positions=positions,
+            backend="reference",
+        )
+        actual = mla_paged_attention(
+            x[:, -1:],
+            cache,
+            block_table,
+            lengths,
+            config,
+            weights,
+            query_positions=positions[-1:].unsqueeze(0),
+            backend="reference",
+        )
+        expected = mla_absorbed_attention_reference(
+            x[:, -1:],
+            contiguous,
+            config,
+            weights,
+            query_positions=positions[-1:],
+        )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
+
+
+def test_paged_cache_rejects_duplicate_and_out_of_range_slot_writes() -> None:
+    x, config, weights = make_fixture()
+    cache = allocate_mla_paged_cache(
+        num_pages=2,
+        page_size=2,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    positions = torch.tensor([0, 1])
+
+    with torch.inference_mode(), pytest.raises(ValueError, match="duplicate"):
+        write_mla_paged_cache(
+            cache,
+            x[:1, :2],
+            config,
+            weights,
+            positions=positions,
+            slot_mapping=torch.tensor([[1, 1]]),
+        )
+    with torch.inference_mode(), pytest.raises(ValueError, match="out-of-range"):
+        write_mla_paged_cache(
+            cache,
+            x[:1, :2],
+            config,
+            weights,
+            positions=positions,
+            slot_mapping=torch.tensor([[0, cache.capacity]]),
+        )
+
+
+def test_paged_cache_allows_complete_slot_overwrite_across_calls() -> None:
+    x, config, weights = make_fixture()
+    cache = allocate_mla_paged_cache(
+        num_pages=2,
+        page_size=2,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    slot = torch.tensor([[3]])
+
+    with torch.inference_mode():
+        write_mla_paged_cache(
+            cache,
+            x[:1, :1],
+            config,
+            weights,
+            positions=torch.tensor([5]),
+            slot_mapping=slot,
+            backend="reference",
+        )
+        write_mla_paged_cache(
+            cache,
+            x[:1, 4:5],
+            config,
+            weights,
+            positions=torch.tensor([9]),
+            slot_mapping=slot,
+            backend="reference",
+        )
+        expected = build_mla_cache(
+            x[:1, 4:5],
+            config,
+            weights,
+            positions=torch.tensor([9]),
+            backend="reference",
+        )
+
+    torch.testing.assert_close(cache.kv_storage.view(-1, config.kv_lora_rank)[3], expected.kv[0, 0])
+    torch.testing.assert_close(
+        cache.pe_storage.view(-1, config.qk_rope_head_dim)[3], expected.pe[0, 0]
+    )
+    assert cache.position_storage.view(-1)[3].item() == 9
+
+
+def test_paged_slot_validation_cache_invalidates_after_inplace_mutation() -> None:
+    x, config, weights = make_fixture()
+    cache = allocate_mla_paged_cache(
+        num_pages=2,
+        page_size=2,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    positions = torch.tensor([0, 1])
+    slots = torch.tensor([[0, 1]])
+
+    with torch.inference_mode():
+        write_mla_paged_cache(
+            cache,
+            x[:1, :2],
+            config,
+            weights,
+            positions=positions,
+            slot_mapping=slots,
+            backend="reference",
+        )
+        slots[0, 1] = 0
+        with pytest.raises(ValueError, match="duplicate"):
+            write_mla_paged_cache(
+                cache,
+                x[:1, :2],
+                config,
+                weights,
+                positions=positions,
+                slot_mapping=slots,
+                backend="reference",
+            )
+
+
+@pytest.mark.parametrize(
+    ("block_table", "lengths", "message"),
+    [
+        (torch.tensor([[3]]), torch.tensor([1]), "out-of-range"),
+        (torch.tensor([[0, 0]]), torch.tensor([3]), "repeats"),
+        (torch.tensor([[0, 1]]), torch.tensor([1]), "unused"),
+        (torch.tensor([[0]]), torch.tensor([3]), "capacity"),
+    ],
+)
+def test_paged_cache_rejects_invalid_block_table_contract(
+    block_table: torch.Tensor,
+    lengths: torch.Tensor,
+    message: str,
+) -> None:
+    _, config, _ = make_fixture()
+    cache = allocate_mla_paged_cache(
+        num_pages=3,
+        page_size=2,
+        config=config,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    with pytest.raises(ValueError, match=message):
+        materialize_mla_paged_cache(cache, block_table, lengths)
+
+
+def test_paged_metadata_validation_cache_invalidates_after_inplace_mutation() -> None:
+    x, config, weights = make_fixture()
+    cache = allocate_mla_paged_cache(
+        num_pages=2,
+        page_size=2,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    table = torch.tensor([[0, -1]])
+    lengths = torch.tensor([2])
+    with torch.inference_mode():
+        write_mla_paged_cache(
+            cache,
+            x[:1, :2],
+            config,
+            weights,
+            positions=torch.tensor([0, 1]),
+            slot_mapping=torch.tensor([[0, 1]]),
+            backend="reference",
+        )
+        materialize_mla_paged_cache(cache, table, lengths)
+        table[0, 1] = 1
+    with pytest.raises(ValueError, match="unused"):
+        materialize_mla_paged_cache(cache, table, lengths)
+
+
+def test_paged_cache_rejects_unwritten_and_nonmonotonic_logical_slots() -> None:
+    x, config, weights = make_fixture()
+    cache = allocate_mla_paged_cache(
+        num_pages=2,
+        page_size=2,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    table = torch.tensor([[0]])
+    lengths = torch.tensor([2])
+    with pytest.raises(ValueError, match="unwritten"):
+        materialize_mla_paged_cache(cache, table, lengths)
+
+    with torch.inference_mode():
+        write_mla_paged_cache(
+            cache,
+            x[:1, :2],
+            config,
+            weights,
+            positions=torch.tensor([3, 4]),
+            slot_mapping=torch.tensor([[0, 1]]),
+            backend="reference",
+        )
+        materialize_mla_paged_cache(cache, table, lengths)
+        cache.position_storage[0, 1] = 3
+    with pytest.raises(ValueError, match="increase"):
+        materialize_mla_paged_cache(cache, table, lengths)
+
+
+def test_paged_cache_is_explicitly_inference_only() -> None:
+    x, config, weights = make_fixture()
+    cache: MLAPagedCache = allocate_mla_paged_cache(
+        num_pages=2,
+        page_size=4,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    with pytest.raises(RuntimeError, match="inference-only"):
+        write_mla_paged_cache(
+            cache,
+            x[:1, :1].requires_grad_(),
+            config,
+            weights,
+            positions=torch.tensor([0]),
+            slot_mapping=torch.tensor([[0]]),
+        )
+
+
+def test_raw_mla_paged_cache_write_passes_opcheck() -> None:
+    x, config, weights = make_fixture()
+    positions = torch.stack((torch.arange(3), torch.arange(10, 13)))
+    slot_mapping = torch.tensor([[0, 3, 4], [1, 6, 7]])
+    kv_storage = torch.full((2, 4, config.kv_lora_rank), torch.nan, dtype=x.dtype)
+    pe_storage = torch.full((2, 4, config.qk_rope_head_dim), torch.nan, dtype=x.dtype)
+    position_storage = torch.full((2, 4), -1, dtype=torch.long)
+    inputs = (
+        x[:, :3],
+        weights.wkv_a,
+        weights.kv_norm_weight,
+        positions,
+        slot_mapping,
+        kv_storage,
+        pe_storage,
+        position_storage,
+        False,
+        config.rope_theta,
+        config.rms_norm_eps,
+    )
+
+    torch.library.opcheck(
+        torch.ops.ds_flash_mla_moe.mla_cache_projection_write_slots.default,
+        inputs,
+    )
+    torch.ops.ds_flash_mla_moe.mla_cache_projection_write_slots.default(*inputs)
+    for batch_index in range(x.shape[0]):
+        expected = build_mla_cache(
+            x[batch_index : batch_index + 1, :3],
+            config,
+            weights,
+            positions=positions[batch_index],
+            backend="reference",
+        )
+        slots = slot_mapping[batch_index]
+        torch.testing.assert_close(
+            kv_storage.view(-1, config.kv_lora_rank)[slots],
+            expected.kv[0],
+        )
+        torch.testing.assert_close(
+            pe_storage.view(-1, config.qk_rope_head_dim)[slots],
+            expected.pe[0],
+        )
+
+
+def test_raw_mla_paged_attention_runs_through_torch_compile() -> None:
+    torch.manual_seed(20260814)
+    q_nope = torch.randn(2, 2, 3, 4, dtype=torch.float64)
+    q_pe = torch.randn(2, 2, 3, 2, dtype=torch.float64)
+    kv_storage = torch.randn(3, 2, 4, dtype=torch.float64)
+    pe_storage = torch.randn(3, 2, 2, dtype=torch.float64)
+    position_storage = torch.tensor([[2, 3], [0, 1], [10, 11]])
+    block_table = torch.tensor([[1, 0], [2, -1]])
+    sequence_lengths = torch.tensor([4, 2])
+    key_up = torch.randn(3, 4, 4, dtype=torch.float64)
+    value_up = torch.randn(3, 3, 4, dtype=torch.float64)
+    query_positions = torch.tensor([[2, 3], [10, 11]])
+
+    @torch.compile(fullgraph=True, backend="eager")
+    def compiled(*inputs: torch.Tensor) -> torch.Tensor:
+        return torch.ops.ds_flash_mla_moe.mla_paged_absorbed_attention.default(
+            *inputs,
+            False,
+            True,
+            0.25,
+        )
+
+    inputs = (
+        q_nope,
+        q_pe,
+        kv_storage,
+        pe_storage,
+        position_storage,
+        block_table,
+        sequence_lengths,
+        key_up,
+        value_up,
+        query_positions,
+    )
+    expected = torch.ops.ds_flash_mla_moe.mla_paged_absorbed_attention.default(
+        *inputs,
+        False,
+        True,
+        0.25,
+    )
+    torch.testing.assert_close(compiled(*inputs), expected)
+
+
+@pytest.mark.skipif(
+    not cuda_paged_mla_available(),
+    reason="requires native paged MLA kernels and a CUDA device",
+)
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cuda_paged_cache_write_and_attention_match_reference(dtype: torch.dtype) -> None:
+    x, config, weights = make_fixture()
+    x = x.to(device="cuda", dtype=dtype)
+    weights = cuda_weights(weights, dtype=dtype)
+    native_cache = allocate_mla_paged_cache(
+        num_pages=6,
+        page_size=2,
+        config=config,
+        device="cuda",
+        dtype=dtype,
+    )
+    reference_cache = allocate_mla_paged_cache(
+        num_pages=6,
+        page_size=2,
+        config=config,
+        device="cuda",
+        dtype=dtype,
+    )
+    page_rows = ([3, 0, 5], [2, 4])
+    lengths = torch.tensor([6, 4], device="cuda")
+    block_table = torch.tensor([[3, 0, 5], [2, 4, -1]], device="cuda")
+    position_rows = (
+        torch.arange(10, 16, device="cuda"),
+        torch.arange(20, 24, device="cuda"),
+    )
+
+    with torch.inference_mode():
+        for batch_index, (pages, length, positions) in enumerate(
+            zip(page_rows, lengths.cpu().tolist(), position_rows, strict=True)
+        ):
+            slots = (
+                physical_slots(list(pages), length, native_cache.page_size).to("cuda").unsqueeze(0)
+            )
+            row_x = x[batch_index : batch_index + 1, :length]
+            write_mla_paged_cache(
+                native_cache,
+                row_x,
+                config,
+                weights,
+                positions=positions,
+                slot_mapping=slots,
+                backend="cuda",
+            )
+            write_mla_paged_cache(
+                reference_cache,
+                row_x,
+                config,
+                weights,
+                positions=positions,
+                slot_mapping=slots,
+                backend="reference",
+            )
+
+        native_view = materialize_mla_paged_cache(native_cache, block_table, lengths)
+        reference_view = materialize_mla_paged_cache(reference_cache, block_table, lengths)
+        query_x = torch.cat((x[0:1, 4:6], x[1:2, 2:4]), dim=0)
+        query_positions = torch.tensor([[14, 15], [22, 23]], device="cuda")
+        actual = mla_paged_attention(
+            query_x,
+            native_cache,
+            block_table,
+            lengths,
+            config,
+            weights,
+            query_positions=query_positions,
+            backend="cuda",
+        )
+        expected = mla_paged_attention(
+            query_x,
+            reference_cache,
+            block_table,
+            lengths,
+            config,
+            weights,
+            query_positions=query_positions,
+            backend="reference",
+        )
+
+    stage_rtol, stage_atol = _mla_cuda_stage_tolerances(dtype)
+    torch.testing.assert_close(native_view.kv, reference_view.kv, rtol=stage_rtol, atol=stage_atol)
+    torch.testing.assert_close(native_view.pe, reference_view.pe, rtol=stage_rtol, atol=stage_atol)
+    rtol, atol = _mla_cuda_tolerances(dtype)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(
+    not cuda_paged_mla_available(),
+    reason="requires native paged MLA kernels and a CUDA device",
+)
+@pytest.mark.cuda
+def test_cuda_paged_attention_long_context_tail_page_matches_reference() -> None:
+    _, config, weights = make_fixture()
+    dtype = torch.bfloat16
+    weights = cuda_weights(weights, dtype=dtype)
+    sequence_length = 257
+    page_size = 16
+    required_pages = (sequence_length + page_size - 1) // page_size
+    logical_pages = list(range(1, required_pages + 1))
+    x = torch.randn(1, sequence_length, weights.wkv_a.shape[1], device="cuda", dtype=dtype)
+    positions = torch.arange(50, 50 + sequence_length, device="cuda")
+    native_cache = allocate_mla_paged_cache(
+        num_pages=required_pages + 1,
+        page_size=page_size,
+        config=config,
+        device="cuda",
+        dtype=dtype,
+    )
+    reference_cache = allocate_mla_paged_cache(
+        num_pages=required_pages + 1,
+        page_size=page_size,
+        config=config,
+        device="cuda",
+        dtype=dtype,
+    )
+    block_table = torch.tensor([logical_pages], device="cuda")
+    lengths = torch.tensor([sequence_length], device="cuda")
+    slots = physical_slots(logical_pages, sequence_length, page_size).to("cuda").unsqueeze(0)
+
+    with torch.inference_mode():
+        write_mla_paged_cache(
+            native_cache,
+            x,
+            config,
+            weights,
+            positions=positions,
+            slot_mapping=slots,
+            backend="cuda",
+        )
+        write_mla_paged_cache(
+            reference_cache,
+            x,
+            config,
+            weights,
+            positions=positions,
+            slot_mapping=slots,
+            backend="reference",
+        )
+        query_positions = positions[-1:].unsqueeze(0)
+        actual = mla_paged_attention(
+            x[:, -1:],
+            native_cache,
+            block_table,
+            lengths,
+            config,
+            weights,
+            query_positions=query_positions,
+            backend="cuda",
+        )
+        expected = mla_paged_attention(
+            x[:, -1:],
+            reference_cache,
+            block_table,
+            lengths,
+            config,
+            weights,
+            query_positions=query_positions,
+            backend="reference",
+        )
+
+    rtol, atol = _mla_cuda_tolerances(dtype)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(
+    not cuda_paged_mla_available(),
+    reason="requires native paged MLA kernels and a CUDA device",
+)
+@pytest.mark.cuda
+@pytest.mark.parametrize("slot_mapping", [torch.tensor([[0, 0]]), torch.tensor([[0, 4]])])
+def test_raw_cuda_paged_cache_write_rejects_unsafe_slots(slot_mapping: torch.Tensor) -> None:
+    x, config, weights = make_fixture()
+    x = x[:1, :2].to(device="cuda", dtype=torch.float32)
+    weights = cuda_weights(weights)
+    cache = allocate_mla_paged_cache(
+        num_pages=2,
+        page_size=2,
+        config=config,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    positions = torch.tensor([[0, 1]], device="cuda")
+
+    with pytest.raises(RuntimeError, match="slot_mapping"):
+        torch.ops.ds_flash_mla_moe.mla_cache_projection_write_slots.default(
+            x,
+            weights.wkv_a,
+            weights.kv_norm_weight,
+            positions,
+            slot_mapping.to("cuda"),
+            cache.kv_storage,
+            cache.pe_storage,
+            cache.position_storage,
+            False,
+            config.rope_theta,
+            config.rms_norm_eps,
+        )

@@ -12,6 +12,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=128)
+    parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--model-dim", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--q-lora-rank", type=int, default=32)
@@ -36,6 +37,7 @@ def parse_args() -> argparse.Namespace:
             "decode_attention",
             "decode_with_append",
             "decode_with_static_write",
+            "decode_with_paged_write",
         ),
         default="prefill_attention",
     )
@@ -52,6 +54,7 @@ def main() -> None:
     config = MLABenchmarkConfig(
         batch=arguments.batch,
         sequence_length=arguments.sequence_length,
+        page_size=arguments.page_size,
         model_dim=arguments.model_dim,
         n_heads=arguments.n_heads,
         q_lora_rank=arguments.q_lora_rank,

@@ -153,7 +153,8 @@ __global__ void query_rope_kernel(
     int64_t heads,
     int64_t nope_dim,
     int64_t rope_dim,
-    int64_t position_stride,
+    int64_t position_stride_batch,
+    int64_t position_stride_sequence,
     float theta) {
   const int64_t head_dim = nope_dim + rope_dim;
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -163,6 +164,7 @@ __global__ void query_rope_kernel(
     const int64_t head_row = index / rope_dim;
     const int64_t head = head_row % heads;
     const int64_t row = head_row / heads;
+    const int64_t batch = row / sequence;
     const int64_t sequence_index = row % sequence;
     const int64_t pair_feature = rope_feature & ~int64_t{1};
     const int64_t input_offset =
@@ -171,7 +173,9 @@ __global__ void query_rope_kernel(
     const float odd = static_cast<float>(projected[input_offset + 1]);
     const float inverse_frequency =
         powf(theta, -static_cast<float>(pair_feature) / static_cast<float>(rope_dim));
-    const float angle = static_cast<float>(positions[sequence_index * position_stride]) *
+    const float angle = static_cast<float>(
+                            positions[batch * position_stride_batch +
+                                      sequence_index * position_stride_sequence]) *
         inverse_frequency;
     const float cosine = cosf(angle);
     const float sine = sinf(angle);
@@ -239,6 +243,32 @@ __global__ void copy_positions_kernel(
   }
 }
 
+template <typename scalar_t>
+__global__ void scatter_cache_slots_kernel(
+    const scalar_t* __restrict__ kv,
+    const scalar_t* __restrict__ pe,
+    const int64_t* __restrict__ positions,
+    const int64_t* __restrict__ slot_mapping,
+    scalar_t* __restrict__ kv_storage,
+    scalar_t* __restrict__ pe_storage,
+    int64_t* __restrict__ position_storage,
+    int64_t token_count,
+    int64_t latent_dim,
+    int64_t rope_dim) {
+  for (int64_t token = blockIdx.x; token < token_count; token += gridDim.x) {
+    const int64_t slot = slot_mapping[token];
+    for (int64_t feature = threadIdx.x; feature < latent_dim; feature += blockDim.x) {
+      kv_storage[slot * latent_dim + feature] = kv[token * latent_dim + feature];
+    }
+    for (int64_t feature = threadIdx.x; feature < rope_dim; feature += blockDim.x) {
+      pe_storage[slot * rope_dim + feature] = pe[token * rope_dim + feature];
+    }
+    if (threadIdx.x == 0) {
+      position_storage[slot] = positions[token];
+    }
+  }
+}
+
 void check_cuda_mla_tensor(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(
@@ -270,6 +300,12 @@ void check_cuda_long_vector(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(tensor.scalar_type() == at::kLong, name, " must use int64");
   TORCH_CHECK(tensor.dim() == 1, name, " must be a vector");
+}
+
+void check_cuda_query_positions(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name, " must use int64");
+  TORCH_CHECK(tensor.dim() == 1 || tensor.dim() == 2, name, " must have rank 1 or 2");
 }
 
 void check_rope_parameters(int64_t rope_dim, double theta) {
@@ -426,7 +462,8 @@ std::tuple<at::Tensor, at::Tensor> split_query_and_apply_rope(
               heads,
               nope_dim,
               rope_dim,
-              positions.stride(0),
+              positions.dim() == 1 ? 0 : positions.stride(0),
+              positions.stride(positions.dim() - 1),
               static_cast<float>(theta));
         });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -484,10 +521,16 @@ void validate_query_common(
     int64_t rope_dim,
     double theta) {
   check_cuda_mla_tensor(x, "x");
-  check_cuda_long_vector(positions, "positions");
+  check_cuda_query_positions(positions, "positions");
   TORCH_CHECK(x.dim() == 3, "MLA query input must have shape [batch, sequence, model_dim]");
   TORCH_CHECK(x.device() == positions.device(), "query input and positions must share a device");
-  TORCH_CHECK(positions.numel() == x.size(1), "positions must match query sequence length");
+  if (positions.dim() == 1) {
+    TORCH_CHECK(positions.numel() == x.size(1), "positions must match query sequence length");
+  } else {
+    TORCH_CHECK(
+        positions.size(0) == x.size(0) && positions.size(1) == x.size(1),
+        "batched positions must match query batch and sequence dimensions");
+  }
   TORCH_CHECK(heads > 0 && nope_dim > 0, "MLA head count and content dimension must be positive");
   check_rope_parameters(rope_dim, theta);
 }
@@ -738,6 +781,140 @@ void mla_cache_projection_write_cuda(
   }
 }
 
+
+void mla_cache_projection_write_slots_cuda(
+    const at::Tensor& x,
+    const at::Tensor& wkv_a,
+    const at::Tensor& kv_norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& slot_mapping,
+    at::Tensor& kv_storage,
+    at::Tensor& pe_storage,
+    at::Tensor& position_storage,
+    bool metadata_validated,
+    double theta,
+    double epsilon) {
+  TORCH_CHECK(x.dim() == 3, "paged cache input must have shape [batch, sequence, model_dim]");
+  TORCH_CHECK(
+      positions.dim() == 2 && positions.sizes() == x.sizes().slice(0, 2),
+      "paged positions must have shape [batch, sequence]");
+  TORCH_CHECK(
+      slot_mapping.dim() == 2 && slot_mapping.sizes() == x.sizes().slice(0, 2),
+      "slot_mapping must have shape [batch, sequence]");
+  TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == at::kLong,
+              "paged positions must be an int64 CUDA tensor");
+  TORCH_CHECK(slot_mapping.is_cuda() && slot_mapping.scalar_type() == at::kLong,
+              "slot_mapping must be an int64 CUDA tensor");
+  TORCH_CHECK(positions.is_contiguous() && slot_mapping.is_contiguous(),
+              "paged positions and slot_mapping must be contiguous");
+
+  const int64_t token_count = x.size(0) * x.size(1);
+  auto flat_x = x.reshape({1, token_count, x.size(2)});
+  auto flat_positions = positions.reshape({token_count});
+  validate_cache_projection_common(
+      flat_x, wkv_a, kv_norm_weight, flat_positions, theta, epsilon);
+  check_contiguous_cuda_mla_tensor(kv_storage, "kv_storage");
+  check_contiguous_cuda_mla_tensor(pe_storage, "pe_storage");
+  check_same_dtype(x, kv_storage, "x", "kv_storage");
+  check_same_dtype(x, pe_storage, "x", "pe_storage");
+  TORCH_CHECK(position_storage.is_cuda() && position_storage.scalar_type() == at::kLong,
+              "position_storage must be an int64 CUDA tensor");
+  TORCH_CHECK(position_storage.is_contiguous(), "position_storage must be contiguous");
+  TORCH_CHECK(kv_storage.dim() == 3 && pe_storage.dim() == 3,
+              "paged cache payload storage must be rank 3");
+  TORCH_CHECK(position_storage.dim() == 2, "paged position storage must be rank 2");
+  TORCH_CHECK(
+      x.device() == positions.device() && x.device() == slot_mapping.device() &&
+          x.device() == kv_storage.device() && x.device() == pe_storage.device() &&
+          x.device() == position_storage.device(),
+      "all paged cache tensors must share a CUDA device");
+  TORCH_CHECK(
+      kv_storage.size(0) == pe_storage.size(0) &&
+          kv_storage.size(1) == pe_storage.size(1) &&
+          kv_storage.size(0) == position_storage.size(0) &&
+          kv_storage.size(1) == position_storage.size(1),
+      "paged cache page dimensions must match");
+  const int64_t latent_dim = kv_norm_weight.numel();
+  const int64_t rope_dim = wkv_a.size(0) - latent_dim;
+  TORCH_CHECK(
+      kv_storage.size(2) == latent_dim && pe_storage.size(2) == rope_dim,
+      "paged cache feature dimensions do not match the projection weights");
+
+  const int64_t capacity = kv_storage.size(0) * kv_storage.size(1);
+  if (token_count > 0 && !metadata_validated) {
+    const int64_t minimum_slot = slot_mapping.min().item<int64_t>();
+    const int64_t maximum_slot = slot_mapping.max().item<int64_t>();
+    TORCH_CHECK(
+        minimum_slot >= 0 && maximum_slot < capacity,
+        "slot_mapping contains an out-of-range physical slot");
+    auto sorted_slots = std::get<0>(at::sort(slot_mapping.reshape({token_count})));
+    const bool has_duplicates = token_count > 1 &&
+        sorted_slots.slice(0, 1, token_count)
+            .eq(sorted_slots.slice(0, 0, token_count - 1))
+            .any()
+            .item<bool>();
+    TORCH_CHECK(!has_duplicates,
+                "slot_mapping must not contain duplicate physical slots in one write");
+  }
+
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  auto projected = at::empty({1, token_count, wkv_a.size(0)}, x.options());
+  auto kv = at::empty({1, token_count, latent_dim}, x.options());
+  auto pe = at::empty({1, token_count, rope_dim}, x.options());
+  launch_linear_weight(flat_x, wkv_a, projected, stream);
+  launch_rms_norm_prefix(
+      projected,
+      kv_norm_weight,
+      kv,
+      1,
+      token_count,
+      wkv_a.size(0),
+      latent_dim,
+      0,
+      epsilon,
+      stream);
+  launch_cache_rope(
+      projected,
+      flat_positions,
+      pe,
+      1,
+      token_count,
+      latent_dim,
+      rope_dim,
+      0,
+      theta,
+      stream);
+  if (token_count > 0) {
+    const cudaDeviceProp* properties = at::cuda::getDeviceProperties(x.get_device());
+    const int64_t requested_blocks = std::min<int64_t>(
+        token_count, static_cast<int64_t>(properties->maxGridSize[0]));
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        x.scalar_type(),
+        "mla_scatter_cache_slots_cuda",
+        [&] {
+          scatter_cache_slots_kernel<scalar_t><<<
+              static_cast<unsigned int>(requested_blocks),
+              kElementwiseThreads,
+              0,
+              stream>>>(
+              kv.const_data_ptr<scalar_t>(),
+              pe.const_data_ptr<scalar_t>(),
+              flat_positions.const_data_ptr<int64_t>(),
+              slot_mapping.const_data_ptr<int64_t>(),
+              kv_storage.mutable_data_ptr<scalar_t>(),
+              pe_storage.mutable_data_ptr<scalar_t>(),
+              position_storage.mutable_data_ptr<int64_t>(),
+              token_count,
+              latent_dim,
+              rope_dim);
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
 at::Tensor mla_output_projection_cuda(const at::Tensor& heads, const at::Tensor& wo) {
   check_contiguous_cuda_mla_tensor(heads, "heads");
   check_contiguous_cuda_mla_tensor(wo, "wo");
@@ -764,5 +941,6 @@ TORCH_LIBRARY_IMPL(ds_flash_mla_moe, CUDA, m) {
   m.impl("mla_query_lora_projection", TORCH_FN(mla_query_lora_projection_cuda));
   m.impl("mla_cache_projection", TORCH_FN(mla_cache_projection_cuda));
   m.impl("mla_cache_projection_write", TORCH_FN(mla_cache_projection_write_cuda));
+  m.impl("mla_cache_projection_write_slots", TORCH_FN(mla_cache_projection_write_slots_cuda));
   m.impl("mla_output_projection", TORCH_FN(mla_output_projection_cuda));
 }

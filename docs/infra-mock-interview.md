@@ -37,7 +37,9 @@ Kernel / 推理系统工程师**，基于当前仓库事实；不修改根目录
 这是一个 correctness-first 的 DeepSeek MLA + MoE 算子项目。项目先用 PyTorch reference
 固定 attention、MLA、routing 和 expert parallel 的数值/梯度语义，再逐步接入 PyTorch
 custom op 与 CUDA。当前最完整的链路是 MLA：我能解释并复现 naive 到 absorbed 的等价
-推导、compressed static cache，以及直接读取 latent cache 的 FP16/BF16/FP32 CUDA core。这个 core
+推导、compressed static/paged cache，以及直接读取 latent cache 的 FP16/BF16/FP32 CUDA core。
+现在 paged 路径可以按 slot mapping 写入物理页，再按 block table 直接读取，不先 materialize 连续
+K/V。这个 core
 融合了 causal mask、online softmax 和 latent value accumulation，不展开完整 per-head K/V，
 也不写出完整 score matrix。staged pipeline 已将 projection、RoPE、attention 与 `W_O` 分别
 接入 native CUDA，并在单张 RTX 5090、CUDA 12.8 环境完成 forward、reference-recompute
@@ -69,7 +71,8 @@ NVSHMEM 也没有本地性能验证。普通 Attention 另有 FP16/BF16/FP32 nat
 absorbed MLA；框架层能说明 schema、CUDA dispatch、FakeTensor 和 autograd registration；
 CUDA 层能解释一个 block 对应 `(B,H,S_q)` 中一行、shared memory 里各缓冲区、在线 softmax
 状态更新、绝对位置 causal mask、当前 stream 和 device guard。与此同时，我也会主动指出它
-现在 MLA 每 key 仍有同步，低精度路径也仍是标量 FP32 accumulation；普通 Attention 同样尚无
+现在 paged MLA 每 key 仍是 correctness-first 标量 FP32 accumulation，且尚无 serving page
+allocator；普通 Attention 同样尚无
 二维 tiling/Tensor Core 调度。我的定位是已有完整 correctness kernel 闭环、正向生产级优化
 能力推进，而不是已经具备成熟 FA3/FA4 优化经验。
 
@@ -302,12 +305,18 @@ forward、raw backward、autograd、causal/tail/stride、SM 架构编译，并�
 下一步需用 profiler 解释 row-wise block reduction、barrier、occupancy 与布局 adapter 成本，再
 决定二维 score tile、warp partition、vectorized load 或 Tensor Core；不能只说换成 BF16 指针。
 
-### Q18：如果目标是长上下文 decode，如何把 static latent cache 接到 PagedAttention 风格管理？
+### Q18：你已经实现了 paged latent cache；请讲清数据契约、错误语义与仍缺的 serving 层
 
-合格回答应区分算法与内存管理：保持 latent `kv/pe/positions` 的逻辑序列语义，用 page table
-将 logical token 映射到非连续物理页；kernel 按 page/block table gather compressed cache，
-causal 判断仍使用 absolute positions。需要处理跨页 coalescing、page size、prefix sharing、
-eviction 和 batch 中不同有效长度；PagedAttention 不替代 online softmax。
+合格回答应覆盖：physical storage 是 `[pages,page_size,latent_or_rope_dim]`；global slot 决定写入
+位置，block table 与 per-row length 决定逻辑读取；同一次写的重复/越界 slot 被拒绝，跨调用允许
+完整覆盖；有效页不能在同一行重复，未用表项为 `-1`，有效 slot 必须已写入且 absolute position
+严格递增。kernel 在 key loop 直接映射物理页，causal 仍比较 absolute positions，PagedAttention
+不替代 online softmax。当前缺口是 allocator、request/page 生命周期、eviction、prefix sharing、
+continuous batching 和 Nsight 驱动调优。
+
+**连续追问**：为什么跨 batch 行允许共享页？写时如何避免共享前缀被误覆盖？如果 Python
+validation 每 token 都 D2H，会发生什么？你如何用 tensor version 缓存校验，又如何证明原地
+修改不会误用旧结果？
 
 ### Q19：如果现在给你 8×H100，你的验证顺序是什么？
 

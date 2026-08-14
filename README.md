@@ -24,7 +24,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Blockwise online attention | yes | CPU + CUDA | FP32-accumulating online-softmax kernel | no |
 | DeepSeek grouped Top-K gate | yes | CPU | FP32 sigmoid source | replicated in EP |
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
-| MLA prefill/decode | naive + absorbed | CPU + CUDA pipeline | staged FP16/BF16/FP32 storage with FP32 accumulation | no |
+| MLA prefill/decode | naive + absorbed + paged | CPU + CUDA pipeline | staged FP16/BF16/FP32 storage, per-slot write, direct paged read | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
 | One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
 
@@ -119,8 +119,18 @@ out-of-place operators use traceable PyTorch-recompute backward; static cache
 writes remain explicitly inference-only. When latent, RoPE, and value dimensions
 are all at most 32, the attention core assigns strided key partitions to four
 warps, merges their online-softmax states stably, and avoids block-wide barriers
-inside the key loop; larger dimensions retain the generic kernel. This remains a
-correctness-oriented backend, not yet a paged-cache or FA2/FA3-class implementation.
+inside the key loop; larger dimensions retain the generic kernel.
+
+`allocate_mla_paged_cache`, `write_mla_paged_cache`, and `mla_paged_attention`
+extend the same latent representation to fixed-size physical pages. A per-token
+slot mapping controls projection writes; a `[batch, logical_pages]` block table
+and per-row lengths define the logical sequences. The CUDA attention kernel reads
+compressed entries directly through that table without materializing contiguous
+K/V. Public APIs reject out-of-range or duplicate writes, invalid page tables,
+unwritten slots, and non-increasing logical positions. Successful metadata checks
+are reused only while tensor identity and version remain unchanged. Paged mutation
+is inference-only, and the current one-CTA-per-query/head implementation remains a
+correctness-oriented kernel rather than an FA2/FA3-class serving backend.
 
 ## Repository layout
 
@@ -248,6 +258,11 @@ both also include native query projection, absorbed attention, and output
 projection. Verification compares the result against the absorbed PyTorch
 specification.
 
+`decode_with_paged_write --page-size 16` instead times one physical-slot
+overwrite followed by direct block-table attention. It keeps the cache payload
+paged throughout the timed path and verifies against the same contiguous
+absorbed specification.
+
 Expert-major SwiGLU has a standalone benchmark whose comma-separated counts
 make skew and empty experts explicit:
 
@@ -305,6 +320,9 @@ The optional `--profile flash-attn-4` profile adds four low-precision Attention-
 making the beta FA4 package a default dependency or changing the representative manifest.
 The optional `--profile mla-low-precision` profile adds four staged MLA pairs covering FP16/BF16,
 prefill/decode, regular dimensions, and tails while keeping the default matrix unchanged.
+The optional `--profile mla-paged` profile adds two paged-decode pairs covering a
+long BF16 sequence and an FP16 tail page; it likewise leaves the representative
+manifest unchanged.
 
 One exact side of that matrix can be captured with PyTorch/Kineto before moving
 to Nsight:
@@ -385,7 +403,8 @@ contains fixed-shape configurations, numerical errors, latency summaries, and ra
 the native GEMM, Attention, MLA, expert, and router paths plus matching PyTorch/cuBLAS/SDPA
 baselines. It also contains the 20-case representative matrix and structured MLA
 prefill/decode Kineto aggregates described above, plus four same-dtype FP16/BF16 pairs against
-the optional FlashAttention-4 backend and four staged MLA FP16/BF16 native/PyTorch pairs. It is
+the optional FlashAttention-4 backend, four staged MLA FP16/BF16 native/PyTorch pairs, and two
+paged MLA decode pairs. It is
 a local diagnostic snapshot, not a general performance claim, an Nsight report, or a replacement
 for self-hosted GPU CI.
 

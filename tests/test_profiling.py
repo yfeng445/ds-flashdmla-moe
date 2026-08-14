@@ -133,6 +133,21 @@ def test_mla_low_precision_matrix_case_can_be_selected_for_profiling() -> None:
     assert case.native_config.dtype == case.baseline_config.dtype == "bfloat16"
 
 
+def test_mla_paged_matrix_case_can_be_selected_for_profiling() -> None:
+    case = profiling._selected_case(
+        OperatorProfileConfig(
+            case="mla_paged_decode_bfloat16_long",
+            warmup=0,
+            iterations=1,
+        )
+    )
+
+    assert case.native_config.implementation == "cuda"
+    assert case.baseline_config.implementation == "absorbed"
+    assert case.native_config.workload == "decode_with_paged_write"
+    assert case.native_config.sequence_length == 257
+
+
 def test_torch_profile_report_classifies_events_and_exports_trace(
     monkeypatch,
     tmp_path: Path,

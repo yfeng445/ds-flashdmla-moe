@@ -61,6 +61,8 @@ def _selected_case(config: OperatorProfileConfig) -> BenchmarkMatrixCase:
         profile = "flash-attn-4"
     elif config.case.startswith("mla_low_precision_"):
         profile = "mla-low-precision"
+    elif config.case.startswith("mla_paged_"):
+        profile = "mla-paged"
     else:
         profile = "representative"
     selected = build_benchmark_matrix_cases(

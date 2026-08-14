@@ -103,6 +103,28 @@ def test_mla_low_precision_profile_contains_only_same_dtype_staged_pairs() -> No
         )
 
 
+def test_mla_paged_profile_contains_long_and_tail_decode_pairs() -> None:
+    config = BenchmarkMatrixConfig(profile="mla-paged", warmup=0, iterations=1)
+    cases = build_benchmark_matrix_cases(config)
+
+    assert {case.name for case in cases} == {
+        "mla_paged_decode_bfloat16_long",
+        "mla_paged_decode_tail_float16",
+    }
+    assert {case.shape_class for case in cases} == {"decode", "tail"}
+    for case in cases:
+        case.validate()
+        assert case.family == "mla"
+        assert case.baseline_label == "pytorch_paged_absorbed"
+        assert case.native_config.implementation == "cuda"
+        assert case.baseline_config.implementation == "absorbed"
+        assert case.native_config.workload == "decode_with_paged_write"
+        assert case.native_config.sequence_length % case.native_config.page_size == 1
+        assert asdict(case.native_config) | {"implementation": "absorbed"} == asdict(
+            case.baseline_config
+        )
+
+
 def test_matrix_filters_family_and_exact_case() -> None:
     config = BenchmarkMatrixConfig(
         families=("attention", "mla"),
