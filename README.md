@@ -127,7 +127,8 @@ throughput claim.
 ├── docs/                         # textbook-style notes and reading guide
 ├── examples/                     # runnable reference examples
 ├── src/ds_flash_mla_moe/         # supported Python specifications
-└── tests/                        # numerical and semantic contracts
+├── tests/                        # numerical and semantic contracts
+└── validation/                   # checked-in hardware validation snapshots
 ```
 
 ## Numerical contracts
@@ -275,6 +276,13 @@ per-source/per-expert cell limit for the symmetric layout; it is not the same
 capacity policy. `--shared-experts N` adds the replicated shared branch as one
 SwiGLU with effective hidden dimension `N * hidden_dim`; its latency and FLOPs
 are reported separately from routed expert compute.
+
+## Validation evidence
+
+The checked-in [RTX 5090 / CUDA 12.8 single-GPU snapshot](validation/single-gpu/2026-08-14-rtx5090-cu128/README.md)
+contains fixed-shape configurations, numerical errors, latency summaries, and raw samples for
+the native GEMM, Attention, MLA, expert, and router paths. It is a local correctness/smoke run,
+not a cross-implementation performance claim or a replacement for self-hosted GPU CI.
 
 ## Learning material
 

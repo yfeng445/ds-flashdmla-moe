@@ -1,0 +1,103 @@
+{
+  "configuration": {
+    "backend": "cuda",
+    "batch": 1,
+    "causal": true,
+    "device": "cuda",
+    "dtype": "float32",
+    "head_dim": 64,
+    "heads": 2,
+    "iterations": 20,
+    "key_length": 128,
+    "query_length": 128,
+    "reference_block_size": 64,
+    "seed": 0,
+    "value_dim": 64,
+    "verify": true,
+    "warmup": 5
+  },
+  "derived": {
+    "compulsory_bandwidth_gb_s_at_median": 2.154088827969994,
+    "matrix_tflops_at_median": 0.0689308424950398
+  },
+  "environment": {
+    "gpu": {
+      "compute_capability": [
+        12,
+        0
+      ],
+      "index": 0,
+      "multiprocessors": 170,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_memory_bytes": 34190458880
+    },
+    "machine": "x86_64",
+    "native_extension_loaded": true,
+    "package": "0.1.0.dev0",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "source_dirty": false,
+    "source_revision": "53ab492c4e18e3282294cb718eaea87b8e3b53e6",
+    "torch": "2.10.0+cu128",
+    "torch_cuda_version": "12.8",
+    "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+  },
+  "latency": {
+    "count": 20,
+    "max_ms": 0.48873600363731384,
+    "mean_ms": 0.16479520127177238,
+    "median_ms": 0.12169600278139114,
+    "min_ms": 0.12144000083208084,
+    "p90_ms": 0.3397023975849152,
+    "p99_ms": 0.4682281646132468
+  },
+  "notes": [
+    "matrix_flops counts QK^T and PV multiply-adds only",
+    "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic"
+  ],
+  "output": {
+    "device": "cuda:0",
+    "dtype": "float32",
+    "shape": [
+      1,
+      2,
+      128,
+      64
+    ]
+  },
+  "raw_samples_ms": [
+    0.13808000087738037,
+    0.1218239963054657,
+    0.12169600278139114,
+    0.12160000205039978,
+    0.12166400253772736,
+    0.1215360015630722,
+    0.48873600363731384,
+    0.1249919980764389,
+    0.12156800180673599,
+    0.12166400253772736,
+    0.12169600278139114,
+    0.12166400253772736,
+    0.12169600278139114,
+    0.3351359963417053,
+    0.1249919980764389,
+    0.1215360015630722,
+    0.12166400253772736,
+    0.12191999703645706,
+    0.3808000087738037,
+    0.12144000083208084
+  ],
+  "schema_version": 1,
+  "verification": {
+    "atol": 5e-05,
+    "max_absolute_error": 8.940696716308594e-07,
+    "max_relative_error": 0.021039641678636724,
+    "performed": true,
+    "reference": "scaled_dot_product_attention_reference",
+    "rtol": 5e-05
+  },
+  "work_estimate": {
+    "compulsory_tensor_bytes_lower_bound": 262144,
+    "matrix_flops": 8388608
+  }
+}
