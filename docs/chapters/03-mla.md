@@ -189,3 +189,21 @@ python benchmarks/mla.py \
 计时前会用另一条 naive/absorbed 路径逐元素校验；报告保留完整 config、cache 容量、矩阵
 FLOPs 计数约定和所有 raw samples。若要观察函数式 cache 复制造成的差异，应以相同参数再
 运行一次 `decode_with_append`，而不是把两种更新策略混入同一个计时区间。
+
+## 3.10 当前 staged CUDA correctness backend
+
+仓库当前没有把整层 MLA 伪装成一个超大 fused kernel，而是沿用 3.6 节的可验证分层，注册
+以下 native FP32 算子：
+
+1. direct query projection + RoPE；
+2. LoRA query projection + RMSNorm + RoPE；
+3. latent KV projection + RMSNorm + RoPE；
+4. projection 后直接写入预分配 static cache；
+5. absorbed score、causal mask、online softmax、latent value reduction；
+6. head output projection。
+
+`backend="cuda"` 要求这六个阶段全部可用，不再只替换 attention core。out-of-place 算子的
+backward 通过可追踪 PyTorch specification 重计算，以便先固定一阶梯度语义；static cache
+写入会修改 storage，因此仍严格限定为 inference-only。该实现证明了完整 prefill/decode
+数据流和 dispatcher 契约，但还不是生产内核：当前只有 FP32，prefill/decode 尚未使用各自
+专用调度，也没有 paged cache、continuous-batching slot 生命周期或 profiler 驱动的融合。

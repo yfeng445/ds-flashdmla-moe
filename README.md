@@ -24,7 +24,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Blockwise online attention | yes | CPU | FP32 forward/backward source | no |
 | DeepSeek grouped Top-K gate | yes | CPU | FP32 sigmoid source | replicated in EP |
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
-| MLA prefill/decode | naive + absorbed | CPU + CUDA smoke | FP32 fused absorbed attention core | no |
+| MLA prefill/decode | naive + absorbed | CPU + CUDA pipeline | staged FP32 projection/cache/attention/output ops | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
 | One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
 
@@ -105,13 +105,14 @@ The current one-thread-per-token selector uses serial candidate scans, so it
 establishes routing, stream, dispatcher, and autograd semantics rather than a
 production-performance claim.
 
-`mla_absorbed_attention(..., backend="cuda")` keeps the compressed latent cache
-in `[B,S,r_kv]` form and fuses absorbed content/position scoring, absolute-position
-causal masking, online softmax, and latent value accumulation. Query/RoPE and
-output projections remain PyTorch operations, and backward recomputes the
-traceable absorbed specification. The first native path supports FP32 and no
-explicit attention mask; it is a correctness kernel, not yet an FA2/FA3-class
-throughput claim.
+`mla_absorbed_attention(..., backend="cuda")` now selects a staged native FP32
+pipeline: direct or LoRA query projection, RMSNorm/RoPE, absorbed attention over
+the compressed `[B,S,r_kv]` cache, and output projection. `build_mla_cache` uses
+the matching native KV projection, while `write_mla_static_cache` projects
+directly into preallocated KV/position storage without reallocating it. The
+out-of-place operators use traceable PyTorch-recompute backward; static cache
+writes remain explicitly inference-only. This is an end-to-end correctness
+backend, not yet a low-precision, paged-cache, or FA2/FA3-class implementation.
 
 ## Repository layout
 
@@ -120,7 +121,7 @@ throughput claim.
 ├── csrc/
 │   ├── attention/                # native CUDA operator source
 │   ├── gemm/                     # fixed-tile CUDA teaching kernel
-│   ├── mla/                      # compressed-cache absorbed MLA kernel
+│   ├── mla/                      # staged projection/cache/absorbed MLA kernels
 │   ├── moe/                      # route and active-row SwiGLU kernels
 │   └── experimental/attention/   # unverified course-era CUDA prototypes
 ├── benchmarks/                   # structured latency and environment reports
@@ -205,8 +206,11 @@ Use `decode_with_append` with the same shape to expose the linear prefix-copy
 cost of a functional cache baseline.
 
 On a native CUDA build, use `--device cuda --dtype float32 --implementation
-cuda` to exercise the fused absorbed attention core. Verification compares it
-against the absorbed PyTorch specification.
+cuda`. `prefill_with_cache` includes native KV-cache projection, while
+`decode_with_static_write` includes native projection into fixed cache storage;
+both also include native query projection, absorbed attention, and output
+projection. Verification compares the result against the absorbed PyTorch
+specification.
 
 Expert-major SwiGLU has a standalone benchmark whose comma-separated counts
 make skew and empty experts explicit:

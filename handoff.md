@@ -2,7 +2,7 @@
 
 更新时间：2026-08-14
 
-当前基线：`main`，已包含 fused MLA CUDA、稳定输出布局契约和单 GPU 成对基线快照。
+当前基线：`main`，已包含 staged end-to-end MLA CUDA、稳定输出布局契约和单 GPU 成对基线快照。
 
 远端：<https://github.com/yfeng445/ds-flashdmla-moe>
 
@@ -23,21 +23,21 @@ correctness-first 的 DeepSeek MLA + MoE 学习与实现项目。核心原则是
 ## 2. 当前完成度
 
 当前可视为 **v0.1 correctness + local single-GPU smoke milestone**。`main` 的
-CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并注册 9 个 native
+CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并注册 14 个 native
 算子；RTX 5090 本地环境也已跑通完整 CUDA 测试和固定 shape smoke benchmark。尚未完成
-持续 self-hosted GPU CI、双 GPU NCCL、profiler 和对照基线，因此仍不具备生产性能结论。
+持续 self-hosted GPU CI、双 GPU NCCL、profiler 和多 shape 主流实现对照，因此仍不具备生产性能结论。
 
-粗略进度约为 **80%**。这里的百分比衡量的是学习/研究仓库的完成度，不代表生产可用性。
+粗略进度约为 **85%**。这里的百分比衡量的是学习/研究仓库的完成度，不代表生产可用性。
 
 | 方向 | 状态 | 说明 |
 | --- | --- | --- |
 | 课程讲义 | 基本完成 | `docs/chapters/00`–`08`，覆盖 tiling、在线 Softmax、FlashAttention、MLA、MoE、EP、自定义算子、benchmark/roofline、对称内存 |
 | PyTorch reference | 基本完成 | GEMM、Attention、MLA、grouped Top-K、SwiGLU MoE、路由、Expert Parallel |
 | CPU/Gloo 验证 | 已完成 | 单元测试、梯度检查、非规则 shape、空 expert、空 rank、两 rank Gloo |
-| CUDA 算子源码 | `main` 有 9 个算子 | Attention forward/backward、tiled GEMM、router、route pack/combine、expert-major pack、SwiGLU experts、absorbed MLA |
+| CUDA 算子源码 | `main` 有 14 个算子 | Attention forward/backward、tiled GEMM、router、route pack/combine、expert-major pack、SwiGLU experts，以及 6 个 staged MLA 算子 |
 | FP16 Tensor Core | 已实现并完成本地单卡 smoke | expert-major SwiGLU 使用 WMMA、FP32 accumulation 和显式 FP16 hidden boundary；仍缺持续 GPU CI |
 | NCCL Expert Parallel | 代码已实现，待双 GPU 验证 | 包括可微 All-to-All 和异步 chunk pipeline |
-| MLA CUDA | correctness core 已进入 `main` | fused FP32 absorbed-attention core 已验证；完整生产级 prefill/decode backend 仍未实现 |
+| MLA CUDA | end-to-end correctness backend 已进入 `main` | direct/LoRA query、KV projection/static write、absorbed attention、output projection 均有 FP32 native op；低精度、paged cache 与生产级调优仍未实现 |
 | One-sided/NVSHMEM | 未实现 | 当前只有 symmetric-buffer 成本与布局模型 |
 | 性能结论 | 尚不可下结论 | 已有单卡固定 shape 原始样本和 PyTorch/cuBLAS/SDPA 对照，但仍缺持续 runner、多 shape 与 Nsight trace |
 
@@ -69,7 +69,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 
 ```text
 pytest -ra --strict-markers -W error::UserWarning
-281 passed, 62 skipped in 10.85s
+285 passed, 69 skipped in 11.16s
 ```
 
 另已完成：
@@ -78,9 +78,10 @@ pytest -ra --strict-markers -W error::UserWarning
 - `ruff check`：通过；
 - `git diff --check`：通过；
 - GitHub Actions `Reference tests` 的 Python 3.10/3.12 matrix：通过：
-  <https://github.com/yfeng445/ds-flashdmla-moe/actions/runs/31763638503>；
-- GitHub Actions `CUDA build / wheel`：通过，并检查 9 个 CUDA dispatch kernel：
-  <https://github.com/yfeng445/ds-flashdmla-moe/actions/runs/31763638494>。
+  <https://github.com/yfeng445/ds-flashdmla-moe/actions/runs/31767920497>；
+- GitHub Actions `CUDA build / wheel`：通过，并检查 14 个 CUDA dispatch kernel；wheel
+  同时携带 forward-compatible PTX：
+  <https://github.com/yfeng445/ds-flashdmla-moe/actions/runs/31767920481>。
 
 ### 4.1 已解决的 MLA output-layout contract
 
@@ -95,14 +96,19 @@ WSL2 / RTX 5090 / PyTorch 2.10 + CUDA 12.8 环境运行：
 
 ```text
 pytest -ra --strict-markers -W error::UserWarning
-343 passed in 28.28s
+354 passed in 25.76s
 ```
 
-同一环境完成 GEMM、Attention、MLA prefill、MLA static-cache decode、FP32 experts、
-FP16 WMMA experts 和 grouped router 的 native/PyTorch 成对 20-sample benchmark。全部数值
-验证通过，环境、固定 shape、误差、latency 汇总和原始样本保存在
+同一环境完成 GEMM、Attention、MLA attention-only、完整 MLA prefill、完整 MLA
+static-cache decode、FP32 experts、FP16 WMMA experts 和 grouped router 的 9 组
+native/PyTorch 成对 20-sample benchmark。全部数值验证通过，环境、固定 shape、误差、
+latency 汇总和原始样本保存在
 `validation/single-gpu/2026-08-14-rtx5090-cu128/`。这仍是本地快照，不是持续
 self-hosted CI 或普适性能结论。
+
+当前固定 shape 的完整 MLA 数据为：`prefill_with_cache` native 1.155536 ms、absorbed
+PyTorch 2.636864 ms；`decode_with_static_write` native 1.028400 ms、absorbed PyTorch
+2.058480 ms。这里只记录本机诊断结果，不外推到其他 shape、dtype 或硬件。
 
 ## 5. 当前阻塞与已知缺口
 
@@ -124,13 +130,14 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
 - Attention CUDA 仍是 correctness-first FP32 路径，不是 FA2/FA3 级实现；
 - grouped router 使用 one-thread-per-token 的串行候选扫描；
 - MoE kernel 尚无 async copy、TMA、WGMMA 或 profiler-driven tuning；
-- absorbed MLA CUDA core 仍未覆盖完整生产级 MLA prefill/decode backend；
+- staged MLA 已覆盖 FP32 correctness pipeline，但 prefill/decode 仍共用 correctness-first
+  kernel；尚无 FP16/BF16、paged/per-slot cache、异步拷贝或 profiler-driven fusion；
 - chunk pipeline 只证明了软件异步协议，尚无 profiler 证据证明物理 overlap；
 - one-sided symmetric memory 只有分析模型，没有 NVSHMEM/PGAS backend。
 
 ## 6. 下一步执行顺序
 
-1. 注册并运行单 GPU self-hosted runner，让现有 343-test + 7-benchmark 本地快照变成可持续
+1. 注册并运行单 GPU self-hosted runner，让现有 354-test + 9-paired-benchmark 本地快照变成可持续
    workflow artifact。
 2. 在双 GPU runner 上验证 NCCL FP32、FP16 WMMA 与 chunked pipeline 的 forward/backward，
    保存每 rank 原始 latency 和通信量。
@@ -138,8 +145,8 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
    并验证 NCCL chunk pipeline 是否真正 overlap。
 4. 把当前单 shape 的 PyTorch/cuBLAS/SDPA 对照扩展为代表性 prefill/decode、规则/尾块和
    skew shape 矩阵；如可用，再加入 CUTLASS 或主流 FlashAttention。
-5. 扩展完整 MLA prefill/decode CUDA backend，再根据 profiler 结果考虑 FA2/FA3、
-   TMA/WGMMA、router 优化和 one-sided EP。
+5. 根据 profiler 把当前 staged MLA correctness backend 扩展为专用 prefill/decode、
+   FP16/BF16 和 paged/per-slot cache，再考虑 FA2/FA3、TMA/WGMMA、router 优化和 one-sided EP。
 
 前三步完成前，不应在 README 中加入“高性能”“快于某实现”等未经证实的结论。
 
@@ -179,7 +186,7 @@ torchrun --master-addr=127.0.0.1 --master-port=29572 \
 ## 8. 分支与协作状态
 
 - PR #1 已关闭且未 merge；其中的实现内容后来直接应用到 `main`。
-- `main` 当前已经包含 fused MLA CUDA、两篇衍生面试文档和 9-operator native extension。
+- `main` 当前已经包含 staged end-to-end MLA CUDA、两篇衍生面试文档和 14-operator native extension。
 - `AI INFRA.ipynb` 是原始面试笔记；后续整理继续写入独立 Markdown，不覆盖原文件。
 - 单 GPU JSON 是硬件相关证据快照；不要把它解释成跨实现性能领先结论。
 
