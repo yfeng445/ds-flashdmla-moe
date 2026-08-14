@@ -50,7 +50,7 @@ jobs:
       - run: >-
           python benchmarks/mla.py
           --device cuda --dtype float32 --implementation cuda
-          --workload prefill_attention --batch 1 --sequence-length 128
+          --workload prefill_with_cache --batch 1 --sequence-length 128
           --model-dim 128 --n-heads 4 --q-lora-rank 32
           --kv-lora-rank 32 --qk-nope-head-dim 32
           --qk-rope-head-dim 16 --v-head-dim 32
@@ -59,7 +59,7 @@ jobs:
       - run: >-
           python benchmarks/mla.py
           --device cuda --dtype float32 --implementation absorbed
-          --workload prefill_attention --batch 1 --sequence-length 128
+          --workload prefill_with_cache --batch 1 --sequence-length 128
           --model-dim 128 --n-heads 4 --q-lora-rank 32
           --kv-lora-rank 32 --qk-nope-head-dim 32
           --qk-rope-head-dim 16 --v-head-dim 32

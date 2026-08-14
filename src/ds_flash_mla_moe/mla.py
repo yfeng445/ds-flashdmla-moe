@@ -185,12 +185,49 @@ def _project_query(
     config: MLAConfig,
     weights: MLAWeights,
     positions: Tensor,
+    *,
+    backend: MLABackend = "reference",
 ) -> tuple[Tensor, Tensor]:
     model_dim = x.shape[-1]
     _validate_weights(config, weights, model_dim)
     if x.ndim != 3:
         raise ValueError("MLA query input must have shape [batch, sequence, model_dim]")
     positions = _validate_positions(positions, x.shape[1], x.device)
+    if backend not in {"auto", "cuda", "reference"}:
+        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+
+    if backend != "reference":
+        from .ops import mla_query_lora_projection, mla_query_projection
+
+        if config.q_lora_rank == 0:
+            assert weights.wq is not None
+            return mla_query_projection(
+                x,
+                weights.wq,
+                positions,
+                n_heads=config.n_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                rope_theta=config.rope_theta,
+                backend=backend,
+            )
+        assert weights.wq_a is not None
+        assert weights.q_norm_weight is not None
+        assert weights.wq_b is not None
+        return mla_query_lora_projection(
+            x,
+            weights.wq_a,
+            weights.q_norm_weight,
+            weights.wq_b,
+            positions,
+            n_heads=config.n_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            rope_theta=config.rope_theta,
+            rms_norm_eps=config.rms_norm_eps,
+            backend=backend,
+        )
+
     compute_dtype = _compute_dtype(x)
     x_compute = x.to(compute_dtype)
 
@@ -221,6 +258,7 @@ def build_mla_cache(
     weights: MLAWeights,
     *,
     positions: Tensor | None = None,
+    backend: MLABackend = "auto",
 ) -> MLALatentCache:
     """Project model states into normalized latent content and positional cache entries."""
 
@@ -230,6 +268,23 @@ def build_mla_cache(
     if positions is None:
         positions = torch.arange(x.shape[1], device=x.device)
     positions = _validate_positions(positions, x.shape[1], x.device)
+    if backend not in {"auto", "cuda", "reference"}:
+        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+
+    if backend != "reference":
+        from .ops import mla_cache_projection
+
+        kv, k_pe = mla_cache_projection(
+            x,
+            weights.wkv_a,
+            weights.kv_norm_weight,
+            positions,
+            kv_lora_rank=config.kv_lora_rank,
+            rope_theta=config.rope_theta,
+            rms_norm_eps=config.rms_norm_eps,
+            backend=backend,
+        )
+        return MLALatentCache(kv=kv, pe=k_pe, positions=positions)
 
     compute_dtype = _compute_dtype(x)
     projected = F.linear(x.to(compute_dtype), weights.wkv_a.to(compute_dtype))
@@ -250,13 +305,14 @@ def append_mla_cache(
     weights: MLAWeights,
     *,
     positions: Tensor | None = None,
+    backend: MLABackend = "auto",
 ) -> MLALatentCache:
     """Append projected entries while enforcing batch, device, dtype, and position order."""
 
     if positions is None:
         start = 0 if cache is None else int(cache.positions[-1].item()) + 1
         positions = torch.arange(start, start + x.shape[1], device=x.device)
-    new = build_mla_cache(x, config, weights, positions=positions)
+    new = build_mla_cache(x, config, weights, positions=positions, backend=backend)
     if cache is None:
         return new
     if cache.kv.shape[0] != new.kv.shape[0]:
@@ -320,6 +376,7 @@ def write_mla_static_cache(
     weights: MLAWeights,
     *,
     positions: Tensor | None = None,
+    backend: MLABackend = "auto",
 ) -> MLALatentCache:
     """Project and write a contiguous chunk at the current inference cursor."""
 
@@ -342,6 +399,9 @@ def write_mla_static_cache(
         raise RuntimeError("MLAStaticCache is inference-only and does not support autograd")
     if x.ndim != 3:
         raise ValueError("static cache input must have shape [batch, sequence, model_dim]")
+    if backend not in {"auto", "cuda", "reference"}:
+        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+    _validate_weights(config, weights, x.shape[-1])
     if x.shape[0] != cache.kv_storage.shape[0]:
         raise ValueError("static cache write must preserve batch size")
     if x.device != cache.kv_storage.device or x.dtype != cache.kv_storage.dtype:
@@ -360,19 +420,31 @@ def write_mla_static_cache(
             else int(cache.position_storage[cache.valid_length - 1].item()) + 1
         )
         positions = torch.arange(start_position, start_position + x.shape[1], device=x.device)
-    new = build_mla_cache(x, config, weights, positions=positions)
+    positions = _validate_positions(positions, x.shape[1], x.device)
     if (
         cache.valid_length
-        and new.positions.numel()
-        and (new.positions[0] <= cache.position_storage[cache.valid_length - 1])
+        and positions.numel()
+        and (positions[0] <= cache.position_storage[cache.valid_length - 1])
     ):
         raise ValueError("static cache positions must follow the valid prefix")
 
     start = cache.valid_length
+    from .ops import mla_cache_projection_write
+
     with torch.no_grad():
-        cache.kv_storage[:, start:end].copy_(new.kv)
-        cache.pe_storage[:, start:end].copy_(new.pe)
-        cache.position_storage[start:end].copy_(new.positions)
+        mla_cache_projection_write(
+            x,
+            weights.wkv_a,
+            weights.kv_norm_weight,
+            positions,
+            cache.kv_storage,
+            cache.pe_storage,
+            cache.position_storage,
+            start=start,
+            rope_theta=config.rope_theta,
+            rms_norm_eps=config.rms_norm_eps,
+            backend=backend,
+        )
     cache.valid_length = end
     return cache.as_latent_cache()
 
@@ -532,12 +604,11 @@ def mla_absorbed_attention(
     attn_mask: Tensor | None = None,
     backend: MLABackend = "auto",
 ) -> Tensor:
-    """Run absorbed MLA with an optional native fused attention core.
+    """Run absorbed MLA with an optional end-to-end native CUDA pipeline.
 
-    Query and output projections remain regular PyTorch linear operations. The
-    CUDA core consumes the compressed latent cache directly, fusing absorbed
-    content/position scores, causal masking, online softmax, and latent value
-    accumulation without materializing expanded K/V or an attention matrix.
+    The native path covers direct/LoRA query projection, RMSNorm, RoPE, absorbed
+    attention over the compressed cache, and output projection. Cache builders
+    select the matching native projection and static-write operators separately.
     """
 
     if backend not in {"auto", "cuda", "reference"}:
@@ -557,7 +628,13 @@ def mla_absorbed_attention(
 
     query_positions = _validate_attention_request(query_x, cache, query_positions, config, weights)
     compute_dtype = _compute_dtype(query_x)
-    q_nope, q_pe = _project_query(query_x, config, weights, query_positions)
+    q_nope, q_pe = _project_query(
+        query_x,
+        config,
+        weights,
+        query_positions,
+        backend=backend,
+    )
     up = weights.wkv_b.to(compute_dtype).reshape(
         config.n_heads,
         config.qk_nope_head_dim + config.v_head_dim,
@@ -581,5 +658,6 @@ def mla_absorbed_attention(
         scale=config.qk_head_dim**-0.5,
         backend=backend,
     )
-    output = F.linear(heads.flatten(2).to(compute_dtype), weights.wo.to(compute_dtype))
-    return output.to(query_x.dtype)
+    from .ops import mla_output_projection
+
+    return mla_output_projection(heads, weights.wo, backend=backend).to(query_x.dtype)

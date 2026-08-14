@@ -107,6 +107,26 @@ _MLA_ABSORBED_ATTENTION_SCHEMA = (
     "Tensor key_up, Tensor value_up, Tensor query_positions, Tensor key_positions, "
     "bool causal, float scale) -> Tensor"
 )
+_MLA_QUERY_PROJECTION_SCHEMA = (
+    "mla_query_projection(Tensor x, Tensor wq, Tensor positions, int n_heads, "
+    "int qk_nope_head_dim, int qk_rope_head_dim, float rope_theta) -> (Tensor, Tensor)"
+)
+_MLA_QUERY_LORA_PROJECTION_SCHEMA = (
+    "mla_query_lora_projection(Tensor x, Tensor wq_a, Tensor q_norm_weight, Tensor wq_b, "
+    "Tensor positions, int n_heads, int qk_nope_head_dim, int qk_rope_head_dim, "
+    "float rope_theta, float rms_norm_eps) -> (Tensor, Tensor)"
+)
+_MLA_CACHE_PROJECTION_SCHEMA = (
+    "mla_cache_projection(Tensor x, Tensor wkv_a, Tensor kv_norm_weight, "
+    "Tensor positions, int kv_lora_rank, float rope_theta, float rms_norm_eps) "
+    "-> (Tensor, Tensor)"
+)
+_MLA_CACHE_PROJECTION_WRITE_SCHEMA = (
+    "mla_cache_projection_write(Tensor x, Tensor wkv_a, Tensor kv_norm_weight, "
+    "Tensor positions, Tensor(a!) kv_storage, Tensor(b!) pe_storage, "
+    "Tensor(c!) position_storage, int start, float rope_theta, float rms_norm_eps) -> ()"
+)
+_MLA_OUTPUT_PROJECTION_SCHEMA = "mla_output_projection(Tensor heads, Tensor wo) -> Tensor"
 _SCHEMAS = {
     "attention_forward": _FORWARD_SCHEMA,
     "attention_backward": _BACKWARD_SCHEMA,
@@ -117,6 +137,11 @@ _SCHEMAS = {
     "expert_major_pack": _EXPERT_MAJOR_PACK_SCHEMA,
     "grouped_topk": _GROUPED_TOPK_SCHEMA,
     "mla_absorbed_attention": _MLA_ABSORBED_ATTENTION_SCHEMA,
+    "mla_query_projection": _MLA_QUERY_PROJECTION_SCHEMA,
+    "mla_query_lora_projection": _MLA_QUERY_LORA_PROJECTION_SCHEMA,
+    "mla_cache_projection": _MLA_CACHE_PROJECTION_SCHEMA,
+    "mla_cache_projection_write": _MLA_CACHE_PROJECTION_WRITE_SCHEMA,
+    "mla_output_projection": _MLA_OUTPUT_PROJECTION_SCHEMA,
 }
 _missing_schemas = {
     operator: schema for operator, schema in _SCHEMAS.items() if not _operator_is_defined(operator)
@@ -341,6 +366,137 @@ def _composite_mla_absorbed_attention(
     )
 
 
+def _mla_projection_compute_dtype(tensor: Tensor) -> torch.dtype:
+    return torch.float64 if tensor.dtype == torch.float64 else torch.float32
+
+
+def _composite_mla_rms_norm(x: Tensor, weight: Tensor, epsilon: float) -> Tensor:
+    compute_dtype = _mla_projection_compute_dtype(x)
+    x_compute = x.to(compute_dtype)
+    inverse_rms = torch.rsqrt(x_compute.square().mean(dim=-1, keepdim=True) + epsilon)
+    return x_compute * inverse_rms * weight.to(compute_dtype)
+
+
+def _composite_mla_rope(x: Tensor, positions: Tensor, theta: float) -> Tensor:
+    compute_dtype = _mla_projection_compute_dtype(x)
+    pair_index = torch.arange(0, x.shape[-1], 2, device=x.device, dtype=compute_dtype)
+    inverse_frequency = theta ** (-pair_index / x.shape[-1])
+    angles = positions.to(compute_dtype).unsqueeze(-1) * inverse_frequency.unsqueeze(0)
+    cosine = torch.cos(angles).view(1, x.shape[1], 1, -1)
+    sine = torch.sin(angles).view(1, x.shape[1], 1, -1)
+    x_compute = x.to(compute_dtype)
+    even = x_compute[..., 0::2]
+    odd = x_compute[..., 1::2]
+    return torch.stack(
+        (even * cosine - odd * sine, even * sine + odd * cosine),
+        dim=-1,
+    ).flatten(-2)
+
+
+def _composite_mla_query_projection(
+    x: Tensor,
+    wq: Tensor,
+    positions: Tensor,
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    rope_theta: float,
+) -> tuple[Tensor, Tensor]:
+    compute_dtype = _mla_projection_compute_dtype(x)
+    head_dim = qk_nope_head_dim + qk_rope_head_dim
+    projected = torch.nn.functional.linear(x.to(compute_dtype), wq.to(compute_dtype))
+    projected = projected.reshape(x.shape[0], x.shape[1], n_heads, head_dim)
+    q_nope, q_pe = torch.split(
+        projected,
+        [qk_nope_head_dim, qk_rope_head_dim],
+        dim=-1,
+    )
+    return q_nope.contiguous(), _composite_mla_rope(q_pe, positions, rope_theta).contiguous()
+
+
+def _composite_mla_query_lora_projection(
+    x: Tensor,
+    wq_a: Tensor,
+    q_norm_weight: Tensor,
+    wq_b: Tensor,
+    positions: Tensor,
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+) -> tuple[Tensor, Tensor]:
+    compute_dtype = _mla_projection_compute_dtype(x)
+    latent = torch.nn.functional.linear(x.to(compute_dtype), wq_a.to(compute_dtype))
+    latent = _composite_mla_rms_norm(latent, q_norm_weight, rms_norm_eps)
+    projected = torch.nn.functional.linear(latent, wq_b.to(compute_dtype))
+    head_dim = qk_nope_head_dim + qk_rope_head_dim
+    projected = projected.reshape(x.shape[0], x.shape[1], n_heads, head_dim)
+    q_nope, q_pe = torch.split(
+        projected,
+        [qk_nope_head_dim, qk_rope_head_dim],
+        dim=-1,
+    )
+    return q_nope.contiguous(), _composite_mla_rope(q_pe, positions, rope_theta).contiguous()
+
+
+def _composite_mla_cache_projection(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    kv_lora_rank: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+) -> tuple[Tensor, Tensor]:
+    compute_dtype = _mla_projection_compute_dtype(x)
+    projected = torch.nn.functional.linear(x.to(compute_dtype), wkv_a.to(compute_dtype))
+    kv, pe = torch.split(
+        projected,
+        [kv_lora_rank, projected.shape[-1] - kv_lora_rank],
+        dim=-1,
+    )
+    kv = _composite_mla_rms_norm(kv, kv_norm_weight, rms_norm_eps).contiguous()
+    pe = _composite_mla_rope(pe.unsqueeze(2), positions, rope_theta).squeeze(2).contiguous()
+    return kv, pe
+
+
+def _composite_mla_cache_projection_write(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    start: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+) -> None:
+    kv, pe = _composite_mla_cache_projection(
+        x,
+        wkv_a,
+        kv_norm_weight,
+        positions,
+        kv_norm_weight.numel(),
+        rope_theta,
+        rms_norm_eps,
+    )
+    end = start + x.shape[1]
+    kv_storage[:, start:end].copy_(kv)
+    pe_storage[:, start:end].copy_(pe)
+    position_storage[start:end].copy_(positions)
+
+
+def _composite_mla_output_projection(heads: Tensor, wo: Tensor) -> Tensor:
+    compute_dtype = _mla_projection_compute_dtype(heads)
+    return (
+        torch.nn.functional.linear(heads.flatten(2).to(compute_dtype), wo.to(compute_dtype))
+        .to(heads.dtype)
+        .contiguous()
+    )
+
+
 def _tensorized_swiglu_experts_reference(
     activations: Tensor,
     expert_offsets: Tensor,
@@ -547,6 +703,158 @@ def _fake_mla_absorbed_attention(
     return q_nope.new_empty((q_nope.shape[0], q_nope.shape[1], q_nope.shape[2], value_up.shape[1]))
 
 
+def _fake_mla_query_outputs(
+    x: Tensor,
+    positions: Tensor,
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    rope_theta: float,
+) -> tuple[Tensor, Tensor]:
+    torch._check(x.ndim == 3 and positions.ndim == 1)
+    torch._check(positions.shape[0] == x.shape[1])
+    torch._check(x.device == positions.device)
+    torch._check(x.is_floating_point() and positions.dtype == torch.long)
+    torch._check(n_heads > 0 and qk_nope_head_dim > 0)
+    torch._check(qk_rope_head_dim > 0 and qk_rope_head_dim % 2 == 0)
+    torch._check(math.isfinite(rope_theta) and rope_theta > 0)
+    output_dtype = _mla_projection_compute_dtype(x)
+    return (
+        x.new_empty(
+            (x.shape[0], x.shape[1], n_heads, qk_nope_head_dim),
+            dtype=output_dtype,
+        ),
+        x.new_empty(
+            (x.shape[0], x.shape[1], n_heads, qk_rope_head_dim),
+            dtype=output_dtype,
+        ),
+    )
+
+
+def _fake_mla_query_projection(
+    x: Tensor,
+    wq: Tensor,
+    positions: Tensor,
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    rope_theta: float,
+) -> tuple[Tensor, Tensor]:
+    torch._check(wq.ndim == 2)
+    torch._check(wq.shape[1] == x.shape[2])
+    torch._check(wq.shape[0] == n_heads * (qk_nope_head_dim + qk_rope_head_dim))
+    torch._check(wq.device == x.device and wq.dtype == x.dtype)
+    return _fake_mla_query_outputs(
+        x,
+        positions,
+        n_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        rope_theta,
+    )
+
+
+def _fake_mla_query_lora_projection(
+    x: Tensor,
+    wq_a: Tensor,
+    q_norm_weight: Tensor,
+    wq_b: Tensor,
+    positions: Tensor,
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+) -> tuple[Tensor, Tensor]:
+    torch._check(wq_a.ndim == 2 and q_norm_weight.ndim == 1 and wq_b.ndim == 2)
+    torch._check(wq_a.shape[1] == x.shape[2])
+    torch._check(wq_a.shape[0] == q_norm_weight.shape[0] == wq_b.shape[1])
+    torch._check(wq_b.shape[0] == n_heads * (qk_nope_head_dim + qk_rope_head_dim))
+    torch._check(
+        wq_a.device == q_norm_weight.device == wq_b.device == x.device
+        and wq_a.dtype == q_norm_weight.dtype == wq_b.dtype == x.dtype
+    )
+    torch._check(math.isfinite(rms_norm_eps) and rms_norm_eps > 0)
+    return _fake_mla_query_outputs(
+        x,
+        positions,
+        n_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        rope_theta,
+    )
+
+
+def _fake_mla_cache_projection(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    kv_lora_rank: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+) -> tuple[Tensor, Tensor]:
+    torch._check(x.ndim == 3 and wkv_a.ndim == 2 and kv_norm_weight.ndim == 1)
+    torch._check(positions.ndim == 1 and positions.shape[0] == x.shape[1])
+    torch._check(wkv_a.shape[1] == x.shape[2])
+    torch._check(kv_norm_weight.shape[0] == kv_lora_rank)
+    rope_dim = wkv_a.shape[0] - kv_lora_rank
+    torch._check(kv_lora_rank > 0 and rope_dim > 0 and rope_dim % 2 == 0)
+    torch._check(
+        x.device == wkv_a.device == kv_norm_weight.device == positions.device
+        and x.dtype == wkv_a.dtype == kv_norm_weight.dtype
+    )
+    torch._check(positions.dtype == torch.long)
+    torch._check(math.isfinite(rope_theta) and rope_theta > 0)
+    torch._check(math.isfinite(rms_norm_eps) and rms_norm_eps > 0)
+    output_dtype = _mla_projection_compute_dtype(x)
+    return (
+        x.new_empty((x.shape[0], x.shape[1], kv_lora_rank), dtype=output_dtype),
+        x.new_empty((x.shape[0], x.shape[1], rope_dim), dtype=output_dtype),
+    )
+
+
+def _fake_mla_cache_projection_write(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    start: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+) -> None:
+    kv, pe = _fake_mla_cache_projection(
+        x,
+        wkv_a,
+        kv_norm_weight,
+        positions,
+        kv_norm_weight.shape[0],
+        rope_theta,
+        rms_norm_eps,
+    )
+    torch._check(kv_storage.ndim == 3 and pe_storage.ndim == 3)
+    torch._check(position_storage.ndim == 1 and position_storage.dtype == torch.long)
+    torch._check(kv_storage.shape[0] == pe_storage.shape[0] == x.shape[0])
+    torch._check(kv_storage.shape[1] == pe_storage.shape[1] == position_storage.shape[0])
+    torch._check(kv_storage.shape[2] == kv.shape[2] and pe_storage.shape[2] == pe.shape[2])
+    torch._check(
+        kv_storage.device == pe_storage.device == position_storage.device == x.device
+        and kv_storage.dtype == pe_storage.dtype == x.dtype
+    )
+    torch._check(start >= 0 and start + x.shape[1] <= kv_storage.shape[1])
+
+
+def _fake_mla_output_projection(heads: Tensor, wo: Tensor) -> Tensor:
+    torch._check(heads.ndim == 4 and wo.ndim == 2)
+    torch._check(wo.shape[1] == heads.shape[2] * heads.shape[3])
+    torch._check(heads.device == wo.device and heads.dtype == wo.dtype)
+    torch._check(heads.is_floating_point() and wo.is_floating_point())
+    return heads.new_empty((heads.shape[0], heads.shape[1], wo.shape[0]))
+
+
 composite_explicit = torch.library.Library("ds_flash_mla_moe", "IMPL", "CompositeExplicitAutograd")
 composite_explicit.impl("attention_forward", _composite_attention_forward)
 composite_explicit.impl("route_pack", _composite_route_pack)
@@ -556,6 +864,11 @@ composite_explicit.impl("swiglu_experts", _composite_swiglu_experts)
 composite_explicit.impl("expert_major_pack", _composite_expert_major_pack)
 composite_explicit.impl("grouped_topk", _composite_grouped_topk)
 composite_explicit.impl("mla_absorbed_attention", _composite_mla_absorbed_attention)
+composite_explicit.impl("mla_query_projection", _composite_mla_query_projection)
+composite_explicit.impl("mla_query_lora_projection", _composite_mla_query_lora_projection)
+composite_explicit.impl("mla_cache_projection", _composite_mla_cache_projection)
+composite_explicit.impl("mla_cache_projection_write", _composite_mla_cache_projection_write)
+composite_explicit.impl("mla_output_projection", _composite_mla_output_projection)
 _LIBRARY_HANDLES.append(composite_explicit)
 
 composite_implicit = torch.library.Library("ds_flash_mla_moe", "IMPL", "CompositeImplicitAutograd")
@@ -572,6 +885,15 @@ torch.library.register_fake("ds_flash_mla_moe::grouped_topk", _fake_grouped_topk
 torch.library.register_fake(
     "ds_flash_mla_moe::mla_absorbed_attention", _fake_mla_absorbed_attention
 )
+torch.library.register_fake("ds_flash_mla_moe::mla_query_projection", _fake_mla_query_projection)
+torch.library.register_fake(
+    "ds_flash_mla_moe::mla_query_lora_projection", _fake_mla_query_lora_projection
+)
+torch.library.register_fake("ds_flash_mla_moe::mla_cache_projection", _fake_mla_cache_projection)
+torch.library.register_fake(
+    "ds_flash_mla_moe::mla_cache_projection_write", _fake_mla_cache_projection_write
+)
+torch.library.register_fake("ds_flash_mla_moe::mla_output_projection", _fake_mla_output_projection)
 
 
 def _attention_setup_context(ctx, inputs, output) -> None:
@@ -862,6 +1184,195 @@ torch.library.register_autograd(
 )
 
 
+def _mla_query_projection_setup_context(ctx, inputs, output) -> None:
+    del output
+    ctx.save_for_backward(*inputs[:3])
+    ctx.n_heads, ctx.nope_dim, ctx.rope_dim, ctx.theta = inputs[3:]
+
+
+def _mla_query_projection_backward(context, grad_q_nope: Tensor | None, grad_q_pe: Tensor | None):
+    x, wq, positions = context.saved_tensors
+    requested = [tensor for index, tensor in enumerate((x, wq)) if context.needs_input_grad[index]]
+    requested_positions = [index for index in range(2) if context.needs_input_grad[index]]
+    if not requested:
+        return (None,) * 7
+    with torch.enable_grad():
+        q_nope, q_pe = _composite_mla_query_projection(
+            x,
+            wq,
+            positions,
+            context.n_heads,
+            context.nope_dim,
+            context.rope_dim,
+            context.theta,
+        )
+        requested_gradients = torch.autograd.grad(
+            (q_nope, q_pe),
+            requested,
+            (
+                torch.zeros_like(q_nope) if grad_q_nope is None else grad_q_nope,
+                torch.zeros_like(q_pe) if grad_q_pe is None else grad_q_pe,
+            ),
+            create_graph=torch.is_grad_enabled(),
+            allow_unused=True,
+        )
+    gradients: list[Tensor | None] = [None] * 7
+    for position, gradient in zip(requested_positions, requested_gradients, strict=True):
+        gradients[position] = gradient
+    return tuple(gradients)
+
+
+torch.library.register_autograd(
+    "ds_flash_mla_moe::mla_query_projection",
+    _mla_query_projection_backward,
+    setup_context=_mla_query_projection_setup_context,
+)
+
+
+def _mla_query_lora_projection_setup_context(ctx, inputs, output) -> None:
+    del output
+    ctx.save_for_backward(*inputs[:5])
+    (
+        ctx.n_heads,
+        ctx.nope_dim,
+        ctx.rope_dim,
+        ctx.theta,
+        ctx.epsilon,
+    ) = inputs[5:]
+
+
+def _mla_query_lora_projection_backward(
+    context,
+    grad_q_nope: Tensor | None,
+    grad_q_pe: Tensor | None,
+):
+    x, wq_a, q_norm_weight, wq_b, positions = context.saved_tensors
+    differentiable = (x, wq_a, q_norm_weight, wq_b)
+    requested = [
+        tensor for index, tensor in enumerate(differentiable) if context.needs_input_grad[index]
+    ]
+    requested_positions = [index for index in range(4) if context.needs_input_grad[index]]
+    if not requested:
+        return (None,) * 10
+    with torch.enable_grad():
+        q_nope, q_pe = _composite_mla_query_lora_projection(
+            x,
+            wq_a,
+            q_norm_weight,
+            wq_b,
+            positions,
+            context.n_heads,
+            context.nope_dim,
+            context.rope_dim,
+            context.theta,
+            context.epsilon,
+        )
+        requested_gradients = torch.autograd.grad(
+            (q_nope, q_pe),
+            requested,
+            (
+                torch.zeros_like(q_nope) if grad_q_nope is None else grad_q_nope,
+                torch.zeros_like(q_pe) if grad_q_pe is None else grad_q_pe,
+            ),
+            create_graph=torch.is_grad_enabled(),
+            allow_unused=True,
+        )
+    gradients: list[Tensor | None] = [None] * 10
+    for position, gradient in zip(requested_positions, requested_gradients, strict=True):
+        gradients[position] = gradient
+    return tuple(gradients)
+
+
+torch.library.register_autograd(
+    "ds_flash_mla_moe::mla_query_lora_projection",
+    _mla_query_lora_projection_backward,
+    setup_context=_mla_query_lora_projection_setup_context,
+)
+
+
+def _mla_cache_projection_setup_context(ctx, inputs, output) -> None:
+    del output
+    ctx.save_for_backward(*inputs[:4])
+    ctx.latent_dim, ctx.theta, ctx.epsilon = inputs[4:]
+
+
+def _mla_cache_projection_backward(context, grad_kv: Tensor | None, grad_pe: Tensor | None):
+    x, wkv_a, kv_norm_weight, positions = context.saved_tensors
+    differentiable = (x, wkv_a, kv_norm_weight)
+    requested = [
+        tensor for index, tensor in enumerate(differentiable) if context.needs_input_grad[index]
+    ]
+    requested_positions = [index for index in range(3) if context.needs_input_grad[index]]
+    if not requested:
+        return (None,) * 7
+    with torch.enable_grad():
+        kv, pe = _composite_mla_cache_projection(
+            x,
+            wkv_a,
+            kv_norm_weight,
+            positions,
+            context.latent_dim,
+            context.theta,
+            context.epsilon,
+        )
+        requested_gradients = torch.autograd.grad(
+            (kv, pe),
+            requested,
+            (
+                torch.zeros_like(kv) if grad_kv is None else grad_kv,
+                torch.zeros_like(pe) if grad_pe is None else grad_pe,
+            ),
+            create_graph=torch.is_grad_enabled(),
+            allow_unused=True,
+        )
+    gradients: list[Tensor | None] = [None] * 7
+    for position, gradient in zip(requested_positions, requested_gradients, strict=True):
+        gradients[position] = gradient
+    return tuple(gradients)
+
+
+torch.library.register_autograd(
+    "ds_flash_mla_moe::mla_cache_projection",
+    _mla_cache_projection_backward,
+    setup_context=_mla_cache_projection_setup_context,
+)
+
+
+def _mla_output_projection_setup_context(ctx, inputs, output) -> None:
+    del output
+    ctx.save_for_backward(*inputs)
+
+
+def _mla_output_projection_backward(context, grad_output: Tensor):
+    heads, wo = context.saved_tensors
+    requested = [
+        tensor for index, tensor in enumerate((heads, wo)) if context.needs_input_grad[index]
+    ]
+    requested_positions = [index for index in range(2) if context.needs_input_grad[index]]
+    if not requested:
+        return None, None
+    with torch.enable_grad():
+        reference = _composite_mla_output_projection(heads, wo)
+        requested_gradients = torch.autograd.grad(
+            reference,
+            requested,
+            grad_output,
+            create_graph=torch.is_grad_enabled(),
+            allow_unused=True,
+        )
+    gradients: list[Tensor | None] = [None, None]
+    for position, gradient in zip(requested_positions, requested_gradients, strict=True):
+        gradients[position] = gradient
+    return tuple(gradients)
+
+
+torch.library.register_autograd(
+    "ds_flash_mla_moe::mla_output_projection",
+    _mla_output_projection_backward,
+    setup_context=_mla_output_projection_setup_context,
+)
+
+
 def native_extension_loaded() -> bool:
     """Return whether this installation contains and loaded the native library."""
 
@@ -885,13 +1396,255 @@ def cuda_gemm_available() -> bool:
 
 
 def cuda_mla_available() -> bool:
-    """Return whether the native absorbed MLA attention kernel can be executed."""
+    """Return whether the complete native MLA prefill/decode pipeline can execute."""
 
     return (
         _NATIVE_EXTENSION_LOADED
         and torch.cuda.is_available()
-        and _operator_has_cuda_kernel("mla_absorbed_attention")
+        and all(
+            _operator_has_cuda_kernel(operator)
+            for operator in (
+                "mla_query_projection",
+                "mla_query_lora_projection",
+                "mla_cache_projection",
+                "mla_cache_projection_write",
+                "mla_absorbed_attention",
+                "mla_output_projection",
+            )
+        )
     )
+
+
+def _validate_mla_backend(backend: MLABackend) -> None:
+    if backend not in {"auto", "cuda", "reference"}:
+        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+
+
+def _mla_projection_cuda_ineligibility_reason(
+    operator: str,
+    floating_tensors: tuple[Tensor, ...],
+    positions: Tensor | None = None,
+    *,
+    contiguous_tensors: tuple[Tensor, ...] = (),
+) -> str | None:
+    if not _NATIVE_EXTENSION_LOADED:
+        return "the native extension is not installed"
+    tensors = floating_tensors + (() if positions is None else (positions,))
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        return "all MLA projection tensors must be CUDA tensors"
+    if any(tensor.dtype != torch.float32 for tensor in floating_tensors):
+        return "the CUDA MLA projection kernels currently support float32 only"
+    if positions is not None and positions.dtype != torch.long:
+        return "MLA positions must use int64"
+    if len({tensor.device for tensor in tensors}) != 1:
+        return "all MLA projection tensors must share a CUDA device"
+    if any(not tensor.is_contiguous() for tensor in contiguous_tensors):
+        return "the CUDA MLA projection weights and storage must be contiguous"
+    if not _operator_has_cuda_kernel(operator):
+        return f"the loaded native extension does not register {operator}"
+    return None
+
+
+def mla_query_projection(
+    x: Tensor,
+    wq: Tensor,
+    positions: Tensor,
+    *,
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    rope_theta: float,
+    backend: MLABackend = "auto",
+) -> tuple[Tensor, Tensor]:
+    """Project direct MLA queries with native CUDA when its FP32 contract holds."""
+
+    _validate_mla_backend(backend)
+    reason = _mla_projection_cuda_ineligibility_reason(
+        "mla_query_projection",
+        (x, wq),
+        positions,
+        contiguous_tensors=(wq,),
+    )
+    arguments = (
+        x,
+        wq,
+        positions,
+        n_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        rope_theta,
+    )
+    if backend == "cuda":
+        if reason is not None:
+            raise RuntimeError(f"CUDA MLA is unavailable: query projection: {reason}")
+        return torch.ops.ds_flash_mla_moe.mla_query_projection.default(*arguments)
+    if backend == "auto" and reason is None:
+        return torch.ops.ds_flash_mla_moe.mla_query_projection.default(*arguments)
+    return _composite_mla_query_projection(*arguments)
+
+
+def mla_query_lora_projection(
+    x: Tensor,
+    wq_a: Tensor,
+    q_norm_weight: Tensor,
+    wq_b: Tensor,
+    positions: Tensor,
+    *,
+    n_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+    backend: MLABackend = "auto",
+) -> tuple[Tensor, Tensor]:
+    """Project LoRA MLA queries, including RMSNorm and RoPE, through one operator."""
+
+    _validate_mla_backend(backend)
+    reason = _mla_projection_cuda_ineligibility_reason(
+        "mla_query_lora_projection",
+        (x, wq_a, q_norm_weight, wq_b),
+        positions,
+        contiguous_tensors=(wq_a, q_norm_weight, wq_b),
+    )
+    arguments = (
+        x,
+        wq_a,
+        q_norm_weight,
+        wq_b,
+        positions,
+        n_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        rope_theta,
+        rms_norm_eps,
+    )
+    if backend == "cuda":
+        if reason is not None:
+            raise RuntimeError(f"CUDA MLA is unavailable: query projection: {reason}")
+        return torch.ops.ds_flash_mla_moe.mla_query_lora_projection.default(*arguments)
+    if backend == "auto" and reason is None:
+        return torch.ops.ds_flash_mla_moe.mla_query_lora_projection.default(*arguments)
+    return _composite_mla_query_lora_projection(*arguments)
+
+
+def mla_cache_projection(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    *,
+    kv_lora_rank: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+    backend: MLABackend = "auto",
+) -> tuple[Tensor, Tensor]:
+    """Build compressed MLA cache entries with native projection, RMSNorm, and RoPE."""
+
+    _validate_mla_backend(backend)
+    reason = _mla_projection_cuda_ineligibility_reason(
+        "mla_cache_projection",
+        (x, wkv_a, kv_norm_weight),
+        positions,
+        contiguous_tensors=(wkv_a, kv_norm_weight),
+    )
+    arguments = (
+        x,
+        wkv_a,
+        kv_norm_weight,
+        positions,
+        kv_lora_rank,
+        rope_theta,
+        rms_norm_eps,
+    )
+    if backend == "cuda":
+        if reason is not None:
+            raise RuntimeError(f"CUDA MLA is unavailable: cache projection: {reason}")
+        return torch.ops.ds_flash_mla_moe.mla_cache_projection.default(*arguments)
+    if backend == "auto" and reason is None:
+        return torch.ops.ds_flash_mla_moe.mla_cache_projection.default(*arguments)
+    return _composite_mla_cache_projection(*arguments)
+
+
+def mla_cache_projection_write(
+    x: Tensor,
+    wkv_a: Tensor,
+    kv_norm_weight: Tensor,
+    positions: Tensor,
+    kv_storage: Tensor,
+    pe_storage: Tensor,
+    position_storage: Tensor,
+    *,
+    start: int,
+    rope_theta: float,
+    rms_norm_eps: float,
+    backend: MLABackend = "auto",
+) -> None:
+    """Project a chunk directly into preallocated inference cache storage."""
+
+    _validate_mla_backend(backend)
+    floating = (x, wkv_a, kv_norm_weight, kv_storage, pe_storage)
+    reason = _mla_projection_cuda_ineligibility_reason(
+        "mla_cache_projection_write",
+        floating,
+        positions,
+        contiguous_tensors=(
+            wkv_a,
+            kv_norm_weight,
+            kv_storage,
+            pe_storage,
+            position_storage,
+        ),
+    )
+    if reason is None and (
+        position_storage.device.type != "cuda"
+        or position_storage.device != x.device
+        or position_storage.dtype != torch.long
+    ):
+        reason = "MLA position storage must be an int64 CUDA tensor"
+    arguments = (
+        x,
+        wkv_a,
+        kv_norm_weight,
+        positions,
+        kv_storage,
+        pe_storage,
+        position_storage,
+        start,
+        rope_theta,
+        rms_norm_eps,
+    )
+    if backend == "cuda":
+        if reason is not None:
+            raise RuntimeError(f"CUDA MLA is unavailable: static cache write: {reason}")
+        torch.ops.ds_flash_mla_moe.mla_cache_projection_write.default(*arguments)
+        return
+    if backend == "auto" and reason is None:
+        torch.ops.ds_flash_mla_moe.mla_cache_projection_write.default(*arguments)
+        return
+    _composite_mla_cache_projection_write(*arguments)
+
+
+def mla_output_projection(
+    heads: Tensor,
+    wo: Tensor,
+    *,
+    backend: MLABackend = "auto",
+) -> Tensor:
+    """Project MLA heads back to model width using the selected operator backend."""
+
+    _validate_mla_backend(backend)
+    reason = _mla_projection_cuda_ineligibility_reason(
+        "mla_output_projection",
+        (heads, wo),
+        contiguous_tensors=(heads, wo),
+    )
+    if backend == "cuda":
+        if reason is not None:
+            raise RuntimeError(f"CUDA MLA is unavailable: output projection: {reason}")
+        return torch.ops.ds_flash_mla_moe.mla_output_projection.default(heads, wo)
+    if backend == "auto" and reason is None:
+        return torch.ops.ds_flash_mla_moe.mla_output_projection.default(heads, wo)
+    return _composite_mla_output_projection(heads, wo)
 
 
 def _mla_cuda_ineligibility_reason(
@@ -934,8 +1687,7 @@ def mla_absorbed_attention(
 ) -> Tensor:
     """Evaluate absorbed MLA attention, selecting the native fused CUDA path when eligible."""
 
-    if backend not in {"auto", "cuda", "reference"}:
-        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+    _validate_mla_backend(backend)
     if not math.isfinite(scale):
         raise ValueError("scale must be finite")
     reason = _mla_cuda_ineligibility_reason(

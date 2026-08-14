@@ -29,6 +29,7 @@ def native_build_configuration() -> dict[str, object]:
             "csrc/moe/grouped_topk_cuda.cu",
             "csrc/moe/swiglu_experts_cuda.cu",
             "csrc/mla/mla_absorbed_attention_cuda.cu",
+            "csrc/mla/mla_projection_cuda.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args,
@@ -54,6 +55,7 @@ def assert_native_sources_present() -> None:
         Path("csrc/moe/grouped_topk_cuda.cu"),
         Path("csrc/moe/swiglu_experts_cuda.cu"),
         Path("csrc/mla/mla_absorbed_attention_cuda.cu"),
+        Path("csrc/mla/mla_projection_cuda.cu"),
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:

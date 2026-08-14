@@ -31,4 +31,13 @@ TORCH_LIBRARY(ds_flash_mla_moe, m) {
       "grouped_topk(Tensor x, Tensor gate_weight, int topk, int n_groups, int topk_groups, Tensor? score_bias, float route_scale) -> (Tensor, Tensor)");
   m.def(
       "mla_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv, Tensor pe, Tensor key_up, Tensor value_up, Tensor query_positions, Tensor key_positions, bool causal, float scale) -> Tensor");
+  m.def(
+      "mla_query_projection(Tensor x, Tensor wq, Tensor positions, int n_heads, int qk_nope_head_dim, int qk_rope_head_dim, float rope_theta) -> (Tensor, Tensor)");
+  m.def(
+      "mla_query_lora_projection(Tensor x, Tensor wq_a, Tensor q_norm_weight, Tensor wq_b, Tensor positions, int n_heads, int qk_nope_head_dim, int qk_rope_head_dim, float rope_theta, float rms_norm_eps) -> (Tensor, Tensor)");
+  m.def(
+      "mla_cache_projection(Tensor x, Tensor wkv_a, Tensor kv_norm_weight, Tensor positions, int kv_lora_rank, float rope_theta, float rms_norm_eps) -> (Tensor, Tensor)");
+  m.def(
+      "mla_cache_projection_write(Tensor x, Tensor wkv_a, Tensor kv_norm_weight, Tensor positions, Tensor(a!) kv_storage, Tensor(b!) pe_storage, Tensor(c!) position_storage, int start, float rope_theta, float rms_norm_eps) -> ()");
+  m.def("mla_output_projection(Tensor heads, Tensor wo) -> Tensor");
 }

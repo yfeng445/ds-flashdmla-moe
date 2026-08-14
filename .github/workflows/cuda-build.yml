@@ -63,6 +63,11 @@ jobs:
               "swiglu_experts",
               "tiled_gemm",
               "mla_absorbed_attention",
+              "mla_query_projection",
+              "mla_query_lora_projection",
+              "mla_cache_projection",
+              "mla_cache_projection_write",
+              "mla_output_projection",
           ):
               qualified = f"ds_flash_mla_moe::{operator}"
               assert torch._C._dispatch_has_kernel_for_dispatch_key(qualified, "CUDA")

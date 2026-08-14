@@ -17,6 +17,7 @@ from .benchmarking import (
     summarize_latencies,
 )
 from .mla import (
+    MLABackend,
     MLAConfig,
     MLALatentCache,
     MLAStaticCache,
@@ -313,6 +314,10 @@ def _attention(
     )
 
 
+def _projection_backend(implementation: MLAImplementation) -> MLABackend:
+    return "cuda" if implementation == "cuda" else "reference"
+
+
 def _error_report(
     actual: Tensor,
     expected: Tensor,
@@ -360,13 +365,21 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
     ).to(device)
     weights = _make_weights(config, dtype=dtype, device=device)
     positions = torch.arange(config.sequence_length, device=device)
-    full_cache = build_mla_cache(context, mla_config, weights, positions=positions)
+    configured_backend = _projection_backend(config.implementation)
+    full_cache = build_mla_cache(
+        context,
+        mla_config,
+        weights,
+        positions=positions,
+        backend=configured_backend,
+    )
     prefix_cache = (
         build_mla_cache(
             context[:, :-1],
             mla_config,
             weights,
             positions=positions[:-1],
+            backend=configured_backend,
         )
         if config.sequence_length > 1
         else None
@@ -389,6 +402,7 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
                     mla_config,
                     weights,
                     positions=positions[:-1],
+                    backend=configured_backend,
                 )
 
     is_decode = config.workload.startswith("decode")
@@ -396,8 +410,15 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
     query_positions = positions[-1:] if is_decode else positions
 
     def operation_for(implementation: MLAImplementation) -> Tensor:
+        projection_backend = _projection_backend(implementation)
         if config.workload == "prefill_with_cache":
-            cache = build_mla_cache(context, mla_config, weights, positions=positions)
+            cache = build_mla_cache(
+                context,
+                mla_config,
+                weights,
+                positions=positions,
+                backend=projection_backend,
+            )
         elif config.workload == "decode_with_append":
             cache = append_mla_cache(
                 prefix_cache,
@@ -405,6 +426,7 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
                 mla_config,
                 weights,
                 positions=query_positions,
+                backend=projection_backend,
             )
         elif config.workload == "decode_with_static_write":
             assert static_cache is not None
@@ -416,6 +438,7 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
                 mla_config,
                 weights,
                 positions=query_positions,
+                backend=projection_backend,
             )
         else:
             cache = full_cache
@@ -499,8 +522,8 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
             "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
             "decode_with_static_write reuses fixed storage and writes only the new cache entry",
             (
-                "cuda fuses absorbed score, online softmax, and latent value accumulation; "
-                "query/output projections remain PyTorch operations"
+                "cuda covers query projection, cache projection/static write, absorbed online "
+                "attention, and output projection with native FP32 operators"
                 if config.implementation == "cuda"
                 else "naive and absorbed paths are correctness references, not fused MLA kernels"
             ),

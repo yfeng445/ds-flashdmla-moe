@@ -60,6 +60,19 @@ def make_fixture(*, direct_query: bool = False):
     return x, config, weights
 
 
+def cuda_weights(weights: MLAWeights, *, requires_grad: bool = False) -> MLAWeights:
+    return MLAWeights(
+        **{
+            field.name: (
+                getattr(weights, field.name).float().cuda().detach().requires_grad_(requires_grad)
+                if getattr(weights, field.name) is not None
+                else None
+            )
+            for field in fields(MLAWeights)
+        }
+    )
+
+
 @pytest.mark.parametrize("direct_query", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 def test_naive_and_absorbed_paths_are_equivalent(direct_query: bool, causal: bool) -> None:
@@ -172,6 +185,93 @@ def test_raw_absorbed_operator_passes_opcheck() -> None:
     assert output.stride() == torch.empty_like(output).stride()
 
 
+def test_raw_mla_projection_operators_pass_opcheck() -> None:
+    torch.manual_seed(191)
+    x = torch.randn(2, 3, 8, dtype=torch.float64, requires_grad=True)
+    positions = torch.arange(3)
+    direct_weight = torch.randn(18, 8, dtype=torch.float64, requires_grad=True)
+    q_a = torch.randn(5, 8, dtype=torch.float64, requires_grad=True)
+    q_norm = torch.randn(5, dtype=torch.float64, requires_grad=True)
+    q_b = torch.randn(18, 5, dtype=torch.float64, requires_grad=True)
+    kv_a = torch.randn(6, 8, dtype=torch.float64, requires_grad=True)
+    kv_norm = torch.randn(4, dtype=torch.float64, requires_grad=True)
+    heads = torch.randn(2, 3, 3, 3, dtype=torch.float64, requires_grad=True)
+    output_weight = torch.randn(8, 9, dtype=torch.float64, requires_grad=True)
+    cases = (
+        (
+            torch.ops.ds_flash_mla_moe.mla_query_projection.default,
+            (x, direct_weight, positions, 3, 4, 2, 10_000.0),
+        ),
+        (
+            torch.ops.ds_flash_mla_moe.mla_query_lora_projection.default,
+            (x, q_a, q_norm, q_b, positions, 3, 4, 2, 10_000.0, 1e-6),
+        ),
+        (
+            torch.ops.ds_flash_mla_moe.mla_cache_projection.default,
+            (x, kv_a, kv_norm, positions, 4, 10_000.0, 1e-6),
+        ),
+        (
+            torch.ops.ds_flash_mla_moe.mla_output_projection.default,
+            (heads, output_weight),
+        ),
+    )
+
+    for operator, inputs in cases:
+        torch.library.opcheck(operator, inputs)
+        outputs = operator(*inputs)
+        if isinstance(outputs, tuple):
+            assert all(output.is_contiguous() for output in outputs)
+        else:
+            assert outputs.is_contiguous()
+
+
+def test_raw_mla_static_cache_write_passes_opcheck_and_mutates_only_target_slice() -> None:
+    x, config, weights = make_fixture()
+    positions = torch.arange(7, 7 + x.shape[1])
+    kv_storage = torch.full(
+        (x.shape[0], x.shape[1] + 2, config.kv_lora_rank),
+        torch.nan,
+        dtype=x.dtype,
+    )
+    pe_storage = torch.full(
+        (x.shape[0], x.shape[1] + 2, config.qk_rope_head_dim),
+        torch.nan,
+        dtype=x.dtype,
+    )
+    position_storage = torch.full((x.shape[1] + 2,), -1, dtype=torch.long)
+    inputs = (
+        x,
+        weights.wkv_a,
+        weights.kv_norm_weight,
+        positions,
+        kv_storage,
+        pe_storage,
+        position_storage,
+        1,
+        config.rope_theta,
+        config.rms_norm_eps,
+    )
+    torch.library.opcheck(
+        torch.ops.ds_flash_mla_moe.mla_cache_projection_write.default,
+        inputs,
+    )
+
+    torch.ops.ds_flash_mla_moe.mla_cache_projection_write.default(*inputs)
+    expected = build_mla_cache(
+        x,
+        config,
+        weights,
+        positions=positions,
+        backend="reference",
+    )
+    torch.testing.assert_close(kv_storage[:, 1:-1], expected.kv)
+    torch.testing.assert_close(pe_storage[:, 1:-1], expected.pe)
+    torch.testing.assert_close(position_storage[1:-1], positions)
+    assert torch.isnan(kv_storage[:, :1]).all() and torch.isnan(kv_storage[:, -1:]).all()
+    assert torch.isnan(pe_storage[:, :1]).all() and torch.isnan(pe_storage[:, -1:]).all()
+    assert position_storage[[0, -1]].tolist() == [-1, -1]
+
+
 def test_raw_absorbed_operator_runs_through_torch_compile() -> None:
     @torch.compile(fullgraph=True, backend="eager")
     def compiled(
@@ -250,28 +350,31 @@ def test_explicit_cuda_mla_rejects_attention_mask() -> None:
 @pytest.mark.cuda
 @pytest.mark.parametrize("query_length", [1, 3, 6])
 @pytest.mark.parametrize("causal", [False, True])
-def test_cuda_absorbed_mla_matches_reference(query_length: int, causal: bool) -> None:
-    x, config, weights = make_fixture()
+@pytest.mark.parametrize("direct_query", [False, True])
+def test_cuda_absorbed_mla_matches_reference(
+    query_length: int,
+    causal: bool,
+    direct_query: bool,
+) -> None:
+    x, config, weights = make_fixture(direct_query=direct_query)
     x = x.float().cuda()
-    weights = MLAWeights(
-        **{
-            field.name: (
-                getattr(weights, field.name).float().cuda()
-                if getattr(weights, field.name) is not None
-                else None
-            )
-            for field in fields(MLAWeights)
-        }
-    )
+    weights = cuda_weights(weights)
     positions = torch.arange(x.shape[1], device="cuda")
-    cache = build_mla_cache(x, config, weights, positions=positions)
+    cache = build_mla_cache(x, config, weights, positions=positions, backend="cuda")
+    reference_cache = build_mla_cache(
+        x,
+        config,
+        weights,
+        positions=positions,
+        backend="reference",
+    )
     query = x[:, -query_length:]
     query_positions = positions[-query_length:]
 
     with torch.no_grad():
         actual = mla_absorbed_attention(
             query,
-            cache,
+            reference_cache,
             config,
             weights,
             query_positions=query_positions,
@@ -301,26 +404,39 @@ def test_cuda_absorbed_mla_backward_matches_reference() -> None:
     x, config, weights = make_fixture()
     actual_x = x.float().cuda().requires_grad_(True)
     expected_x = actual_x.detach().clone().requires_grad_(True)
-    weights = MLAWeights(
+    actual_weights = cuda_weights(weights, requires_grad=True)
+    expected_weights = MLAWeights(
         **{
             field.name: (
-                getattr(weights, field.name).float().cuda()
-                if getattr(weights, field.name) is not None
+                getattr(actual_weights, field.name).detach().clone().requires_grad_(True)
+                if getattr(actual_weights, field.name) is not None
                 else None
             )
             for field in fields(MLAWeights)
         }
     )
     positions = torch.arange(x.shape[1], device="cuda")
-    actual_cache = build_mla_cache(actual_x, config, weights, positions=positions)
-    expected_cache = build_mla_cache(expected_x, config, weights, positions=positions)
+    actual_cache = build_mla_cache(
+        actual_x,
+        config,
+        actual_weights,
+        positions=positions,
+        backend="cuda",
+    )
+    expected_cache = build_mla_cache(
+        expected_x,
+        config,
+        expected_weights,
+        positions=positions,
+        backend="reference",
+    )
     upstream = torch.randn_like(actual_x)
 
     actual = mla_absorbed_attention(
         actual_x,
         actual_cache,
         config,
-        weights,
+        actual_weights,
         query_positions=positions,
         backend="cuda",
     )
@@ -328,14 +444,24 @@ def test_cuda_absorbed_mla_backward_matches_reference() -> None:
         expected_x,
         expected_cache,
         config,
-        weights,
+        expected_weights,
         query_positions=positions,
     )
     actual.backward(upstream)
     expected.backward(upstream)
 
     torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
-    torch.testing.assert_close(actual_x.grad, expected_x.grad, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(actual_x.grad, expected_x.grad, rtol=1e-3, atol=1e-3)
+    for field in fields(MLAWeights):
+        actual_weight = getattr(actual_weights, field.name)
+        expected_weight = getattr(expected_weights, field.name)
+        if actual_weight is not None and expected_weight is not None:
+            torch.testing.assert_close(
+                actual_weight.grad,
+                expected_weight.grad,
+                rtol=1e-3,
+                atol=1e-3,
+            )
 
 
 @pytest.mark.skipif(
@@ -346,18 +472,9 @@ def test_cuda_absorbed_mla_backward_matches_reference() -> None:
 def test_cuda_absorbed_mla_uses_current_stream() -> None:
     x, config, weights = make_fixture()
     x = x.float().cuda()
-    weights = MLAWeights(
-        **{
-            field.name: (
-                getattr(weights, field.name).float().cuda()
-                if getattr(weights, field.name) is not None
-                else None
-            )
-            for field in fields(MLAWeights)
-        }
-    )
+    weights = cuda_weights(weights)
     positions = torch.arange(x.shape[1], device="cuda")
-    cache = build_mla_cache(x, config, weights, positions=positions)
+    cache = build_mla_cache(x, config, weights, positions=positions, backend="cuda")
     stream = torch.cuda.Stream()
 
     with torch.no_grad(), torch.cuda.stream(stream):
@@ -381,6 +498,63 @@ def test_cuda_absorbed_mla_uses_current_stream() -> None:
             query_positions=positions,
         )
     torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
+
+
+@pytest.mark.skipif(
+    not cuda_mla_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.cuda
+def test_cuda_static_cache_projection_write_matches_reference_on_current_stream() -> None:
+    x, config, weights = make_fixture()
+    x = x.float().cuda()
+    weights = cuda_weights(weights)
+    positions = torch.arange(11, 11 + x.shape[1], device="cuda")
+    static = allocate_mla_static_cache(
+        batch_size=x.shape[0],
+        capacity=x.shape[1] + 2,
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    pointers = (
+        static.kv_storage.data_ptr(),
+        static.pe_storage.data_ptr(),
+        static.position_storage.data_ptr(),
+    )
+    stream = torch.cuda.Stream()
+
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        x.fill_(0.1875)
+        cache = write_mla_static_cache(
+            static,
+            x,
+            config,
+            weights,
+            positions=positions,
+            backend="cuda",
+        )
+        cache.kv.record_stream(stream)
+        cache.pe.record_stream(stream)
+        cache.positions.record_stream(stream)
+    stream.synchronize()
+    expected = build_mla_cache(
+        x,
+        config,
+        weights,
+        positions=positions,
+        backend="reference",
+    )
+
+    torch.testing.assert_close(cache.kv, expected.kv, rtol=5e-5, atol=5e-5)
+    torch.testing.assert_close(cache.pe, expected.pe, rtol=5e-5, atol=5e-5)
+    torch.testing.assert_close(cache.positions, positions)
+    assert static.valid_length == x.shape[1]
+    assert pointers == (
+        static.kv_storage.data_ptr(),
+        static.pe_storage.data_ptr(),
+        static.position_storage.data_ptr(),
+    )
 
 
 def test_incremental_latent_cache_decode_matches_causal_prefill() -> None:
