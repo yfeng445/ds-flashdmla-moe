@@ -25,7 +25,9 @@ jobs:
     container: nvidia/cuda:12.8.1-devel-ubuntu24.04
     env:
       DS_FLASH_BUILD_CUDA: "1"
-      TORCH_CUDA_ARCH_LIST: "8.0"
+      # Keep an Ampere cubin for the hosted compile gate and PTX for forward-JIT
+      # validation on the local Blackwell/RTX 5090 runner.
+      TORCH_CUDA_ARCH_LIST: "8.0+PTX"
     steps:
       - uses: actions/checkout@v4
       - run: apt-get update && apt-get install --yes python3 python3-pip python3-venv git
