@@ -1,0 +1,1217 @@
+{
+  "benchmark": "single_gpu_operator_matrix",
+  "cases": [
+    {
+      "baseline_label": "pytorch_absorbed",
+      "baseline_report": {
+        "benchmark": "multi_head_latent_attention_reference",
+        "cache_storage": {
+          "expanded_kv_payload_bytes": 81920,
+          "expanded_kv_payload_elements": 40960,
+          "expanded_total_bytes_with_positions": 82944,
+          "latent_payload_bytes": 12288,
+          "latent_payload_elements": 6144,
+          "latent_total_bytes_with_positions": 13312,
+          "payload_compression_ratio": 6.666666666666667,
+          "position_metadata_bytes": 1024
+        },
+        "configuration": {
+          "batch": 1,
+          "device": "cuda",
+          "dtype": "bfloat16",
+          "implementation": "absorbed",
+          "iterations": 20,
+          "kv_lora_rank": 32,
+          "model_dim": 128,
+          "n_heads": 4,
+          "q_lora_rank": 32,
+          "qk_nope_head_dim": 32,
+          "qk_rope_head_dim": 16,
+          "seed": 20260838,
+          "sequence_length": 128,
+          "v_head_dim": 32,
+          "verify": true,
+          "warmup": 5,
+          "workload": "prefill_with_cache"
+        },
+        "derived": {
+          "matrix_tflops_equivalent_at_median": 0.00782225198368425
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 5.666304111480713,
+          "mean_ms": 3.1376640021800997,
+          "median_ms": 2.681007981300354,
+          "min_ms": 1.6558400392532349,
+          "p90_ms": 4.89984941482544,
+          "p99_ms": 5.635223107337952
+        },
+        "notes": [
+          "matrix FLOPs omit RMSNorm, RoPE, softmax, masking, and cache concatenation",
+          "cache payload bytes are a storage model, not measured memory traffic",
+          "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
+          "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+          "naive and absorbed paths are correctness references, not fused MLA kernels"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "bfloat16",
+          "shape": [
+            1,
+            128,
+            128
+          ]
+        },
+        "raw_samples_ms": [
+          1.8621439933776855,
+          1.6558400392532349,
+          2.1204800605773926,
+          4.32473611831665,
+          4.832863807678223,
+          5.666304111480713,
+          5.502719879150391,
+          3.9657599925994873,
+          2.3621439933776855,
+          2.645792007446289,
+          2.716223955154419,
+          3.577888011932373,
+          2.5995841026306152,
+          2.5445120334625244,
+          2.783071994781494,
+          2.723583936691284,
+          3.0205440521240234,
+          2.645087957382202,
+          2.566431999206543,
+          2.6375679969787598
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.3,
+          "max_absolute_error": 1.0,
+          "max_tolerance_ratio": 0.8644400785854617,
+          "performed": true,
+          "reference": "the alternate naive/absorbed MLA path",
+          "rtol": 0.05
+        },
+        "work_estimate": {
+          "attention_path_matrix_flops": 12582912,
+          "cache_projection_matrix_flops": 1572864,
+          "functional_append_copy_bytes_lower_bound": 0,
+          "key_length": 128,
+          "output_projection_matrix_flops": 4194304,
+          "query_length": 128,
+          "query_projection_matrix_flops": 2621440,
+          "static_cache_storage_write_bytes": 0,
+          "total_matrix_flops": 20971520
+        }
+      },
+      "comparison": {
+        "baseline_median_ms": 2.681007981300354,
+        "lower_median": "native",
+        "native_median_ms": 0.8996959924697876,
+        "native_over_baseline": 0.3355812436013015
+      },
+      "description": "BF16 full prefill with low-precision staged storage",
+      "execution_order": [
+        "native",
+        "baseline"
+      ],
+      "family": "mla",
+      "name": "mla_low_precision_prefill_bfloat16",
+      "native_report": {
+        "benchmark": "multi_head_latent_attention_cuda",
+        "cache_storage": {
+          "expanded_kv_payload_bytes": 81920,
+          "expanded_kv_payload_elements": 40960,
+          "expanded_total_bytes_with_positions": 82944,
+          "latent_payload_bytes": 12288,
+          "latent_payload_elements": 6144,
+          "latent_total_bytes_with_positions": 13312,
+          "payload_compression_ratio": 6.666666666666667,
+          "position_metadata_bytes": 1024
+        },
+        "configuration": {
+          "batch": 1,
+          "device": "cuda",
+          "dtype": "bfloat16",
+          "implementation": "cuda",
+          "iterations": 20,
+          "kv_lora_rank": 32,
+          "model_dim": 128,
+          "n_heads": 4,
+          "q_lora_rank": 32,
+          "qk_nope_head_dim": 32,
+          "qk_rope_head_dim": 16,
+          "seed": 20260838,
+          "sequence_length": 128,
+          "v_head_dim": 32,
+          "verify": true,
+          "warmup": 5,
+          "workload": "prefill_with_cache"
+        },
+        "derived": {
+          "matrix_tflops_equivalent_at_median": 0.023309562536152163
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 1.3124799728393555,
+          "mean_ms": 0.9478863924741745,
+          "median_ms": 0.8996959924697876,
+          "min_ms": 0.7764480113983154,
+          "p90_ms": 1.1318143725395202,
+          "p99_ms": 1.2914066994190214
+        },
+        "notes": [
+          "matrix FLOPs omit RMSNorm, RoPE, softmax, masking, and cache concatenation",
+          "cache payload bytes are a storage model, not measured memory traffic",
+          "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
+          "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+          "cuda covers query projection, cache projection/static write, absorbed online attention, and output projection with same-dtype native operators and FP32 accumulation"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "bfloat16",
+          "shape": [
+            1,
+            128,
+            128
+          ]
+        },
+        "raw_samples_ms": [
+          1.3124799728393555,
+          0.8978559970855713,
+          0.8505280017852783,
+          0.9015359878540039,
+          0.8654080033302307,
+          1.2015680074691772,
+          1.037727952003479,
+          0.8700479865074158,
+          1.0885440111160278,
+          0.9048640131950378,
+          0.9752960205078125,
+          1.0027519464492798,
+          0.781279981136322,
+          0.8260160088539124,
+          1.1240639686584473,
+          0.8452159762382507,
+          0.7960960268974304,
+          1.071455955505371,
+          0.7764480113983154,
+          0.828544020652771
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.3,
+          "max_absolute_error": 0.5,
+          "max_tolerance_ratio": 0.31620553359683795,
+          "performed": true,
+          "reference": "the alternate naive/absorbed MLA path",
+          "rtol": 0.05
+        },
+        "work_estimate": {
+          "attention_path_matrix_flops": 12582912,
+          "cache_projection_matrix_flops": 1572864,
+          "functional_append_copy_bytes_lower_bound": 0,
+          "key_length": 128,
+          "output_projection_matrix_flops": 4194304,
+          "query_length": 128,
+          "query_projection_matrix_flops": 2621440,
+          "static_cache_storage_write_bytes": 0,
+          "total_matrix_flops": 20971520
+        }
+      },
+      "paired_configuration": {
+        "batch": 1,
+        "device": "cuda",
+        "dtype": "bfloat16",
+        "iterations": 20,
+        "kv_lora_rank": 32,
+        "model_dim": 128,
+        "n_heads": 4,
+        "q_lora_rank": 32,
+        "qk_nope_head_dim": 32,
+        "qk_rope_head_dim": 16,
+        "seed": 20260838,
+        "sequence_length": 128,
+        "v_head_dim": 32,
+        "verify": true,
+        "warmup": 5,
+        "workload": "prefill_with_cache"
+      },
+      "shape_class": "regular"
+    },
+    {
+      "baseline_label": "pytorch_absorbed",
+      "baseline_report": {
+        "benchmark": "multi_head_latent_attention_reference",
+        "cache_storage": {
+          "expanded_kv_payload_bytes": 41148,
+          "expanded_kv_payload_elements": 20574,
+          "expanded_total_bytes_with_positions": 42164,
+          "latent_payload_bytes": 7366,
+          "latent_payload_elements": 3683,
+          "latent_total_bytes_with_positions": 8382,
+          "payload_compression_ratio": 5.586206896551724,
+          "position_metadata_bytes": 1016
+        },
+        "configuration": {
+          "batch": 1,
+          "device": "cuda",
+          "dtype": "float16",
+          "implementation": "absorbed",
+          "iterations": 20,
+          "kv_lora_rank": 19,
+          "model_dim": 96,
+          "n_heads": 3,
+          "q_lora_rank": 17,
+          "qk_nope_head_dim": 24,
+          "qk_rope_head_dim": 10,
+          "seed": 20260839,
+          "sequence_length": 127,
+          "v_head_dim": 20,
+          "verify": true,
+          "warmup": 5,
+          "workload": "prefill_with_cache"
+        },
+        "derived": {
+          "matrix_tflops_equivalent_at_median": 0.0050307903014524535
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 2.29203200340271,
+          "mean_ms": 1.6964095950126648,
+          "median_ms": 1.6512960195541382,
+          "min_ms": 1.2360639572143555,
+          "p90_ms": 2.231641697883606,
+          "p99_ms": 2.2879887938499452
+        },
+        "notes": [
+          "matrix FLOPs omit RMSNorm, RoPE, softmax, masking, and cache concatenation",
+          "cache payload bytes are a storage model, not measured memory traffic",
+          "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
+          "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+          "naive and absorbed paths are correctness references, not fused MLA kernels"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "float16",
+          "shape": [
+            1,
+            127,
+            96
+          ]
+        },
+        "raw_samples_ms": [
+          1.2360639572143555,
+          1.4315199851989746,
+          1.4334720373153687,
+          1.4551359415054321,
+          2.29203200340271,
+          1.747040033340454,
+          1.6560959815979004,
+          2.270751953125,
+          1.9556159973144531,
+          1.8303040266036987,
+          1.7962559461593628,
+          1.646496057510376,
+          1.462399959564209,
+          2.2272961139678955,
+          1.8273279666900635,
+          1.4767040014266968,
+          1.4535679817199707,
+          1.6827199459075928,
+          1.5391039848327637,
+          1.508288025856018
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.02,
+          "max_absolute_error": 0.0625,
+          "max_tolerance_ratio": 0.6771104016630781,
+          "performed": true,
+          "reference": "the alternate naive/absorbed MLA path",
+          "rtol": 0.01
+        },
+        "work_estimate": {
+          "attention_path_matrix_flops": 5282184,
+          "cache_projection_matrix_flops": 707136,
+          "functional_append_copy_bytes_lower_bound": 0,
+          "key_length": 127,
+          "output_projection_matrix_flops": 1463040,
+          "query_length": 127,
+          "query_projection_matrix_flops": 854964,
+          "static_cache_storage_write_bytes": 0,
+          "total_matrix_flops": 8307324
+        }
+      },
+      "comparison": {
+        "baseline_median_ms": 1.6512960195541382,
+        "lower_median": "native",
+        "native_median_ms": 0.3041280061006546,
+        "native_over_baseline": 0.18417534015661913
+      },
+      "description": "FP16 full prefill with tail dimensions",
+      "execution_order": [
+        "baseline",
+        "native"
+      ],
+      "family": "mla",
+      "name": "mla_low_precision_prefill_tail_float16",
+      "native_report": {
+        "benchmark": "multi_head_latent_attention_cuda",
+        "cache_storage": {
+          "expanded_kv_payload_bytes": 41148,
+          "expanded_kv_payload_elements": 20574,
+          "expanded_total_bytes_with_positions": 42164,
+          "latent_payload_bytes": 7366,
+          "latent_payload_elements": 3683,
+          "latent_total_bytes_with_positions": 8382,
+          "payload_compression_ratio": 5.586206896551724,
+          "position_metadata_bytes": 1016
+        },
+        "configuration": {
+          "batch": 1,
+          "device": "cuda",
+          "dtype": "float16",
+          "implementation": "cuda",
+          "iterations": 20,
+          "kv_lora_rank": 19,
+          "model_dim": 96,
+          "n_heads": 3,
+          "q_lora_rank": 17,
+          "qk_nope_head_dim": 24,
+          "qk_rope_head_dim": 10,
+          "seed": 20260839,
+          "sequence_length": 127,
+          "v_head_dim": 20,
+          "verify": true,
+          "warmup": 5,
+          "workload": "prefill_with_cache"
+        },
+        "derived": {
+          "matrix_tflops_equivalent_at_median": 0.027315221989949182
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 1.4370239973068237,
+          "mean_ms": 0.3889392018318176,
+          "median_ms": 0.3041280061006546,
+          "min_ms": 0.19737599790096283,
+          "p90_ms": 0.624790382385254,
+          "p99_ms": 1.2965820795297613
+        },
+        "notes": [
+          "matrix FLOPs omit RMSNorm, RoPE, softmax, masking, and cache concatenation",
+          "cache payload bytes are a storage model, not measured memory traffic",
+          "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
+          "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+          "cuda covers query projection, cache projection/static write, absorbed online attention, and output projection with same-dtype native operators and FP32 accumulation"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "float16",
+          "shape": [
+            1,
+            127,
+            96
+          ]
+        },
+        "raw_samples_ms": [
+          0.2993279993534088,
+          0.2931840121746063,
+          0.33900800347328186,
+          0.4102399945259094,
+          0.38447999954223633,
+          0.26764801144599915,
+          0.255295991897583,
+          0.6978560090065002,
+          0.3083840012550354,
+          0.27904000878334045,
+          0.3340800106525421,
+          0.24527999758720398,
+          0.2335360050201416,
+          0.6166719794273376,
+          0.30720001459121704,
+          0.2449599951505661,
+          0.32713600993156433,
+          1.4370239973068237,
+          0.30105599761009216,
+          0.19737599790096283
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.02,
+          "max_absolute_error": 0.015625,
+          "max_tolerance_ratio": 0.07692307692307693,
+          "performed": true,
+          "reference": "the alternate naive/absorbed MLA path",
+          "rtol": 0.01
+        },
+        "work_estimate": {
+          "attention_path_matrix_flops": 5282184,
+          "cache_projection_matrix_flops": 707136,
+          "functional_append_copy_bytes_lower_bound": 0,
+          "key_length": 127,
+          "output_projection_matrix_flops": 1463040,
+          "query_length": 127,
+          "query_projection_matrix_flops": 854964,
+          "static_cache_storage_write_bytes": 0,
+          "total_matrix_flops": 8307324
+        }
+      },
+      "paired_configuration": {
+        "batch": 1,
+        "device": "cuda",
+        "dtype": "float16",
+        "iterations": 20,
+        "kv_lora_rank": 19,
+        "model_dim": 96,
+        "n_heads": 3,
+        "q_lora_rank": 17,
+        "qk_nope_head_dim": 24,
+        "qk_rope_head_dim": 10,
+        "seed": 20260839,
+        "sequence_length": 127,
+        "v_head_dim": 20,
+        "verify": true,
+        "warmup": 5,
+        "workload": "prefill_with_cache"
+      },
+      "shape_class": "tail"
+    },
+    {
+      "baseline_label": "pytorch_absorbed",
+      "baseline_report": {
+        "benchmark": "multi_head_latent_attention_reference",
+        "cache_storage": {
+          "expanded_kv_payload_bytes": 81920,
+          "expanded_kv_payload_elements": 40960,
+          "expanded_total_bytes_with_positions": 82944,
+          "latent_payload_bytes": 12288,
+          "latent_payload_elements": 6144,
+          "latent_total_bytes_with_positions": 13312,
+          "payload_compression_ratio": 6.666666666666667,
+          "position_metadata_bytes": 1024
+        },
+        "configuration": {
+          "batch": 1,
+          "device": "cuda",
+          "dtype": "bfloat16",
+          "implementation": "absorbed",
+          "iterations": 20,
+          "kv_lora_rank": 32,
+          "model_dim": 128,
+          "n_heads": 4,
+          "q_lora_rank": 32,
+          "qk_nope_head_dim": 32,
+          "qk_rope_head_dim": 16,
+          "seed": 20260840,
+          "sequence_length": 128,
+          "v_head_dim": 32,
+          "verify": true,
+          "warmup": 5,
+          "workload": "decode_with_static_write"
+        },
+        "derived": {
+          "matrix_tflops_equivalent_at_median": 0.00010343225395189815
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 4.44371223449707,
+          "mean_ms": 1.7566208124160767,
+          "median_ms": 1.5840319991111755,
+          "min_ms": 1.2900160551071167,
+          "p90_ms": 1.9740735530853275,
+          "p99_ms": 4.016057128906247
+        },
+        "notes": [
+          "matrix FLOPs omit RMSNorm, RoPE, softmax, masking, and cache concatenation",
+          "cache payload bytes are a storage model, not measured memory traffic",
+          "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
+          "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+          "naive and absorbed paths are correctness references, not fused MLA kernels"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "bfloat16",
+          "shape": [
+            1,
+            1,
+            128
+          ]
+        },
+        "raw_samples_ms": [
+          1.4319039583206177,
+          1.388159990310669,
+          1.2900160551071167,
+          1.4143040180206299,
+          1.7596800327301025,
+          1.4259840250015259,
+          4.44371223449707,
+          1.9497599601745605,
+          1.721951961517334,
+          1.8305599689483643,
+          1.540671944618225,
+          1.6023999452590942,
+          2.1928958892822266,
+          1.550976037979126,
+          1.6798080205917358,
+          1.5656640529632568,
+          1.428096055984497,
+          1.7476160526275635,
+          1.496000051498413,
+          1.6722559928894043
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.3,
+          "max_absolute_error": 1.0,
+          "max_tolerance_ratio": 0.5047318611987381,
+          "performed": true,
+          "reference": "the alternate naive/absorbed MLA path",
+          "rtol": 0.05
+        },
+        "work_estimate": {
+          "attention_path_matrix_flops": 98304,
+          "cache_projection_matrix_flops": 12288,
+          "functional_append_copy_bytes_lower_bound": 0,
+          "key_length": 128,
+          "output_projection_matrix_flops": 32768,
+          "query_length": 1,
+          "query_projection_matrix_flops": 20480,
+          "static_cache_storage_write_bytes": 104,
+          "total_matrix_flops": 163840
+        }
+      },
+      "comparison": {
+        "baseline_median_ms": 1.5840319991111755,
+        "lower_median": "native",
+        "native_median_ms": 0.2407039999961853,
+        "native_over_baseline": 0.15195652621364214
+      },
+      "description": "BF16 static-cache write and single-token decode",
+      "execution_order": [
+        "native",
+        "baseline"
+      ],
+      "family": "mla",
+      "name": "mla_low_precision_decode_bfloat16",
+      "native_report": {
+        "benchmark": "multi_head_latent_attention_cuda",
+        "cache_storage": {
+          "expanded_kv_payload_bytes": 81920,
+          "expanded_kv_payload_elements": 40960,
+          "expanded_total_bytes_with_positions": 82944,
+          "latent_payload_bytes": 12288,
+          "latent_payload_elements": 6144,
+          "latent_total_bytes_with_positions": 13312,
+          "payload_compression_ratio": 6.666666666666667,
+          "position_metadata_bytes": 1024
+        },
+        "configuration": {
+          "batch": 1,
+          "device": "cuda",
+          "dtype": "bfloat16",
+          "implementation": "cuda",
+          "iterations": 20,
+          "kv_lora_rank": 32,
+          "model_dim": 128,
+          "n_heads": 4,
+          "q_lora_rank": 32,
+          "qk_nope_head_dim": 32,
+          "qk_rope_head_dim": 16,
+          "seed": 20260840,
+          "sequence_length": 128,
+          "v_head_dim": 32,
+          "verify": true,
+          "warmup": 5,
+          "workload": "decode_with_static_write"
+        },
+        "derived": {
+          "matrix_tflops_equivalent_at_median": 0.0006806700345760626
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.6368640065193176,
+          "mean_ms": 0.27697120010852816,
+          "median_ms": 0.2407039999961853,
+          "min_ms": 0.18515199422836304,
+          "p90_ms": 0.3959999889135361,
+          "p99_ms": 0.5915923243761059
+        },
+        "notes": [
+          "matrix FLOPs omit RMSNorm, RoPE, softmax, masking, and cache concatenation",
+          "cache payload bytes are a storage model, not measured memory traffic",
+          "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
+          "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+          "cuda covers query projection, cache projection/static write, absorbed online attention, and output projection with same-dtype native operators and FP32 accumulation"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "bfloat16",
+          "shape": [
+            1,
+            1,
+            128
+          ]
+        },
+        "raw_samples_ms": [
+          0.3149760067462921,
+          0.18515199422836304,
+          0.3957119882106781,
+          0.3283199965953827,
+          0.283488005399704,
+          0.3985919952392578,
+          0.2593599855899811,
+          0.23792000114917755,
+          0.24348799884319305,
+          0.1908160001039505,
+          0.18745599687099457,
+          0.6368640065193176,
+          0.25996801257133484,
+          0.22300800681114197,
+          0.20854400098323822,
+          0.2207999974489212,
+          0.1857919991016388,
+          0.21449600160121918,
+          0.3487040102481842,
+          0.21596799790859222
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.3,
+          "max_absolute_error": 0.0,
+          "max_tolerance_ratio": 0.0,
+          "performed": true,
+          "reference": "the alternate naive/absorbed MLA path",
+          "rtol": 0.05
+        },
+        "work_estimate": {
+          "attention_path_matrix_flops": 98304,
+          "cache_projection_matrix_flops": 12288,
+          "functional_append_copy_bytes_lower_bound": 0,
+          "key_length": 128,
+          "output_projection_matrix_flops": 32768,
+          "query_length": 1,
+          "query_projection_matrix_flops": 20480,
+          "static_cache_storage_write_bytes": 104,
+          "total_matrix_flops": 163840
+        }
+      },
+      "paired_configuration": {
+        "batch": 1,
+        "device": "cuda",
+        "dtype": "bfloat16",
+        "iterations": 20,
+        "kv_lora_rank": 32,
+        "model_dim": 128,
+        "n_heads": 4,
+        "q_lora_rank": 32,
+        "qk_nope_head_dim": 32,
+        "qk_rope_head_dim": 16,
+        "seed": 20260840,
+        "sequence_length": 128,
+        "v_head_dim": 32,
+        "verify": true,
+        "warmup": 5,
+        "workload": "decode_with_static_write"
+      },
+      "shape_class": "decode"
+    },
+    {
+      "baseline_label": "pytorch_absorbed",
+      "baseline_report": {
+        "benchmark": "multi_head_latent_attention_reference",
+        "cache_storage": {
+          "expanded_kv_payload_bytes": 41796,
+          "expanded_kv_payload_elements": 20898,
+          "expanded_total_bytes_with_positions": 42828,
+          "latent_payload_bytes": 7482,
+          "latent_payload_elements": 3741,
+          "latent_total_bytes_with_positions": 8514,
+          "payload_compression_ratio": 5.586206896551724,
+          "position_metadata_bytes": 1032
+        },
+        "configuration": {
+          "batch": 1,
+          "device": "cuda",
+          "dtype": "float16",
+          "implementation": "absorbed",
+          "iterations": 20,
+          "kv_lora_rank": 19,
+          "model_dim": 96,
+          "n_heads": 3,
+          "q_lora_rank": 17,
+          "qk_nope_head_dim": 24,
+          "qk_rope_head_dim": 10,
+          "seed": 20260841,
+          "sequence_length": 129,
+          "v_head_dim": 20,
+          "verify": true,
+          "warmup": 5,
+          "workload": "decode_with_static_write"
+        },
+        "derived": {
+          "matrix_tflops_equivalent_at_median": 3.978209936780992e-05
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 1.959328055381775,
+          "mean_ms": 1.642527997493744,
+          "median_ms": 1.658735990524292,
+          "min_ms": 1.2247999906539917,
+          "p90_ms": 1.9202720284461976,
+          "p99_ms": 1.958610601425171
+        },
+        "notes": [
+          "matrix FLOPs omit RMSNorm, RoPE, softmax, masking, and cache concatenation",
+          "cache payload bytes are a storage model, not measured memory traffic",
+          "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
+          "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+          "naive and absorbed paths are correctness references, not fused MLA kernels"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "float16",
+          "shape": [
+            1,
+            1,
+            96
+          ]
+        },
+        "raw_samples_ms": [
+          1.2947200536727905,
+          1.2247999906539917,
+          1.4179519414901733,
+          1.495360016822815,
+          1.6164480447769165,
+          1.3861119747161865,
+          1.8162879943847656,
+          1.4618879556655884,
+          1.4151999950408936,
+          1.9555519819259644,
+          1.667904019355774,
+          1.64956796169281,
+          1.8317439556121826,
+          1.798143982887268,
+          1.9163520336151123,
+          1.577728033065796,
+          1.8050559759140015,
+          1.959328055381775,
+          1.847424030303955,
+          1.7129919528961182
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.02,
+          "max_absolute_error": 0.03125,
+          "max_tolerance_ratio": 0.6024096385542168,
+          "performed": true,
+          "reference": "the alternate naive/absorbed MLA path",
+          "rtol": 0.01
+        },
+        "work_estimate": {
+          "attention_path_matrix_flops": 42168,
+          "cache_projection_matrix_flops": 5568,
+          "functional_append_copy_bytes_lower_bound": 0,
+          "key_length": 129,
+          "output_projection_matrix_flops": 11520,
+          "query_length": 1,
+          "query_projection_matrix_flops": 6732,
+          "static_cache_storage_write_bytes": 66,
+          "total_matrix_flops": 65988
+        }
+      },
+      "comparison": {
+        "baseline_median_ms": 1.658735990524292,
+        "lower_median": "native",
+        "native_median_ms": 0.4394399970769882,
+        "native_over_baseline": 0.26492461705017345
+      },
+      "description": "FP16 static-cache decode with tail dimensions",
+      "execution_order": [
+        "baseline",
+        "native"
+      ],
+      "family": "mla",
+      "name": "mla_low_precision_decode_tail_float16",
+      "native_report": {
+        "benchmark": "multi_head_latent_attention_cuda",
+        "cache_storage": {
+          "expanded_kv_payload_bytes": 41796,
+          "expanded_kv_payload_elements": 20898,
+          "expanded_total_bytes_with_positions": 42828,
+          "latent_payload_bytes": 7482,
+          "latent_payload_elements": 3741,
+          "latent_total_bytes_with_positions": 8514,
+          "payload_compression_ratio": 5.586206896551724,
+          "position_metadata_bytes": 1032
+        },
+        "configuration": {
+          "batch": 1,
+          "device": "cuda",
+          "dtype": "float16",
+          "implementation": "cuda",
+          "iterations": 20,
+          "kv_lora_rank": 19,
+          "model_dim": 96,
+          "n_heads": 3,
+          "q_lora_rank": 17,
+          "qk_nope_head_dim": 24,
+          "qk_rope_head_dim": 10,
+          "seed": 20260841,
+          "sequence_length": 129,
+          "v_head_dim": 20,
+          "verify": true,
+          "warmup": 5,
+          "workload": "decode_with_static_write"
+        },
+        "derived": {
+          "matrix_tflops_equivalent_at_median": 0.00015016384589234183
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.7194880247116089,
+          "mean_ms": 0.4478640019893646,
+          "median_ms": 0.4394399970769882,
+          "min_ms": 0.2847039997577667,
+          "p90_ms": 0.5892320215702057,
+          "p99_ms": 0.6966819423437117
+        },
+        "notes": [
+          "matrix FLOPs omit RMSNorm, RoPE, softmax, masking, and cache concatenation",
+          "cache payload bytes are a storage model, not measured memory traffic",
+          "decode_with_append uses functional torch.cat and therefore copies the prefix cache",
+          "decode_with_static_write reuses fixed storage and writes only the new cache entry",
+          "cuda covers query projection, cache projection/static write, absorbed online attention, and output projection with same-dtype native operators and FP32 accumulation"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "float16",
+          "shape": [
+            1,
+            1,
+            96
+          ]
+        },
+        "raw_samples_ms": [
+          0.3787519931793213,
+          0.3011839985847473,
+          0.5994560122489929,
+          0.5371840000152588,
+          0.5250880122184753,
+          0.4219839870929718,
+          0.5345919728279114,
+          0.5611519813537598,
+          0.45689600706100464,
+          0.4843840003013611,
+          0.3665280044078827,
+          0.3339200019836426,
+          0.5015680193901062,
+          0.3614720106124878,
+          0.39558398723602295,
+          0.2847039997577667,
+          0.31462401151657104,
+          0.2906239926815033,
+          0.588096022605896,
+          0.7194880247116089
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.02,
+          "max_absolute_error": 0.0,
+          "max_tolerance_ratio": 0.0,
+          "performed": true,
+          "reference": "the alternate naive/absorbed MLA path",
+          "rtol": 0.01
+        },
+        "work_estimate": {
+          "attention_path_matrix_flops": 42168,
+          "cache_projection_matrix_flops": 5568,
+          "functional_append_copy_bytes_lower_bound": 0,
+          "key_length": 129,
+          "output_projection_matrix_flops": 11520,
+          "query_length": 1,
+          "query_projection_matrix_flops": 6732,
+          "static_cache_storage_write_bytes": 66,
+          "total_matrix_flops": 65988
+        }
+      },
+      "paired_configuration": {
+        "batch": 1,
+        "device": "cuda",
+        "dtype": "float16",
+        "iterations": 20,
+        "kv_lora_rank": 19,
+        "model_dim": 96,
+        "n_heads": 3,
+        "q_lora_rank": 17,
+        "qk_nope_head_dim": 24,
+        "qk_rope_head_dim": 10,
+        "seed": 20260841,
+        "sequence_length": 129,
+        "v_head_dim": 20,
+        "verify": true,
+        "warmup": 5,
+        "workload": "decode_with_static_write"
+      },
+      "shape_class": "tail"
+    }
+  ],
+  "elapsed_wall_seconds": 3.9518415489874315,
+  "environment": {
+    "gpu": {
+      "compute_capability": [
+        12,
+        0
+      ],
+      "index": 0,
+      "multiprocessors": 170,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_memory_bytes": 34190458880
+    },
+    "machine": "x86_64",
+    "native_extension_loaded": true,
+    "package": "0.1.0.dev0",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "source_dirty": false,
+    "source_revision": "abf36c36a50cbd3ed7090fb8b43486049530100e",
+    "torch": "2.10.0+cu128",
+    "torch_cuda_version": "12.8",
+    "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+  },
+  "failures": [],
+  "matrix_configuration": {
+    "cases": [],
+    "device": "cuda",
+    "fail_fast": false,
+    "families": [
+      "gemm",
+      "attention",
+      "mla",
+      "experts",
+      "router"
+    ],
+    "iterations": 20,
+    "profile": "mla-low-precision",
+    "seed": 20260814,
+    "verify": true,
+    "warmup": 5
+  },
+  "notes": [
+    "each side independently verifies against its operator reference before comparison",
+    "native/baseline execution order alternates between adjacent cases",
+    "each ratio compares medians for one fixed case and environment",
+    "aggregate ratio statistics are unweighted descriptors across heterogeneous cases and baselines, not an overall speedup",
+    "nested reports retain every raw post-warmup latency sample",
+    "traffic, FLOPs, and tile counts remain analytical unless a profiler report says otherwise"
+  ],
+  "schema_version": 1,
+  "summary": {
+    "completed_by_family": {
+      "mla": 4
+    },
+    "completed_case_count": 4,
+    "failed_case_count": 0,
+    "lower_median_counts": {
+      "baseline": 0,
+      "native": 4,
+      "tie": 0
+    },
+    "native_over_baseline": {
+      "count": 4,
+      "geometric_mean": 0.22334061513729933,
+      "maximum": 0.3355812436013015,
+      "median": 0.2245499786033963,
+      "minimum": 0.15195652621364214
+    },
+    "selected_by_family": {
+      "mla": 4
+    },
+    "selected_by_shape_class": {
+      "decode": 1,
+      "regular": 1,
+      "tail": 2
+    },
+    "selected_case_count": 4,
+    "status": "success",
+    "unattempted_case_count": 0
+  }
+}

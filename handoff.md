@@ -181,7 +181,10 @@ CUDA 回归覆盖 direct/LoRA、prefill/decode、causal/tail、specialized/gener
 cache write、非连续 fallback、逐 stage 严格对照和 end-to-end composed tolerance；MLA 专项为
 79 tests，全仓为 493 tests。`benchmarks/matrix.py --profile mla-low-precision` 另提供四组完全
 同 dtype/config 的 native/PyTorch absorbed paired case。本机四组均通过 staged reference 数值
-校验；这些小 shape 样本只用于正确性与后续 profiler 定位，不构成通用性能结论。
+校验；正式 20-sample 快照的 native/baseline median 比值为 0.336、0.184、0.152 与 0.265，
+本轮四组 native median 均更低。它们使用小 shape 与未缩放随机权重，只用于正确性与后续
+profiler 定位，不构成通用性能结论。报告位于
+`validation/single-gpu/2026-08-14-rtx5090-cu128/operator-matrix-mla-low-precision.json`。
 
 ## 5. 当前阻塞与已知缺口
 

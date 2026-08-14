@@ -12,7 +12,7 @@ performance comparison or a sustained self-hosted CI result.
 - PyTorch 2.10.0 with CUDA 12.8
 - Native extension loaded with all 14 CUDA dispatcher kernels
 
-The current CUDA-aware test suite passed with `427 passed`. Each paired latency JSON contains
+The current CUDA-aware test suite passed with `493 passed`. Each paired latency JSON contains
 the exact configuration, environment metadata, numerical verification, latency summary, and
 all 20 raw post-warmup samples. Native and baseline reports use identical inputs and shapes.
 
@@ -68,6 +68,26 @@ All eight outputs passed the materialized FP32-reference check. Three FA4 median
 median were lower in this particular run, but several raw samples show substantial desktop-WSL
 variation. The JSON is therefore a reproducible correctness and profiling baseline, not evidence
 that either implementation wins generally.
+
+## Staged MLA low-precision pairs
+
+[`operator-matrix-mla-low-precision.json`](operator-matrix-mla-low-precision.json) records four
+same-dtype staged MLA pairs. The native path and absorbed PyTorch baseline receive identical
+inputs, weights, cache configuration, warmup, iteration count, and verification policy. Both
+implement the public stage writeback semantics for FP16/BF16 storage; the native kernels use
+FP32 for projection, normalization, RoPE, online softmax, and value accumulation internally.
+
+| Case | Dtype | Native median (ms) | PyTorch absorbed median (ms) | Native / baseline | Lower median |
+| --- | --- | ---: | ---: | ---: | --- |
+| Prefill, `B=1,S=128,H=4,M=128` | BF16 | 0.899696 | 2.681008 | 0.336 | native |
+| Tail prefill, `B=1,S=127,H=3,M=96` | FP16 | 0.304128 | 1.651296 | 0.184 | native |
+| Static decode, `B=1,Sk=128,H=4,M=128` | BF16 | 0.240704 | 1.584032 | 0.152 | native |
+| Tail static decode, `B=1,Sk=129,H=3,M=96` | FP16 | 0.439440 | 1.658736 | 0.265 | native |
+
+All eight outputs passed the alternate naive/absorbed MLA reference check, and the report was
+generated from a clean source tree. The native median was lower in all four runs, but these are
+small, unscaled-random-weight workloads on a desktop WSL session. The result is a correctness
+and profiler baseline, not a claim about production models, long contexts, or other hardware.
 
 ## MLA profiler triage
 
