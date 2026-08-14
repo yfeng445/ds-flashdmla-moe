@@ -739,6 +739,109 @@ def test_positions_must_be_strictly_increasing_and_nonnegative() -> None:
         build_mla_cache(x[:, :2], config, weights, positions=torch.tensor([-1, 0]))
 
 
+def test_cached_position_validation_is_invalidated_by_tensor_mutation() -> None:
+    x, config, weights = make_fixture()
+    positions = torch.arange(x.shape[1])
+    cache = build_mla_cache(x, config, weights, positions=positions)
+
+    cache.positions[2] = cache.positions[1]
+
+    with pytest.raises(ValueError, match="strictly"):
+        mla_absorbed_attention_reference(
+            x,
+            cache,
+            config,
+            weights,
+            query_positions=positions,
+        )
+
+
+def test_cache_append_revalidates_a_mutated_prefix() -> None:
+    x, config, weights = make_fixture()
+    cache = build_mla_cache(x[:, :3], config, weights, positions=torch.arange(3))
+    cache.positions[1] = cache.positions[0]
+
+    with pytest.raises(ValueError, match="strictly"):
+        append_mla_cache(
+            cache,
+            x[:, 3:4],
+            config,
+            weights,
+            positions=torch.tensor([3]),
+        )
+
+
+def test_recent_query_position_validation_is_invalidated_by_tensor_mutation() -> None:
+    x, config, weights = make_fixture()
+    cache = build_mla_cache(x, config, weights)
+    query_positions = torch.arange(x.shape[1])
+    mla_absorbed_attention_reference(
+        x,
+        cache,
+        config,
+        weights,
+        query_positions=query_positions,
+    )
+
+    query_positions[3] = query_positions[2]
+
+    with pytest.raises(ValueError, match="strictly"):
+        mla_absorbed_attention_reference(
+            x,
+            cache,
+            config,
+            weights,
+            query_positions=query_positions,
+        )
+
+
+def test_static_position_validation_is_invalidated_by_storage_mutation() -> None:
+    x, config, weights = make_fixture()
+    static = allocate_mla_static_cache(
+        batch_size=x.shape[0],
+        capacity=x.shape[1],
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    with torch.inference_mode():
+        write_mla_static_cache(
+            static,
+            x[:, :3],
+            config,
+            weights,
+            positions=torch.arange(3),
+        )
+        static.position_storage[1] = static.position_storage[0]
+
+        with pytest.raises(ValueError, match="strictly"):
+            write_mla_static_cache(static, x[:, 3:4], config, weights)
+
+
+def test_static_cache_view_does_not_trust_mutated_position_storage() -> None:
+    x, config, weights = make_fixture()
+    static = allocate_mla_static_cache(
+        batch_size=x.shape[0],
+        capacity=x.shape[1],
+        config=config,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    with torch.inference_mode():
+        write_mla_static_cache(static, x, config, weights, positions=torch.arange(x.shape[1]))
+        static.position_storage[2] = static.position_storage[1]
+        cache = static.as_latent_cache()
+
+        with pytest.raises(ValueError, match="strictly"):
+            mla_absorbed_attention_reference(
+                x,
+                cache,
+                config,
+                weights,
+                query_positions=cache.positions,
+            )
+
+
 def test_static_cache_chunk_writes_match_functional_cache_without_reallocation() -> None:
     x, config, weights = make_fixture()
     positions = torch.arange(20, 20 + x.shape[1])

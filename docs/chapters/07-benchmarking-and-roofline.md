@@ -167,7 +167,49 @@ python benchmarks/matrix.py \
 geometric mean 和 maximum 是未加权描述统计，不是总体 speedup；不应把 GEMM/cuBLAS、
 Attention/SDPA 和 MoE/reference 的比值混成一个性能结论。
 
-## 7.8 分布式算子的计时边界
+## 7.8 从 Kineto 定位到 Nsight 取证
+
+shape matrix 回答“哪些固定 workload 能正确运行、延迟分布如何”，但不能解释时间消耗在
+Python 校验、dispatcher、哪个 custom operator 或哪个 CUDA kernel。仓库用
+`benchmarks/profile.py` 对 matrix 中一个精确 case 的单侧实现做第一轮归因：
+
+```bash
+python benchmarks/profile.py \
+  --case mla_decode_regular --side native --mode torch \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/torch-profiler-mla-decode.json
+```
+
+runner 先在 capture 外完整执行一次 workload，使扩展加载、kernel lazy loading 和 allocator
+状态得到预热；随后 capture 一次新的 setup、一次输出调用、配置的 warmup 和正式迭代。报告
+保留三类聚合：
+
+- `custom_operator_events`：`ds_flash_mla_moe::` dispatcher 边界；
+- `top_self_device_events`：按 self-device 时间排序的 operator/kernel 视图；
+- `synchronization_events`：CUDA stream/device synchronize、DtoH copy 和
+  `aten::_local_scalar_dense` 等主机同步信号。
+
+同一个 device 时间可能同时出现在父 operator 和子 kernel 中，因此这些行彼此相关，不能把
+整张表直接求和当成总 GPU 时间。CUDA event benchmark 和 profiler capture 也具有不同开销，
+不能用 profiler 中的 median 替换普通 latency 报告。Kineto 的价值是筛选后续问题，例如发现
+循环中的隐式标量读取或确认哪个 custom operator 最值得进 Nsight。
+
+需要原生 timeline 时，使用同一个 case 的 NVTX 模式：
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt \
+  --output benchmark-results/mla-decode \
+  python benchmarks/profile.py \
+    --case mla_decode_regular --side native --mode nvtx \
+    --warmup 5 --iterations 20 --seed 20260814
+```
+
+外层 range 名为 `ds_flash_mla_moe::<case>::<side>`，可用于 Nsight Systems 过滤时间线，
+也可让 Nsight Compute 定位同一 workload 的 kernel counters。仅运行 `--mode nvtx` 不会生成
+Nsight 证据；occupancy、DRAM traffic、Tensor Core 利用率和通信计算 overlap 仍必须由原生
+profiler 报告支持。
+
+## 7.9 分布式算子的计时边界
 
 多 rank 算子不能只测 rank 0。对第 `n` 次迭代，先让所有 rank 在相同边界开始，再取各
 rank 完成时间的最大值：
@@ -264,7 +306,7 @@ F_{router}=2TDE,
 CUDA 验证还必须要求 indices 与稳定 tie-break reference 完全一致；只比较归一化 weights
 可能让选错但分数相同的 expert 漏过测试。
 
-## 7.9 阶段分解不是端到端求和
+## 7.10 阶段分解不是端到端求和
 
 分布式流水线可以为每个阶段记录独立 latency，但需区分两种 max：
 
@@ -286,7 +328,7 @@ t_{e2e}\ne\sum_s t_{stage,s},
 线。端到端 pass 用于报告用户可见 latency，插入同步的 profiling pass 用于归因。二者
 必须分开运行、分别保留 raw samples。
 
-## 7.10 负载分布与流水线模型也要保留口径
+## 7.11 负载分布与流水线模型也要保留口径
 
 EP 报告不能用 `total_routes / world_size` 代替每 rank 的实际负载。至少分别保存 send、
 receive、cross-rank send、cross-rank receive 和 per-expert counts，再从原始整数计算

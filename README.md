@@ -266,6 +266,38 @@ GPU; `--family` and `--case` narrow an execution. Nested reports retain every
 raw sample and numerical check. Cross-family ratio statistics are unweighted
 descriptors over heterogeneous workloads and baselines, not an overall speedup.
 
+One exact side of that matrix can be captured with PyTorch/Kineto before moving
+to Nsight:
+
+```bash
+python benchmarks/profile.py \
+  --case mla_prefill_regular --side native --mode torch \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/torch-profiler-mla-prefill.json
+```
+
+The profiler runner performs one uncaptured preflight, then records fresh
+workload setup, the output call, configured warmup, and timed iterations. Its
+JSON separates custom operators, top self-device events, and common
+device-to-host synchronization events. `--trace PATH` additionally exports a
+Chrome trace. These Kineto aggregates are triage evidence, not a substitute for
+Nsight counters or a multi-GPU timeline.
+
+For a native profiler, `--mode nvtx` emits an outer range named after the exact
+matrix case and side. For example:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt \
+  --output benchmark-results/mla-prefill \
+  python benchmarks/profile.py \
+    --case mla_prefill_regular --side native --mode nvtx \
+    --warmup 5 --iterations 20 --seed 20260814
+```
+
+The same NVTX-marked command can be launched by Nsight Compute when kernel
+counters are available. Running NVTX mode by itself does not produce an Nsight
+report or prove utilization.
+
 The Expert Parallel validator is launched with `torchrun`; rank zero writes a
 single report containing the route-count matrix, per-rank metadata, global
 maximum latency samples, load-skew/capacity diagnostics, an overlap contract,
@@ -311,8 +343,9 @@ are reported separately from routed expert compute.
 The checked-in [RTX 5090 / CUDA 12.8 single-GPU snapshot](validation/single-gpu/2026-08-14-rtx5090-cu128/README.md)
 contains fixed-shape configurations, numerical errors, latency summaries, and raw samples for
 the native GEMM, Attention, MLA, expert, and router paths plus matching PyTorch/cuBLAS/SDPA
-baselines. It also contains the 20-case representative matrix described above. It is a local
-diagnostic snapshot, not a general performance claim or a replacement for self-hosted GPU CI.
+baselines. It also contains the 20-case representative matrix and structured MLA
+prefill/decode Kineto aggregates described above. It is a local diagnostic snapshot, not a
+general performance claim, an Nsight report, or a replacement for self-hosted GPU CI.
 
 ## Learning material
 

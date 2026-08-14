@@ -19,6 +19,7 @@ from .router_benchmarking import RouterBenchmarkConfig, benchmark_router
 
 MatrixFamily = Literal["gemm", "attention", "mla", "experts", "router"]
 MatrixProfile = Literal["smoke", "representative"]
+MatrixSide = Literal["native", "baseline"]
 ShapeClass = Literal["regular", "tail", "decode", "skew"]
 BenchmarkConfig = (
     AttentionBenchmarkConfig
@@ -571,6 +572,19 @@ def _execute_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     raise TypeError(f"unsupported benchmark configuration: {type(config).__name__}")
 
 
+def benchmark_matrix_case_side(
+    case: BenchmarkMatrixCase,
+    side: MatrixSide,
+) -> dict[str, Any]:
+    """Execute one validated native or baseline side of a matrix case."""
+
+    case.validate()
+    if side not in {"native", "baseline"}:
+        raise ValueError("matrix side must be native or baseline")
+    selected = case.native_config if side == "native" else case.baseline_config
+    return _execute_benchmark(selected)
+
+
 def _checked_median(report: dict[str, Any], label: str) -> float:
     try:
         median = float(report["latency"]["median_ms"])
@@ -585,8 +599,7 @@ def _run_matrix_case(case: BenchmarkMatrixCase, index: int, verify: bool) -> dic
     order = ("native", "baseline") if index % 2 == 0 else ("baseline", "native")
     reports: dict[str, dict[str, Any]] = {}
     for label in order:
-        selected_config = case.native_config if label == "native" else case.baseline_config
-        reports[label] = _execute_benchmark(selected_config)
+        reports[label] = benchmark_matrix_case_side(case, label)
     native_report = reports["native"]
     baseline_report = reports["baseline"]
     if native_report.get("output") != baseline_report.get("output"):

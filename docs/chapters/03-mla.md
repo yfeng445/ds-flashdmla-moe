@@ -207,3 +207,38 @@ backward 通过可追踪 PyTorch specification 重计算，以便先固定一阶
 写入会修改 storage，因此仍严格限定为 inference-only。该实现证明了完整 prefill/decode
 数据流和 dispatcher 契约，但还不是生产内核：当前只有 FP32，prefill/decode 尚未使用各自
 专用调度，也没有 paged cache、continuous-batching slot 生命周期或 profiler 驱动的融合。
+
+## 3.11 位置校验也可能成为 GPU 同步边界
+
+Python 层的参数检查并不天然“免费”。若 positions 位于 CUDA，下面这种条件最终需要把一个
+GPU boolean 读回主机：
+
+```python
+if not torch.all(positions[1:] > positions[:-1]):
+    raise ValueError(...)
+```
+
+一次检查很小，但 MLA 原先会在 cache 构建、attention 请求、query projection 和 RoPE 边界
+重复检查同一个 Tensor。每次 `bool(cuda_tensor)` 都可能产生 DtoH scalar copy 和 stream
+synchronize，使 CPU launch 序列被切碎。
+
+当前实现仍在公开 API 边界检查非负、严格递增和 prefix 顺序，但在一次失败前先把多个谓词
+合并，只做一次正常路径标量读取。已经验证的 cache/query positions 以 Tensor identity 和
+version counter 为依据复用；任何原地修改都会改变 version 并触发重新检查。static cache
+另外记录 position storage 的已验证 prefix 长度和版本，`truncate` 可以复用仍然有效的前缀，
+外部修改 storage 后则不能继续信任。inference-mode Tensor 若不提供 version counter，也不会
+跨 API 调用复用验证结果。
+
+RTX 5090 上对 representative MLA case 的同口径 capture 包含一次输出、5 次 warmup 和 20 次
+正式调用，即 26 次主路径调用。修改前后的同步事件计数为：
+
+| Case | `_local_scalar_dense` 修改前 | 修改后 | `cudaStreamSynchronize` 修改前 | 修改后 |
+| --- | ---: | ---: | ---: | ---: |
+| `mla_prefill_regular` | 212 | 28 | 220 | 36 |
+| `mla_decode_regular` | 162 | 29 | 170 | 37 |
+
+这证明的是 Python-side 隐式同步减少，不等价于宣称 kernel 延迟按相同比例下降。修改后的聚合
+报告保存在 `validation/single-gpu/2026-08-14-rtx5090-cu128/`。该次快照中，absorbed-attention
+分别占 prefill/decode custom-operator self-device 时间的 67.2% 和 81.3%，因此下一轮 CUDA
+工作应先用 Nsight Compute 分解它的访存、occupancy 和指令瓶颈，再决定专用 prefill/decode
+调度或融合边界。

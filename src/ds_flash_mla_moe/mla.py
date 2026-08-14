@@ -87,11 +87,17 @@ class MLAStaticCache:
     def capacity(self) -> int:
         return self.kv_storage.shape[1]
 
-    def as_latent_cache(self) -> MLALatentCache:
-        return MLALatentCache(
+    def as_latent_cache(
+        self,
+        *,
+        _validated_query_positions: Tensor | None = None,
+    ) -> MLALatentCache:
+        return _validated_latent_cache(
             kv=self.kv_storage[:, : self.valid_length],
             pe=self.pe_storage[:, : self.valid_length],
             positions=self.position_storage[: self.valid_length],
+            recent_positions=_validated_query_positions,
+            positions_validated=_static_cache_positions_are_current(self),
         )
 
     def truncate(self, valid_length: int = 0) -> None:
@@ -149,23 +155,131 @@ def _validate_weights(config: MLAConfig, weights: MLAWeights, model_dim: int) ->
             raise ValueError("wq_b has an invalid shape")
 
 
-def _validate_positions(positions: Tensor, length: int, device: torch.device) -> Tensor:
+def _validate_positions(
+    positions: Tensor,
+    length: int,
+    device: torch.device,
+    *,
+    values_validated: bool = False,
+    minimum_exclusive: Tensor | int | None = None,
+    order_error: str = "positions must follow the existing prefix",
+) -> Tensor:
     if positions.ndim != 1 or positions.numel() != length:
         raise ValueError("positions must be a one-dimensional tensor matching sequence length")
     positions = positions.to(device=device, dtype=torch.long)
-    if positions.numel() > 1 and not torch.all(positions[1:] > positions[:-1]):
-        raise ValueError("positions must be strictly increasing")
-    if positions.numel() and positions[0] < 0:
-        raise ValueError("positions must be non-negative")
+    if not positions.numel():
+        return positions
+
+    checks: list[Tensor] = []
+    first_nonnegative: Tensor | None = None
+    strictly_increasing: Tensor | None = None
+    follows_prefix: Tensor | None = None
+    if not values_validated:
+        first_nonnegative = positions[0] >= 0
+        checks.append(first_nonnegative)
+        if positions.numel() > 1:
+            strictly_increasing = torch.all(positions[1:] > positions[:-1])
+            checks.append(strictly_increasing)
+    if minimum_exclusive is not None:
+        follows_prefix = positions[0] > minimum_exclusive
+        checks.append(follows_prefix)
+
+    if checks:
+        valid = checks[0]
+        for check in checks[1:]:
+            valid = valid & check
+        if not bool(valid):
+            if first_nonnegative is not None and not bool(first_nonnegative):
+                raise ValueError("positions must be non-negative")
+            if strictly_increasing is not None and not bool(strictly_increasing):
+                raise ValueError("positions must be strictly increasing")
+            if follows_prefix is not None and not bool(follows_prefix):
+                raise ValueError(order_error)
     return positions
 
 
-def _apply_rope(x: Tensor, positions: Tensor, theta: float) -> Tensor:
+def _tensor_version(tensor: Tensor) -> int | None:
+    try:
+        return tensor._version
+    except RuntimeError:
+        # Tensors created in inference mode do not expose a version counter, so
+        # their value validation cannot safely be reused across API calls.
+        return None
+
+
+def _validation_is_current(tensor: Tensor, version: int | None) -> bool:
+    return version is not None and _tensor_version(tensor) == version
+
+
+def _remember_cache_positions(cache: MLALatentCache) -> None:
+    object.__setattr__(
+        cache,
+        "_positions_validation_version",
+        _tensor_version(cache.positions),
+    )
+
+
+def _static_cache_positions_are_current(cache: MLAStaticCache) -> bool:
+    validated_length = getattr(cache, "_positions_validation_length", -1)
+    return validated_length >= cache.valid_length and _validation_is_current(
+        cache.position_storage,
+        getattr(cache, "_positions_validation_version", None),
+    )
+
+
+def _remember_static_cache_positions(cache: MLAStaticCache) -> None:
+    object.__setattr__(
+        cache,
+        "_positions_validation_version",
+        _tensor_version(cache.position_storage),
+    )
+    object.__setattr__(cache, "_positions_validation_length", cache.valid_length)
+
+
+def _remember_recent_positions(cache: MLALatentCache, positions: Tensor) -> None:
+    object.__setattr__(cache, "_recent_positions", positions)
+    object.__setattr__(
+        cache,
+        "_recent_positions_validation_version",
+        _tensor_version(positions),
+    )
+
+
+def _validated_latent_cache(
+    *,
+    kv: Tensor,
+    pe: Tensor,
+    positions: Tensor,
+    recent_positions: Tensor | None = None,
+    positions_validated: bool = True,
+) -> MLALatentCache:
+    cache = MLALatentCache(kv=kv, pe=pe, positions=positions)
+    if positions_validated:
+        _remember_cache_positions(cache)
+    if recent_positions is not None:
+        _remember_recent_positions(cache, recent_positions)
+    elif positions_validated:
+        _remember_recent_positions(cache, positions)
+    return cache
+
+
+def _apply_rope(
+    x: Tensor,
+    positions: Tensor,
+    theta: float,
+    *,
+    _positions_validated: bool = False,
+) -> Tensor:
     """Apply interleaved-pair RoPE to ``[batch, sequence, heads, rope_dim]``."""
 
     if x.ndim != 4 or x.shape[-1] % 2 != 0:
         raise ValueError("RoPE input must be [batch, sequence, heads, even_dim]")
-    positions = _validate_positions(positions, x.shape[1], x.device)
+    positions = _validate_positions(
+        positions,
+        x.shape[1],
+        x.device,
+        values_validated=_positions_validated,
+    )
     compute_dtype = _compute_dtype(x)
     pair_index = torch.arange(0, x.shape[-1], 2, device=x.device, dtype=compute_dtype)
     inverse_frequency = theta ** (-pair_index / x.shape[-1])
@@ -187,12 +301,18 @@ def _project_query(
     positions: Tensor,
     *,
     backend: MLABackend = "reference",
+    _positions_validated: bool = False,
 ) -> tuple[Tensor, Tensor]:
     model_dim = x.shape[-1]
     _validate_weights(config, weights, model_dim)
     if x.ndim != 3:
         raise ValueError("MLA query input must have shape [batch, sequence, model_dim]")
-    positions = _validate_positions(positions, x.shape[1], x.device)
+    positions = _validate_positions(
+        positions,
+        x.shape[1],
+        x.device,
+        values_validated=_positions_validated,
+    )
     if backend not in {"auto", "cuda", "reference"}:
         raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
 
@@ -248,7 +368,12 @@ def _project_query(
         [config.qk_nope_head_dim, config.qk_rope_head_dim],
         dim=-1,
     )
-    q_pe = _apply_rope(q_pe, positions, config.rope_theta)
+    q_pe = _apply_rope(
+        q_pe,
+        positions,
+        config.rope_theta,
+        _positions_validated=True,
+    )
     return q_nope, q_pe
 
 
@@ -265,9 +390,16 @@ def build_mla_cache(
     if x.ndim != 3:
         raise ValueError("MLA cache input must have shape [batch, sequence, model_dim]")
     _validate_weights(config, weights, x.shape[-1])
-    if positions is None:
+    positions_generated = positions is None
+    if positions_generated:
         positions = torch.arange(x.shape[1], device=x.device)
-    positions = _validate_positions(positions, x.shape[1], x.device)
+    assert positions is not None
+    positions = _validate_positions(
+        positions,
+        x.shape[1],
+        x.device,
+        values_validated=positions_generated,
+    )
     if backend not in {"auto", "cuda", "reference"}:
         raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
 
@@ -284,7 +416,7 @@ def build_mla_cache(
             rms_norm_eps=config.rms_norm_eps,
             backend=backend,
         )
-        return MLALatentCache(kv=kv, pe=k_pe, positions=positions)
+        return _validated_latent_cache(kv=kv, pe=k_pe, positions=positions)
 
     compute_dtype = _compute_dtype(x)
     projected = F.linear(x.to(compute_dtype), weights.wkv_a.to(compute_dtype))
@@ -294,8 +426,13 @@ def build_mla_cache(
         dim=-1,
     )
     kv = _rms_norm(kv, weights.kv_norm_weight, config.rms_norm_eps)
-    k_pe = _apply_rope(k_pe.unsqueeze(2), positions, config.rope_theta).squeeze(2)
-    return MLALatentCache(kv=kv, pe=k_pe, positions=positions)
+    k_pe = _apply_rope(
+        k_pe.unsqueeze(2),
+        positions,
+        config.rope_theta,
+        _positions_validated=True,
+    ).squeeze(2)
+    return _validated_latent_cache(kv=kv, pe=k_pe, positions=positions)
 
 
 def append_mla_cache(
@@ -319,16 +456,32 @@ def append_mla_cache(
         raise ValueError("cache append must preserve batch size")
     if cache.kv.device != new.kv.device or cache.kv.dtype != new.kv.dtype:
         raise ValueError("cache append must preserve device and dtype")
-    if (
-        new.positions.numel()
-        and cache.positions.numel()
-        and new.positions[0] <= cache.positions[-1]
-    ):
-        raise ValueError("appended positions must follow existing cache positions")
-    return MLALatentCache(
+    cache_positions_validated = _validation_is_current(
+        cache.positions,
+        getattr(cache, "_positions_validation_version", None),
+    )
+    _validate_positions(
+        cache.positions,
+        cache.sequence_length,
+        cache.kv.device,
+        values_validated=cache_positions_validated,
+    )
+    if not cache_positions_validated:
+        _remember_cache_positions(cache)
+    if new.positions.numel() and cache.positions.numel():
+        _validate_positions(
+            new.positions,
+            new.positions.numel(),
+            new.positions.device,
+            values_validated=True,
+            minimum_exclusive=cache.positions[-1],
+            order_error="appended positions must follow existing cache positions",
+        )
+    return _validated_latent_cache(
         kv=torch.cat((cache.kv, new.kv), dim=1),
         pe=torch.cat((cache.pe, new.pe), dim=1),
         positions=torch.cat((cache.positions, new.positions), dim=0),
+        recent_positions=new.positions,
     )
 
 
@@ -413,20 +566,31 @@ def write_mla_static_cache(
     end = cache.valid_length + x.shape[1]
     if end > cache.capacity:
         raise ValueError("static cache write exceeds capacity")
-    if positions is None:
-        start_position = (
-            0
-            if cache.valid_length == 0
-            else int(cache.position_storage[cache.valid_length - 1].item()) + 1
+    if cache.valid_length and not _static_cache_positions_are_current(cache):
+        _validate_positions(
+            cache.position_storage[: cache.valid_length],
+            cache.valid_length,
+            x.device,
         )
-        positions = torch.arange(start_position, start_position + x.shape[1], device=x.device)
-    positions = _validate_positions(positions, x.shape[1], x.device)
-    if (
-        cache.valid_length
-        and positions.numel()
-        and (positions[0] <= cache.position_storage[cache.valid_length - 1])
-    ):
-        raise ValueError("static cache positions must follow the valid prefix")
+    positions_generated = positions is None
+    if positions_generated:
+        positions = torch.arange(x.shape[1], device=x.device)
+        if cache.valid_length:
+            positions = positions + cache.position_storage[cache.valid_length - 1] + 1
+    assert positions is not None
+    minimum_exclusive = (
+        cache.position_storage[cache.valid_length - 1]
+        if cache.valid_length and not positions_generated
+        else None
+    )
+    positions = _validate_positions(
+        positions,
+        x.shape[1],
+        x.device,
+        values_validated=positions_generated,
+        minimum_exclusive=minimum_exclusive,
+        order_error="static cache positions must follow the valid prefix",
+    )
 
     start = cache.valid_length
     from .ops import mla_cache_projection_write
@@ -446,7 +610,8 @@ def write_mla_static_cache(
             backend=backend,
         )
     cache.valid_length = end
-    return cache.as_latent_cache()
+    _remember_static_cache_positions(cache)
+    return cache.as_latent_cache(_validated_query_positions=positions)
 
 
 def _attention_probabilities(
@@ -495,8 +660,37 @@ def _validate_attention_request(
         or cache.positions.device != query_x.device
     ):
         raise ValueError("query and cache must be on the same device")
-    _validate_positions(cache.positions, cache.sequence_length, query_x.device)
-    return _validate_positions(query_positions, query_x.shape[1], query_x.device)
+    cache_positions_validated = _validation_is_current(
+        cache.positions,
+        getattr(cache, "_positions_validation_version", None),
+    )
+    _validate_positions(
+        cache.positions,
+        cache.sequence_length,
+        query_x.device,
+        values_validated=cache_positions_validated,
+    )
+    if not cache_positions_validated:
+        _remember_cache_positions(cache)
+        cache_positions_validated = True
+
+    query_positions_validated = (
+        query_positions is cache.positions and cache_positions_validated
+    ) or (
+        query_positions is getattr(cache, "_recent_positions", None)
+        and _validation_is_current(
+            query_positions,
+            getattr(cache, "_recent_positions_validation_version", None),
+        )
+    )
+    query_positions = _validate_positions(
+        query_positions,
+        query_x.shape[1],
+        query_x.device,
+        values_validated=query_positions_validated,
+    )
+    _remember_recent_positions(cache, query_positions)
+    return query_positions
 
 
 def mla_naive_attention_reference(
@@ -513,7 +707,13 @@ def mla_naive_attention_reference(
 
     query_positions = _validate_attention_request(query_x, cache, query_positions, config, weights)
     compute_dtype = _compute_dtype(query_x)
-    q_nope, q_pe = _project_query(query_x, config, weights, query_positions)
+    q_nope, q_pe = _project_query(
+        query_x,
+        config,
+        weights,
+        query_positions,
+        _positions_validated=True,
+    )
     q = torch.cat((q_nope, q_pe), dim=-1).to(compute_dtype)
 
     expanded = F.linear(cache.kv.to(compute_dtype), weights.wkv_b.to(compute_dtype))
@@ -561,7 +761,13 @@ def mla_absorbed_attention_reference(
 
     query_positions = _validate_attention_request(query_x, cache, query_positions, config, weights)
     compute_dtype = _compute_dtype(query_x)
-    q_nope, q_pe = _project_query(query_x, config, weights, query_positions)
+    q_nope, q_pe = _project_query(
+        query_x,
+        config,
+        weights,
+        query_positions,
+        _positions_validated=True,
+    )
     q_nope = q_nope.to(compute_dtype)
     q_pe = q_pe.to(compute_dtype)
     kv = cache.kv.to(compute_dtype)
@@ -634,6 +840,7 @@ def mla_absorbed_attention(
         weights,
         query_positions,
         backend=backend,
+        _positions_validated=True,
     )
     up = weights.wkv_b.to(compute_dtype).reshape(
         config.n_heads,

@@ -2,7 +2,8 @@
 
 更新时间：2026-08-14
 
-当前基线：`main`，已包含 staged end-to-end MLA CUDA、稳定输出布局契约和单 GPU 成对基线快照。
+当前基线：`main`，已包含 staged end-to-end MLA CUDA、稳定输出布局契约、单 GPU 成对基线
+快照，以及可复现的单 case Kineto/NVTX profiling 入口。
 
 远端：<https://github.com/yfeng445/ds-flashdmla-moe>
 
@@ -24,11 +25,11 @@ correctness-first 的 DeepSeek MLA + MoE 学习与实现项目。核心原则是
 
 当前可视为 **v0.1 correctness + local single-GPU smoke milestone**。`main` 的
 CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并注册 14 个 native
-算子；RTX 5090 本地环境也已跑通完整 CUDA 测试、固定 shape smoke benchmark 和 20-case
-代表性 shape matrix。尚未完成持续 self-hosted GPU CI、双 GPU NCCL、profiler 和主流
-第三方实现对照，因此仍不具备生产性能结论。
+算子；RTX 5090 本地环境也已跑通完整 CUDA 测试、固定 shape smoke benchmark、20-case
+代表性 shape matrix 和 MLA PyTorch/Kineto profiler triage。尚未完成持续 self-hosted GPU
+CI、双 GPU NCCL、原生 Nsight 取证和主流第三方实现对照，因此仍不具备生产性能结论。
 
-粗略进度约为 **85%**。这里的百分比衡量的是学习/研究仓库的完成度，不代表生产可用性。
+粗略进度约为 **86%**。这里的百分比衡量的是学习/研究仓库的完成度，不代表生产可用性。
 
 | 方向 | 状态 | 说明 |
 | --- | --- | --- |
@@ -40,7 +41,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 | NCCL Expert Parallel | 代码已实现，待双 GPU 验证 | 包括可微 All-to-All 和异步 chunk pipeline |
 | MLA CUDA | end-to-end correctness backend 已进入 `main` | direct/LoRA query、KV projection/static write、absorbed attention、output projection 均有 FP32 native op；低精度、paged cache 与生产级调优仍未实现 |
 | One-sided/NVSHMEM | 未实现 | 当前只有 symmetric-buffer 成本与布局模型 |
-| 性能结论 | 尚不可下结论 | 已有单卡固定 shape 与 20-case matrix 原始样本，但仍缺持续 runner、Nsight trace 和 CUTLASS/主流 FlashAttention 对照 |
+| 性能结论 | 尚不可下结论 | 已有单卡固定 shape、20-case matrix 和 Kineto 聚合，但仍缺持续 runner、Nsight trace 和 CUTLASS/主流 FlashAttention 对照 |
 
 ## 3. 代码地图
 
@@ -54,9 +55,10 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 - `src/ds_flash_mla_moe/expert_parallel.py`：Gloo/NCCL Expert Parallel 协议与 autograd。
 - `src/ds_flash_mla_moe/ops.py`：PyTorch dispatcher、FakeTensor、autograd 和 CUDA 注册。
 - `src/ds_flash_mla_moe/*_benchmarking.py`：结构化 benchmark、成对 shape matrix 与报告模型。
+- `src/ds_flash_mla_moe/profiling.py`：精确 matrix side 的 Kineto 聚合与 NVTX 包装。
 - `csrc/`：supported CUDA/C++ extension 源码。
 - `csrc/experimental/`：未验证的课程时期原型，不属于 supported API。
-- `benchmarks/`：GEMM、Attention、MLA、router、experts、成对 matrix、Expert Parallel CLI。
+- `benchmarks/`：GEMM、Attention、MLA、router、experts、成对 matrix、profile 和 Expert Parallel CLI。
 - `tests/`：数值、梯度、dispatcher、benchmark schema 和 distributed contract 测试。
 - `validation/`：带环境、误差和原始 latency 的硬件验证快照。
 - `docs/`：讲义、练习、阅读顺序和参考资料。
@@ -70,7 +72,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 
 ```text
 pytest -ra --strict-markers -W error::UserWarning
-295 passed, 69 skipped in 9.56s
+311 passed, 69 skipped in 9.47s
 ```
 
 另已完成：
@@ -97,7 +99,7 @@ WSL2 / RTX 5090 / PyTorch 2.10 + CUDA 12.8 环境运行：
 
 ```text
 pytest -ra --strict-markers -W error::UserWarning
-354 passed in 25.76s
+380 passed in 26.04s
 ```
 
 同一环境完成 GEMM、Attention、MLA attention-only、完整 MLA prefill、完整 MLA
@@ -113,9 +115,26 @@ experts 4 组、router 3 组，共覆盖 5 个 regular、8 个 tail、4 个 deco
 使用 cuBLAS、SDPA、absorbed MLA、padded experts 或 PyTorch router reference，因此跨 case
 汇总比值只是未加权描述统计，不是总体加速比。
 
-当前固定 shape 的完整 MLA 数据为：`prefill_with_cache` native 1.155536 ms、absorbed
-PyTorch 2.636864 ms；`decode_with_static_write` native 1.028400 ms、absorbed PyTorch
-2.058480 ms。这里只记录本机诊断结果，不外推到其他 shape、dtype 或硬件。
+原固定 shape 快照仍保留完整 MLA 的 1.155536/2.636864 ms prefill 和
+1.028400/2.058480 ms decode native/baseline 数据。应用 Python-side position validation
+优化后，最新 representative matrix 中对应 regular case 为 0.325520/1.299392 ms 和
+0.441744/1.689824 ms。两轮都只是本机诊断样本；系统状态和测量轮次不同，不应把两组差值
+全部归因于一次代码修改，也不能外推到其他 shape、dtype 或硬件。
+
+### 4.3 MLA profiler-driven Python 同步优化
+
+新增 `benchmarks/profile.py`，可对 20-case matrix 中任意一个 `native`/`baseline` side 运行
+PyTorch/Kineto 聚合或 NVTX 标记。runner 在 capture 外先完整预热一次，再捕获 fresh setup、
+一次输出调用、配置的 warmup 和正式迭代；JSON 分开保存 custom operator、self-device 热点和
+常见同步事件。`--mode nvtx` 已在本机 smoke 通过，但本机没有 `nsys`/`ncu`，因此它只是为
+后续原生 profiler 准备稳定 range，不是 Nsight 结果。
+
+对 `mla_prefill_regular`/`mla_decode_regular` 的 26-call capture，重复 position 校验优化使
+`aten::_local_scalar_dense` 从 212/162 降到 28/29，`cudaStreamSynchronize` 从 220/170
+降到 36/37。成功校验只在 Tensor identity/version 未变化时复用；latent cache、query
+positions 和 static position storage 原地修改都会使缓存失效并重新校验。修改后的结构化报告
+保存在单 GPU validation 目录。该次 capture 中 absorbed-attention 分别占 custom-operator
+self-device 时间的 67.2%/81.3%，是下一轮 MLA CUDA profiler 的首要目标。
 
 ## 5. 当前阻塞与已知缺口
 
@@ -124,12 +143,13 @@ PyTorch 2.636864 ms；`decode_with_static_write` native 1.028400 ms、absorbed P
 - `.github/workflows/cuda-tests.yml` 依赖标签为
   `[self-hosted, linux, x64, cuda]` 的 runner；
 - `.github/workflows/nccl-expert-parallel.yml` 依赖额外带 `multi-gpu` 标签的双 GPU runner；
-- 两者目前都是手动触发。本地单 GPU 结果已经固化为验证快照，但仓库仍没有注册并持续
-  运行的 self-hosted 单 GPU/双 GPU runner，也没有 NCCL benchmark artifact。
+- 两者目前都是手动触发。2026-08-14 查询远端 runner 数量仍为 0；本地单 GPU 结果已经
+  固化为验证快照，但仓库仍没有注册并持续运行的 self-hosted 单 GPU/双 GPU runner，也没有
+  NCCL benchmark artifact。
 
 ### 5.2 双 GPU 通信验证缺失
 
-当前机器只有一张可见 GPU，无法证明 NCCL FP32、FP16 WMMA 和 chunked pipeline 的
+当前 WSL 环境只有一张可见 RTX 5090，无法证明 NCCL FP32、FP16 WMMA 和 chunked pipeline 的
 forward/backward 正确性，也无法用 profiler 证明通信计算发生了物理 overlap。
 
 ### 5.3 算法与性能缺口
@@ -137,8 +157,9 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
 - Attention CUDA 仍是 correctness-first FP32 路径，不是 FA2/FA3 级实现；
 - grouped router 使用 one-thread-per-token 的串行候选扫描；
 - MoE kernel 尚无 async copy、TMA、WGMMA 或 profiler-driven tuning；
-- staged MLA 已覆盖 FP32 correctness pipeline，但 prefill/decode 仍共用 correctness-first
-  kernel；尚无 FP16/BF16、paged/per-slot cache、异步拷贝或 profiler-driven fusion；
+- staged MLA 已覆盖 FP32 correctness pipeline，Python 重复同步已按 Kineto 结果优化；但
+  prefill/decode 仍共用 correctness-first absorbed-attention kernel，尚无 FP16/BF16、
+  paged/per-slot cache、异步拷贝或 profiler-driven fusion；
 - 代表性单 GPU shape matrix 已覆盖 regular/tail/decode/skew，但尚未接入 CUTLASS 或主流
   FlashAttention，也没有长上下文与更多低精度矩阵；
 - chunk pipeline 只证明了软件异步协议，尚无 profiler 证据证明物理 overlap；
@@ -146,16 +167,18 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
 
 ## 6. 下一步执行顺序
 
-1. 注册并运行单 GPU self-hosted runner，让现有 354-test、9 组固定快照和 20-case matrix
+1. 注册并运行单 GPU self-hosted runner，让现有 380-test、9 组固定快照和 20-case matrix
    变成可持续 workflow artifact。
 2. 在双 GPU runner 上验证 NCCL FP32、FP16 WMMA 与 chunked pipeline 的 forward/backward，
    保存每 rank 原始 latency 和通信量。
-3. 用 Nsight Systems/Compute 检查 Attention、MLA、router、experts 的 kernel bottleneck，
-   并验证 NCCL chunk pipeline 是否真正 overlap。
+3. 在已有 Kineto/NVTX 入口上用 Nsight Systems/Compute 检查 Attention、MLA、router、experts
+   的 kernel bottleneck；MLA 先分析 absorbed-attention，再在双卡上验证 NCCL chunk
+   pipeline 是否真正 overlap。
 4. 在现有 20-case matrix 中加入可用的 CUTLASS 或主流 FlashAttention baseline，并按
    profiler 结果补充长上下文与低精度 case，而不是继续堆叠任意 shape。
-5. 根据 profiler 把当前 staged MLA correctness backend 扩展为专用 prefill/decode、
-   FP16/BF16 和 paged/per-slot cache，再考虑 FA2/FA3、TMA/WGMMA、router 优化和 one-sided EP。
+5. 根据原生 profiler 先优化 absorbed-attention，并把 staged MLA correctness backend 扩展为
+   专用 prefill/decode、FP16/BF16 和 paged/per-slot cache，再考虑 FA2/FA3、TMA/WGMMA、
+   router 优化和 one-sided EP。
 
 前三步完成前，不应在 README 中加入“高性能”“快于某实现”等未经证实的结论。
 
@@ -186,6 +209,21 @@ python benchmarks/matrix.py --device cuda --profile representative \
   --output benchmark-results/operator-matrix-representative.json
 ```
 
+单 case Kineto 聚合：
+
+```bash
+python benchmarks/profile.py --case mla_prefill_regular \
+  --side native --mode torch --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/torch-profiler-mla-prefill.json
+```
+
+为 Nsight 标记同一 workload：
+
+```bash
+python benchmarks/profile.py --case mla_prefill_regular \
+  --side native --mode nvtx --warmup 5 --iterations 20 --seed 20260814
+```
+
 两 rank Gloo smoke test：
 
 ```bash
@@ -203,7 +241,8 @@ torchrun --master-addr=127.0.0.1 --master-port=29572 \
 ## 8. 分支与协作状态
 
 - PR #1 已关闭且未 merge；其中的实现内容后来直接应用到 `main`。
-- `main` 当前已经包含 staged end-to-end MLA CUDA、20-case operator matrix、两篇衍生面试文档和 14-operator native extension。
+- `main` 当前已经包含 staged end-to-end MLA CUDA、20-case operator matrix、单 case profiler、
+  两篇衍生面试文档和 14-operator native extension。
 - `AI INFRA.ipynb` 是原始面试笔记；后续整理继续写入独立 Markdown，不覆盖原文件。
 - 单 GPU JSON 是硬件相关证据快照；不要把它解释成跨实现性能领先结论。
 

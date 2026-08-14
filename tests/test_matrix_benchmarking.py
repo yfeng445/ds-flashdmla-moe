@@ -5,6 +5,7 @@ import pytest
 from ds_flash_mla_moe import matrix_benchmarking
 from ds_flash_mla_moe.matrix_benchmarking import (
     BenchmarkMatrixConfig,
+    benchmark_matrix_case_side,
     benchmark_matrix_manifest,
     benchmark_operator_matrix,
     build_benchmark_matrix_cases,
@@ -100,6 +101,30 @@ def _fake_report(config, *, median: float) -> dict:
         "latency": {"median_ms": median},
         "raw_samples_ms": [median],
     }
+
+
+def test_matrix_case_side_executes_the_requested_configuration(monkeypatch) -> None:
+    case = build_benchmark_matrix_cases(
+        BenchmarkMatrixConfig(
+            cases=("gemm_regular_128",),
+            warmup=0,
+            iterations=1,
+        )
+    )[0]
+    executed = []
+
+    def execute(config):
+        executed.append(config)
+        return {"selector": config.implementation}
+
+    monkeypatch.setattr(matrix_benchmarking, "_execute_benchmark", execute)
+
+    assert benchmark_matrix_case_side(case, "native") == {"selector": "cuda"}
+    assert benchmark_matrix_case_side(case, "baseline") == {"selector": "torch"}
+    assert executed == [case.native_config, case.baseline_config]
+
+    with pytest.raises(ValueError, match="side"):
+        benchmark_matrix_case_side(case, "unknown")  # type: ignore[arg-type]
 
 
 def test_matrix_report_pairs_results_and_summarizes_ratios(monkeypatch) -> None:

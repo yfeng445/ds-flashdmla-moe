@@ -12,9 +12,9 @@ performance comparison or a sustained self-hosted CI result.
 - PyTorch 2.10.0 with CUDA 12.8
 - Native extension loaded with all 14 CUDA dispatcher kernels
 
-The complete CUDA-aware test suite passed with `354 passed`. Each JSON report contains the
-exact configuration, environment metadata, numerical verification, latency summary, and all
-20 raw post-warmup samples. Native and baseline reports use identical inputs and shapes.
+The current CUDA-aware test suite passed with `380 passed`. Each paired latency JSON contains
+the exact configuration, environment metadata, numerical verification, latency summary, and
+all 20 raw post-warmup samples. Native and baseline reports use identical inputs and shapes.
 
 | Workload | Native median (ms) | Baseline | Baseline median (ms) | Native / baseline |
 | --- | ---: | --- | ---: | ---: |
@@ -40,15 +40,36 @@ Every nested native and baseline report retains 20 post-warmup samples.
 
 | Family | Cases | Coverage | Baseline | Native lower | Baseline lower | Native / baseline range |
 | --- | ---: | --- | --- | ---: | ---: | ---: |
-| GEMM | 4 | regular, decode, tails | PyTorch/cuBLAS | 3 | 1 | 0.076–1.957 |
-| Attention | 4 | prefill, decode, tails | PyTorch SDPA | 0 | 4 | 1.272–5.559 |
-| MLA | 5 | prefill, decode, direct/LoRA, tails | absorbed PyTorch | 5 | 0 | 0.369–0.529 |
-| Experts | 4 | FP32/FP16, tails, skew/empty experts | padded PyTorch | 4 | 0 | 0.037–0.096 |
-| Router | 3 | regular, tail, hot-expert skew | PyTorch reference | 3 | 0 | 0.205–0.226 |
+| GEMM | 4 | regular, decode, tails | PyTorch/cuBLAS | 2 | 2 | 0.411–6.598 |
+| Attention | 4 | prefill, decode, tails | PyTorch SDPA | 2 | 2 | 0.632–1.337 |
+| MLA | 5 | prefill, decode, direct/LoRA, tails | absorbed PyTorch | 5 | 0 | 0.251–0.696 |
+| Experts | 4 | FP32/FP16, tails, skew/empty experts | padded PyTorch | 4 | 0 | 0.050–0.204 |
+| Router | 3 | regular, tail, hot-expert skew | PyTorch reference | 3 | 0 | 0.250–0.322 |
 
 These ratios are only paired observations for this machine and configuration. Baselines and
 operator boundaries differ across families, so the aggregate ratio statistics in the JSON are
 unweighted descriptors, not an overall speedup or a cross-family ranking.
+
+## MLA profiler triage
+
+[`torch-profiler-mla-prefill.json`](torch-profiler-mla-prefill.json) and
+[`torch-profiler-mla-decode.json`](torch-profiler-mla-decode.json) are structured
+PyTorch/Kineto aggregates for one native side of the representative matrix. Each capture has
+one unprofiled preflight and then records fresh setup, one output call, 5 warmup calls, and 20
+timed calls. No large Chrome trace is checked in.
+
+| Case | Main-path calls | DtoH scalar reads before | After | Stream synchronizations before | After | Absorbed-attention share of custom-op self-device time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `mla_prefill_regular` | 26 | 212 | 28 | 220 | 36 | 67.2% |
+| `mla_decode_regular` | 26 | 162 | 29 | 170 | 37 | 81.3% |
+
+The pre-change counts were captured during the same optimization session; the checked-in JSON
+files contain the post-change aggregates. The reduction comes from reusing successful position
+validation only while the Tensor identity/version is unchanged. Mutation regression tests cover
+both latent and static-cache storage. These counts diagnose host synchronization; they are not
+an Nsight report and do not imply an equal latency reduction. The custom-op share only compares
+the mutually relevant custom-operator rows in this capture; parent operator and child kernel
+views elsewhere in the profiler table are correlated and must not be summed.
 
 The commands and fixed shapes mirror `.github/workflows/cuda-tests.yml`. Re-run that workflow
 on a registered single-GPU runner before treating this snapshot as continuously reproducible.
