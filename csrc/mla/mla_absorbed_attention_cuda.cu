@@ -13,8 +13,206 @@
 namespace {
 
 constexpr int kThreads = 128;
+constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = kThreads / kWarpSize;
+constexpr unsigned int kFullWarpMask = 0xffffffffU;
 
-__global__ void mla_absorbed_attention_float_kernel(
+__device__ __forceinline__ float warp_sum(float value) {
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(kFullWarpMask, value, offset);
+  }
+  return value;
+}
+
+// Small DeepSeek-style head dimensions leave most of a 128-thread reduction
+// block idle. Split the key sequence across four warps instead: each warp keeps
+// an independent online-softmax state, then warp zero performs one stable merge
+// and the latent-to-value projection. This removes block-wide barriers from the
+// per-key loop while preserving the generic strided-tensor contract.
+__global__ void mla_absorbed_attention_warp_partition_float_kernel(
+    const float* __restrict__ q_nope,
+    const float* __restrict__ q_pe,
+    const float* __restrict__ kv,
+    const float* __restrict__ pe,
+    const float* __restrict__ key_up,
+    const float* __restrict__ value_up,
+    const int64_t* __restrict__ query_positions,
+    const int64_t* __restrict__ key_positions,
+    float* __restrict__ output,
+    int64_t heads,
+    int64_t query_length,
+    int64_t key_length,
+    int64_t nope_dim,
+    int64_t rope_dim,
+    int64_t latent_dim,
+    int64_t value_dim,
+    int64_t q_nope_stride_batch,
+    int64_t q_nope_stride_query,
+    int64_t q_nope_stride_head,
+    int64_t q_nope_stride_dim,
+    int64_t q_pe_stride_batch,
+    int64_t q_pe_stride_query,
+    int64_t q_pe_stride_head,
+    int64_t q_pe_stride_dim,
+    int64_t kv_stride_batch,
+    int64_t kv_stride_key,
+    int64_t kv_stride_dim,
+    int64_t pe_stride_batch,
+    int64_t pe_stride_key,
+    int64_t pe_stride_dim,
+    int64_t key_up_stride_head,
+    int64_t key_up_stride_nope,
+    int64_t key_up_stride_latent,
+    int64_t value_up_stride_head,
+    int64_t value_up_stride_value,
+    int64_t value_up_stride_latent,
+    int64_t query_position_stride,
+    int64_t key_position_stride,
+    float scale,
+    bool causal) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x);
+  const int64_t query_index = row % query_length;
+  const int64_t batch_head = row / query_length;
+  const int64_t head = batch_head % heads;
+  const int64_t batch = batch_head / heads;
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+
+  const int64_t q_nope_offset = batch * q_nope_stride_batch +
+      query_index * q_nope_stride_query + head * q_nope_stride_head;
+  const int64_t q_pe_offset = batch * q_pe_stride_batch +
+      query_index * q_pe_stride_query + head * q_pe_stride_head;
+  const int64_t key_up_offset = head * key_up_stride_head;
+  const int64_t value_up_offset = head * value_up_stride_head;
+  const int64_t output_offset =
+      ((batch * query_length + query_index) * heads + head) * value_dim;
+
+  __shared__ float shared_q_latent[kWarpSize];
+  __shared__ float partition_max[kWarpsPerBlock];
+  __shared__ float partition_denominator[kWarpsPerBlock];
+  __shared__ float partition_numerator[kWarpsPerBlock][kWarpSize];
+  __shared__ float partition_scale[kWarpsPerBlock];
+  __shared__ float global_denominator;
+
+  if (warp == 0 && lane < latent_dim) {
+    float accumulator = 0.0F;
+    for (int64_t column = 0; column < nope_dim; ++column) {
+      accumulator = fmaf(
+          q_nope[q_nope_offset + column * q_nope_stride_dim],
+          key_up[key_up_offset + column * key_up_stride_nope +
+                 lane * key_up_stride_latent],
+          accumulator);
+    }
+    shared_q_latent[lane] = accumulator;
+  }
+  __syncthreads();
+
+  const float q_latent = lane < latent_dim ? shared_q_latent[lane] : 0.0F;
+  float numerator = 0.0F;
+  float running_max = -CUDART_INF_F;
+  float denominator = 0.0F;
+
+  for (int64_t key_index = warp; key_index < key_length;
+       key_index += kWarpsPerBlock) {
+    const bool visible = !causal ||
+        key_positions[key_index * key_position_stride] <=
+            query_positions[query_index * query_position_stride];
+    if (!visible) {
+      continue;
+    }
+    const int64_t kv_offset = batch * kv_stride_batch + key_index * kv_stride_key;
+    const int64_t pe_offset = batch * pe_stride_batch + key_index * pe_stride_key;
+    float partial = 0.0F;
+    if (lane < latent_dim) {
+      partial = q_latent * kv[kv_offset + lane * kv_stride_dim];
+    }
+    if (lane < rope_dim) {
+      partial = fmaf(
+          q_pe[q_pe_offset + lane * q_pe_stride_dim],
+          pe[pe_offset + lane * pe_stride_dim],
+          partial);
+    }
+    partial = warp_sum(partial);
+
+    float previous_scale = 0.0F;
+    float current_scale = 0.0F;
+    if (lane == 0) {
+      const float score = partial * scale;
+      const float next_max = fmaxf(running_max, score);
+      previous_scale = isinf(running_max) && running_max < 0.0F
+          ? 0.0F
+          : expf(running_max - next_max);
+      current_scale = expf(score - next_max);
+      running_max = next_max;
+      denominator = denominator * previous_scale + current_scale;
+    }
+    previous_scale = __shfl_sync(kFullWarpMask, previous_scale, 0);
+    current_scale = __shfl_sync(kFullWarpMask, current_scale, 0);
+    if (lane < latent_dim) {
+      numerator = numerator * previous_scale +
+          current_scale * kv[kv_offset + lane * kv_stride_dim];
+    }
+  }
+
+  if (lane == 0) {
+    partition_max[warp] = running_max;
+    partition_denominator[warp] = denominator;
+  }
+  if (lane < latent_dim) {
+    partition_numerator[warp][lane] = numerator;
+  }
+  __syncthreads();
+
+  if (warp != 0) {
+    return;
+  }
+  if (lane == 0) {
+    float combined_max = -CUDART_INF_F;
+#pragma unroll
+    for (int partition = 0; partition < kWarpsPerBlock; ++partition) {
+      if (partition_denominator[partition] > 0.0F) {
+        combined_max = fmaxf(combined_max, partition_max[partition]);
+      }
+    }
+    float combined_denominator = 0.0F;
+#pragma unroll
+    for (int partition = 0; partition < kWarpsPerBlock; ++partition) {
+      const float partition_weight = partition_denominator[partition] > 0.0F
+          ? expf(partition_max[partition] - combined_max)
+          : 0.0F;
+      partition_scale[partition] = partition_weight;
+      combined_denominator +=
+          partition_denominator[partition] * partition_weight;
+    }
+    global_denominator = combined_denominator;
+  }
+  __syncwarp();
+
+  if (lane < value_dim) {
+    float accumulator = 0.0F;
+    if (global_denominator > 0.0F) {
+      for (int64_t latent = 0; latent < latent_dim; ++latent) {
+        float combined_numerator = 0.0F;
+#pragma unroll
+        for (int partition = 0; partition < kWarpsPerBlock; ++partition) {
+          combined_numerator = fmaf(
+              partition_numerator[partition][latent],
+              partition_scale[partition],
+              combined_numerator);
+        }
+        accumulator = fmaf(
+            combined_numerator / global_denominator,
+            value_up[value_up_offset + lane * value_up_stride_value +
+                     latent * value_up_stride_latent],
+            accumulator);
+      }
+    }
+    output[output_offset + lane] = accumulator;
+  }
+}
+
+__global__ void mla_absorbed_attention_generic_float_kernel(
     const float* __restrict__ q_nope,
     const float* __restrict__ q_pe,
     const float* __restrict__ kv,
@@ -248,55 +446,106 @@ at::Tensor mla_absorbed_attention_cuda(
   const cudaDeviceProp* properties = at::cuda::getDeviceProperties(q_nope.get_device());
   TORCH_CHECK(rows <= static_cast<int64_t>(properties->maxGridSize[0]),
               "too many MLA query rows for a one-dimensional CUDA launch: ", rows);
-  const size_t shared_bytes =
-      static_cast<size_t>(2 * latent_dim + kThreads + 2) * sizeof(float);
-  TORCH_CHECK(shared_bytes <= static_cast<size_t>(properties->sharedMemPerBlock),
-              "MLA latent dimension requires ", shared_bytes,
-              " bytes of shared memory, but the device limit is ", properties->sharedMemPerBlock);
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
-  mla_absorbed_attention_float_kernel<<<
-      static_cast<unsigned int>(rows), kThreads, shared_bytes, stream>>>(
-      q_nope.const_data_ptr<float>(),
-      q_pe.const_data_ptr<float>(),
-      kv.const_data_ptr<float>(),
-      pe.const_data_ptr<float>(),
-      key_up.const_data_ptr<float>(),
-      value_up.const_data_ptr<float>(),
-      query_positions.const_data_ptr<int64_t>(),
-      key_positions.const_data_ptr<int64_t>(),
-      output.mutable_data_ptr<float>(),
-      heads,
-      query_length,
-      key_length,
-      nope_dim,
-      rope_dim,
-      latent_dim,
-      value_dim,
-      q_nope.stride(0),
-      q_nope.stride(1),
-      q_nope.stride(2),
-      q_nope.stride(3),
-      q_pe.stride(0),
-      q_pe.stride(1),
-      q_pe.stride(2),
-      q_pe.stride(3),
-      kv.stride(0),
-      kv.stride(1),
-      kv.stride(2),
-      pe.stride(0),
-      pe.stride(1),
-      pe.stride(2),
-      key_up.stride(0),
-      key_up.stride(1),
-      key_up.stride(2),
-      value_up.stride(0),
-      value_up.stride(1),
-      value_up.stride(2),
-      query_positions.stride(0),
-      key_positions.stride(0),
-      static_cast<float>(scale),
-      causal);
+  // One lane owns each latent, RoPE, or value component in the specialized
+  // path. Larger dimensions retain the original block-wide implementation.
+  const bool use_warp_partition =
+      latent_dim <= kWarpSize && rope_dim <= kWarpSize && value_dim <= kWarpSize;
+  if (use_warp_partition) {
+    mla_absorbed_attention_warp_partition_float_kernel<<<
+        static_cast<unsigned int>(rows), kThreads, 0, stream>>>(
+        q_nope.const_data_ptr<float>(),
+        q_pe.const_data_ptr<float>(),
+        kv.const_data_ptr<float>(),
+        pe.const_data_ptr<float>(),
+        key_up.const_data_ptr<float>(),
+        value_up.const_data_ptr<float>(),
+        query_positions.const_data_ptr<int64_t>(),
+        key_positions.const_data_ptr<int64_t>(),
+        output.mutable_data_ptr<float>(),
+        heads,
+        query_length,
+        key_length,
+        nope_dim,
+        rope_dim,
+        latent_dim,
+        value_dim,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_nope.stride(2),
+        q_nope.stride(3),
+        q_pe.stride(0),
+        q_pe.stride(1),
+        q_pe.stride(2),
+        q_pe.stride(3),
+        kv.stride(0),
+        kv.stride(1),
+        kv.stride(2),
+        pe.stride(0),
+        pe.stride(1),
+        pe.stride(2),
+        key_up.stride(0),
+        key_up.stride(1),
+        key_up.stride(2),
+        value_up.stride(0),
+        value_up.stride(1),
+        value_up.stride(2),
+        query_positions.stride(0),
+        key_positions.stride(0),
+        static_cast<float>(scale),
+        causal);
+  } else {
+    const size_t shared_bytes =
+        static_cast<size_t>(2 * latent_dim + kThreads + 2) * sizeof(float);
+    TORCH_CHECK(
+        shared_bytes <= static_cast<size_t>(properties->sharedMemPerBlock),
+        "MLA latent dimension requires ", shared_bytes,
+        " bytes of shared memory, but the device limit is ",
+        properties->sharedMemPerBlock);
+    mla_absorbed_attention_generic_float_kernel<<<
+        static_cast<unsigned int>(rows), kThreads, shared_bytes, stream>>>(
+        q_nope.const_data_ptr<float>(),
+        q_pe.const_data_ptr<float>(),
+        kv.const_data_ptr<float>(),
+        pe.const_data_ptr<float>(),
+        key_up.const_data_ptr<float>(),
+        value_up.const_data_ptr<float>(),
+        query_positions.const_data_ptr<int64_t>(),
+        key_positions.const_data_ptr<int64_t>(),
+        output.mutable_data_ptr<float>(),
+        heads,
+        query_length,
+        key_length,
+        nope_dim,
+        rope_dim,
+        latent_dim,
+        value_dim,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_nope.stride(2),
+        q_nope.stride(3),
+        q_pe.stride(0),
+        q_pe.stride(1),
+        q_pe.stride(2),
+        q_pe.stride(3),
+        kv.stride(0),
+        kv.stride(1),
+        kv.stride(2),
+        pe.stride(0),
+        pe.stride(1),
+        pe.stride(2),
+        key_up.stride(0),
+        key_up.stride(1),
+        key_up.stride(2),
+        value_up.stride(0),
+        value_up.stride(1),
+        value_up.stride(2),
+        query_positions.stride(0),
+        key_positions.stride(0),
+        static_cast<float>(scale),
+        causal);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }

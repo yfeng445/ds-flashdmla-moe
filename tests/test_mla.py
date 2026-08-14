@@ -16,6 +16,9 @@ from ds_flash_mla_moe import (
     mla_naive_attention_reference,
     write_mla_static_cache,
 )
+from ds_flash_mla_moe.ops import (
+    mla_absorbed_attention as dispatch_mla_absorbed_attention,
+)
 
 
 def make_fixture(*, direct_query: bool = False):
@@ -389,6 +392,71 @@ def test_cuda_absorbed_mla_matches_reference(
             query_positions=query_positions,
             causal=causal,
         )
+    torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
+
+
+@pytest.mark.skipif(
+    not cuda_mla_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("latent_dim", "rope_dim", "value_dim", "strided"),
+    [
+        pytest.param(20, 10, 24, True, id="specialized-tail-strided"),
+        pytest.param(32, 32, 32, False, id="specialized-boundary"),
+        pytest.param(33, 10, 24, True, id="generic-latent"),
+        pytest.param(20, 34, 24, True, id="generic-rope"),
+        pytest.param(20, 10, 35, True, id="generic-value"),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_cuda_absorbed_attention_dimension_dispatch_matches_reference(
+    latent_dim: int,
+    rope_dim: int,
+    value_dim: int,
+    strided: bool,
+    causal: bool,
+) -> None:
+    torch.manual_seed(20260814)
+    batch, query_length, heads, key_length, nope_dim = 2, 5, 3, 17, 19
+
+    def make_tensor(*shape: int) -> torch.Tensor:
+        if not strided:
+            return torch.randn(*shape, device="cuda")
+        storage = torch.randn(*shape[:-1], shape[-1] * 2, device="cuda")
+        return storage[..., ::2]
+
+    q_nope = make_tensor(batch, query_length, heads, nope_dim)
+    q_pe = make_tensor(batch, query_length, heads, rope_dim)
+    kv = make_tensor(batch, key_length, latent_dim)
+    pe = make_tensor(batch, key_length, rope_dim)
+    key_up = make_tensor(heads, nope_dim, latent_dim)
+    value_up = make_tensor(heads, value_dim, latent_dim)
+    key_positions = torch.arange(2 * key_length, device="cuda", dtype=torch.long)[::2]
+    query_positions = key_positions[-query_length:]
+    scale = float((nope_dim + rope_dim) ** -0.5)
+    arguments = (q_nope, q_pe, kv, pe, key_up, value_up)
+
+    with torch.no_grad():
+        expected = dispatch_mla_absorbed_attention(
+            *arguments,
+            query_positions=query_positions,
+            key_positions=key_positions,
+            causal=causal,
+            scale=scale,
+            backend="reference",
+        )
+        actual = dispatch_mla_absorbed_attention(
+            *arguments,
+            query_positions=query_positions,
+            key_positions=key_positions,
+            causal=causal,
+            scale=scale,
+            backend="cuda",
+        )
+
+    assert actual.is_contiguous()
     torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
 
 
