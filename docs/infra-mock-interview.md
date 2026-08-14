@@ -39,9 +39,11 @@ Kernel / 推理系统工程师**，基于当前仓库事实；不修改根目录
 custom op 与 CUDA。当前最完整的链路是 MLA：我能解释并复现 naive 到 absorbed 的等价
 推导、compressed static cache，以及直接读取 latent cache 的 FP32 CUDA core。这个 core
 融合了 causal mask、online softmax 和 latent value accumulation，不展开完整 per-head K/V，
-也不写出完整 score matrix。它已在单张 RTX 5090、CUDA 12.8 环境构建并完成 forward、
-reference-recompute backward、非默认 stream 和全仓测试。当前边界是 FP32、无显式 mask，
-projection/RoPE/`W_O` 仍由 PyTorch 完成，多卡 NCCL 与 NVSHMEM 也没有本地性能验证。
+也不写出完整 score matrix。staged pipeline 已将 projection、RoPE、attention 与 `W_O` 分别
+接入 native CUDA，并在单张 RTX 5090、CUDA 12.8 环境完成 forward、reference-recompute
+backward、非默认 stream 和全仓测试。MLA 当前边界仍是 FP32、无显式 mask；多卡 NCCL 与
+NVSHMEM 也没有本地性能验证。普通 Attention 另有 FP16/BF16/FP32 native forward/backward，
+不要把两条 dtype contract 混在一起。
 
 如果这些代码并非全部由本人独立完成，应把“我”替换为“项目”，并明确自己的具体贡献。
 
@@ -66,8 +68,9 @@ projection/RoPE/`W_O` 仍由 PyTorch 完成，多卡 NCCL 与 NVSHMEM 也没有�
 absorbed MLA；框架层能说明 schema、CUDA dispatch、FakeTensor 和 autograd registration；
 CUDA 层能解释一个 block 对应 `(B,H,S_q)` 中一行、shared memory 里各缓冲区、在线 softmax
 状态更新、绝对位置 causal mask、当前 stream 和 device guard。与此同时，我也会主动指出它
-现在每 key 有同步、只支持 FP32、没有 profiler-driven tuning，所以我的定位是已有完整
-correctness kernel 闭环、正向生产级优化能力推进，而不是已经具备成熟 FA3 优化经验。
+现在 MLA 每 key 仍有同步且只支持 FP32；普通 Attention 虽已补齐 FP16/BF16 contract，仍无
+二维 tiling/Tensor Core 调度。我的定位是已有完整 correctness kernel 闭环、正向生产级优化
+能力推进，而不是已经具备成熟 FA3/FA4 优化经验。
 
 </details>
 
@@ -290,11 +293,13 @@ current stream 并在该 stream launch；测试在自建 stream 中先修改输�
 
 ## 第六轮：系统设计加试
 
-### Q17：把当前 kernel 扩展到 BF16，你会先改什么？
+### Q17：普通 Attention 已扩展到 BF16，你如何证明不是只改了指针类型？下一步怎么优化？
 
-合格回答应覆盖：API/dispatch contract、输入/load dtype 与 FP32 accumulator、exp/softmax 精度、
-vectorized access/alignment、可能的 Tensor Core tile、reference/gradient 容差、sm 架构编译与
-benchmark；不能只说把 `float` 替换成 `__nv_bfloat16`。
+合格回答应覆盖：API/dispatch 接受相同 dtype 的 Q/K/V；load/store 使用低精度但 dot、
+exp/softmax、numerator 与 backward gradient workspace 保持 FP32；原子累加后再 cast；测试覆盖
+forward、raw backward、autograd、causal/tail/stride、SM 架构编译，并与同 dtype FA4 成对验证。
+下一步需用 profiler 解释 row-wise block reduction、barrier、occupancy 与布局 adapter 成本，再
+决定二维 score tile、warp partition、vectorized load 或 Tensor Core；不能只说换成 BF16 指针。
 
 ### Q18：如果目标是长上下文 decode，如何把 static latent cache 接到 PagedAttention 风格管理？
 

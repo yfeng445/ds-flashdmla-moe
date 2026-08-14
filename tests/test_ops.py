@@ -12,6 +12,18 @@ from ds_flash_mla_moe import (
 )
 
 
+def _cuda_attention_tolerances(
+    dtype: torch.dtype,
+    *,
+    backward: bool = False,
+) -> tuple[float, float]:
+    if dtype == torch.float32:
+        return (8e-5, 8e-5) if backward else (3e-5, 3e-5)
+    if dtype == torch.float16:
+        return (1e-2, 1e-2) if backward else (5e-3, 5e-3)
+    return (5e-2, 5e-2) if backward else (2e-2, 2e-2)
+
+
 @contextmanager
 def _deterministic_algorithms():
     previous = torch.are_deterministic_algorithms_enabled()
@@ -236,27 +248,30 @@ def test_native_capability_flags_are_consistent() -> None:
 )
 @pytest.mark.cuda
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     ("query_length", "key_length", "head_dim", "value_dim"),
     [(1, 7, 8, 5), (5, 5, 32, 16), (7, 11, 65, 33)],
 )
 def test_cuda_forward_matches_reference(
     causal: bool,
+    dtype: torch.dtype,
     query_length: int,
     key_length: int,
     head_dim: int,
     value_dim: int,
 ) -> None:
     torch.manual_seed(47)
-    q = torch.randn(2, 3, query_length, head_dim, device="cuda")
-    k = torch.randn(2, 3, key_length, head_dim, device="cuda")
-    v = torch.randn(2, 3, key_length, value_dim, device="cuda")
+    q = torch.randn(2, 3, query_length, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(2, 3, key_length, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(2, 3, key_length, value_dim, device="cuda", dtype=dtype)
 
     with torch.no_grad():
         actual = flash_attention_forward(q, k, v, causal=causal, backend="cuda")
         expected = blockwise_attention(q, k, v, causal=causal, block_size=3)
 
-    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-5)
+    rtol, atol = _cuda_attention_tolerances(dtype)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
 
 @pytest.mark.skipif(
@@ -282,9 +297,12 @@ def test_cuda_kernel_uses_current_stream() -> None:
     reason="requires a built native extension and a CUDA device",
 )
 @pytest.mark.cuda
-def test_cuda_forward_uses_reference_backward() -> None:
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cuda_forward_autograd_matches_reference(dtype: torch.dtype) -> None:
     torch.manual_seed(49)
-    inputs = [torch.randn(1, 2, 5, 8, device="cuda", requires_grad=True) for _ in range(3)]
+    inputs = [
+        torch.randn(1, 2, 5, 8, device="cuda", dtype=dtype, requires_grad=True) for _ in range(3)
+    ]
     expected_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
     upstream = torch.randn_like(inputs[0])
 
@@ -293,9 +311,16 @@ def test_cuda_forward_uses_reference_backward() -> None:
     actual.backward(upstream)
     expected.backward(upstream)
 
-    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-5)
+    forward_rtol, forward_atol = _cuda_attention_tolerances(dtype)
+    backward_rtol, backward_atol = _cuda_attention_tolerances(dtype, backward=True)
+    torch.testing.assert_close(actual, expected, rtol=forward_rtol, atol=forward_atol)
     for actual_input, expected_input in zip(inputs, expected_inputs):
-        torch.testing.assert_close(actual_input.grad, expected_input.grad, rtol=3e-5, atol=3e-5)
+        torch.testing.assert_close(
+            actual_input.grad,
+            expected_input.grad,
+            rtol=backward_rtol,
+            atol=backward_atol,
+        )
 
 
 @pytest.mark.skipif(
@@ -304,22 +329,31 @@ def test_cuda_forward_uses_reference_backward() -> None:
 )
 @pytest.mark.cuda
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     ("query_length", "key_length", "head_dim", "value_dim"),
     [(1, 7, 8, 5), (5, 5, 32, 16), (7, 11, 65, 33)],
 )
 def test_cuda_backward_matches_analytic_reference(
     causal: bool,
+    dtype: torch.dtype,
     query_length: int,
     key_length: int,
     head_dim: int,
     value_dim: int,
 ) -> None:
     torch.manual_seed(51)
-    q = torch.randn(2, 3, query_length, head_dim, device="cuda")
-    k = torch.randn(2, 3, key_length, head_dim, device="cuda")
-    v = torch.randn(2, 3, key_length, value_dim, device="cuda")
-    grad_output = torch.randn(2, 3, query_length, value_dim, device="cuda")
+    q = torch.randn(2, 3, query_length, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(2, 3, key_length, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(2, 3, key_length, value_dim, device="cuda", dtype=dtype)
+    grad_output = torch.randn(
+        2,
+        3,
+        query_length,
+        value_dim,
+        device="cuda",
+        dtype=dtype,
+    )
 
     actual = torch.ops.ds_flash_mla_moe.attention_backward.default(
         grad_output, q, k, v, causal, head_dim**-0.5
@@ -332,8 +366,49 @@ def test_cuda_backward_matches_analytic_reference(
         causal=causal,
     )
 
+    rtol, atol = _cuda_attention_tolerances(dtype, backward=True)
     for actual_gradient, expected_gradient in zip(actual, expected):
-        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=8e-5, atol=8e-5)
+        assert actual_gradient.dtype == dtype
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(
+    not cuda_kernel_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_low_precision_noncontiguous_inputs_follow_the_explicit_fallback_contract(
+    dtype: torch.dtype,
+) -> None:
+    q = torch.randn(1, 2, 5, 16, device="cuda", dtype=dtype)[..., ::2]
+    k = torch.randn(1, 2, 7, 16, device="cuda", dtype=dtype)[..., ::2]
+    v = torch.randn(1, 2, 7, 12, device="cuda", dtype=dtype)[..., ::2]
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+
+    actual = flash_attention_forward(q, k, v, causal=True, backend="auto")
+    expected = blockwise_attention(q, k, v, causal=True, block_size=3)
+    rtol, atol = _cuda_attention_tolerances(dtype)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+    with pytest.raises(RuntimeError, match="contiguous"):
+        flash_attention_forward(q, k, v, causal=True, backend="cuda")
+
+
+@pytest.mark.skipif(
+    not cuda_kernel_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.cuda
+def test_cuda_attention_rejects_mixed_storage_dtypes() -> None:
+    q = torch.randn(1, 2, 3, 8, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 5, 8, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 2, 5, 4, device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="same dtype"):
+        flash_attention_forward(q, k, v, backend="cuda")
 
 
 @pytest.mark.skipif(

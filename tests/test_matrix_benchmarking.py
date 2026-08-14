@@ -53,6 +53,31 @@ def test_smoke_matrix_selects_one_case_per_family() -> None:
     assert all(case["native_selector"] == "cuda" for case in report["cases"])
 
 
+def test_flash_attn_4_profile_contains_only_same_dtype_attention_pairs() -> None:
+    config = BenchmarkMatrixConfig(profile="flash-attn-4", warmup=0, iterations=1)
+    cases = build_benchmark_matrix_cases(config)
+
+    assert len(cases) == 4
+    assert {case.name for case in cases} == {
+        "attention_fa4_prefill_bfloat16",
+        "attention_fa4_prefill_tail_float16",
+        "attention_fa4_decode_bfloat16",
+        "attention_fa4_decode_tail_float16",
+    }
+    assert {case.shape_class for case in cases} == {"regular", "tail", "decode"}
+    for case in cases:
+        case.validate()
+        assert case.family == "attention"
+        assert case.baseline_label == "flash_attention_4"
+        assert case.native_config.backend == "cuda"
+        assert case.baseline_config.backend == "flash-attn-4"
+        assert case.native_config.dtype in {"float16", "bfloat16"}
+        assert case.native_config.dtype == case.baseline_config.dtype
+        assert asdict(case.native_config) | {"backend": "flash-attn-4"} == asdict(
+            case.baseline_config
+        )
+
+
 def test_matrix_filters_family_and_exact_case() -> None:
     config = BenchmarkMatrixConfig(
         families=("attention", "mla"),

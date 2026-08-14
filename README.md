@@ -20,8 +20,8 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Area | Reference | Tested | CUDA | Distributed |
 | --- | --- | --- | --- | --- |
 | Tiled GEMM teaching model | materialized + explicit tiles | CPU | FP32 16×16 source | no |
-| Scaled dot-product attention | yes | CPU | FP32 forward/backward source | no |
-| Blockwise online attention | yes | CPU | FP32 forward/backward source | no |
+| Scaled dot-product attention | yes | CPU + CUDA | FP16/BF16/FP32 forward/backward | no |
+| Blockwise online attention | yes | CPU + CUDA | FP32-accumulating online-softmax kernel | no |
 | DeepSeek grouped Top-K gate | yes | CPU | FP32 sigmoid source | replicated in EP |
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
 | MLA prefill/decode | naive + absorbed | CPU + CUDA pipeline | staged FP32 ops + small-dimension warp-partition attention | no |
@@ -77,12 +77,14 @@ DS_FLASH_BUILD_CUDA=1 python -m pip install --no-build-isolation .
 pytest -ra
 ```
 
-The first kernel accepts contiguous FP32 tensors shaped `[B, H, S, D]`, supports
-right-aligned causal attention and `S_q != S_k`, but does not yet support
-explicit masks or low-precision inputs. The correctness-first native backward
-uses atomic accumulation for `dK/dV`; deterministic mode and higher-order
-gradients use the analytic PyTorch specification. `backend="cuda"` rejects
-unsupported input contracts instead of silently changing semantics.
+The attention kernel accepts contiguous FP16, BF16, or FP32 tensors with a
+shared dtype and shape `[B, H, S, D]`. It supports right-aligned causal attention
+and `S_q != S_k`, but not explicit masks. Dot products, online-softmax state, and
+forward output accumulation use FP32. Native backward accumulates `dQ/dK/dV` in
+FP32 workspaces before casting to the input dtype; `dK/dV` remain atomic, so
+deterministic mode and higher-order gradients use the analytic PyTorch
+specification. `backend="cuda"` rejects unsupported contracts instead of
+silently changing semantics.
 
 `tiled_gemm(..., backend="cuda")` exposes the first shared-memory teaching
 kernel: contiguous FP32 rank-2 matrices, fixed 16x16x16 tiles, arbitrary M/N/K
@@ -211,9 +213,19 @@ python benchmarks/attention.py --device cuda --backend flash-attn-4 \
 The adapter is imported only when selected, records the installed `flash-attn-4` distribution
 version, and includes the repository-BHSD/FA4-BSHD layout adapter in the timed boundary. It is not
 a default dependency because compatible beta versions depend on the active PyTorch, CUDA, and GPU
-stack. It is intentionally absent from the paired FP32 matrix: the native Attention kernel does
-not yet support the same FP16/BF16 contract, so comparing those different dtypes would not be a
-fair speed claim.
+stack. Once a matching optional installation is available, four exact low-precision pairs can be
+run separately from the default 20-case matrix:
+
+```bash
+python benchmarks/matrix.py --device cuda --profile flash-attn-4 \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/operator-matrix-fa4.json
+```
+
+The four pairs cover BF16/FP16 prefill, decode, tail sequence lengths, and unequal QK/V widths.
+Each native and FA4 side receives identical tensors, dtype, causal semantics, seed, warmup, and
+iteration count. This makes the comparison valid for those cases; it does not imply that the
+correctness-first native kernel is competitive with FA4.
 
 MLA reports separate prefill/decode and attention-only/cache-update timing:
 
@@ -287,6 +299,8 @@ PyTorch router reference. `--list-cases` prints the selected manifest without a
 GPU; `--family` and `--case` narrow an execution. Nested reports retain every
 raw sample and numerical check. Cross-family ratio statistics are unweighted
 descriptors over heterogeneous workloads and baselines, not an overall speedup.
+The optional `--profile flash-attn-4` profile adds four low-precision Attention-only pairs without
+making the beta FA4 package a default dependency or changing the representative manifest.
 
 One exact side of that matrix can be captured with PyTorch/Kineto before moving
 to Nsight:

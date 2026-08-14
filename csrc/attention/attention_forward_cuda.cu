@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -14,11 +15,12 @@ namespace {
 
 constexpr int kThreads = 128;
 
-__global__ void attention_forward_float_kernel(
-    const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
-    float* __restrict__ output,
+template <typename scalar_t>
+__global__ void attention_forward_kernel(
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
+    scalar_t* __restrict__ output,
     int64_t query_length,
     int64_t key_length,
     int64_t head_dim,
@@ -39,7 +41,7 @@ __global__ void attention_forward_float_kernel(
   float* statistics = reduction + blockDim.x;
 
   for (int64_t column = threadIdx.x; column < head_dim; column += blockDim.x) {
-    query[column] = q[query_offset + column];
+    query[column] = static_cast<float>(q[query_offset + column]);
   }
   for (int64_t column = threadIdx.x; column < value_dim; column += blockDim.x) {
     numerator[column] = 0.0F;
@@ -62,7 +64,7 @@ __global__ void attention_forward_float_kernel(
     const int64_t key_offset = (batch_head * key_length + key_position) * head_dim;
     float partial = 0.0F;
     for (int64_t column = threadIdx.x; column < head_dim; column += blockDim.x) {
-      partial += query[column] * k[key_offset + column];
+      partial += query[column] * static_cast<float>(k[key_offset + column]);
     }
     reduction[threadIdx.x] = partial;
     __syncthreads();
@@ -93,14 +95,16 @@ __global__ void attention_forward_float_kernel(
     const int64_t value_offset = (batch_head * key_length + key_position) * value_dim;
     for (int64_t column = threadIdx.x; column < value_dim; column += blockDim.x) {
       numerator[column] =
-          numerator[column] * previous_scale + current_scale * v[value_offset + column];
+          numerator[column] * previous_scale +
+          current_scale * static_cast<float>(v[value_offset + column]);
     }
     __syncthreads();
   }
 
   const float denominator = statistics[1];
   for (int64_t column = threadIdx.x; column < value_dim; column += blockDim.x) {
-    output[output_offset + column] = denominator > 0.0F ? numerator[column] / denominator : 0.0F;
+    output[output_offset + column] = static_cast<scalar_t>(
+        denominator > 0.0F ? numerator[column] / denominator : 0.0F);
   }
 }
 
@@ -115,9 +119,12 @@ at::Tensor attention_forward_cuda(
               "q, k, and v must be on the same CUDA device");
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
               "q, k, and v must have shape [batch, heads, sequence, dimension]");
-  TORCH_CHECK(q.scalar_type() == at::kFloat && k.scalar_type() == at::kFloat &&
-                  v.scalar_type() == at::kFloat,
-              "the CUDA attention forward kernel currently supports float32 only");
+  const auto scalar_type = q.scalar_type();
+  TORCH_CHECK(scalar_type == at::kFloat || scalar_type == at::kHalf ||
+                  scalar_type == at::kBFloat16,
+              "the CUDA attention forward kernel supports float32, float16, and bfloat16");
+  TORCH_CHECK(k.scalar_type() == scalar_type && v.scalar_type() == scalar_type,
+              "q, k, and v must have the same dtype");
   TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
               "q, k, and v must be contiguous");
   TORCH_CHECK(q.size(0) == k.size(0) && k.size(0) == v.size(0) &&
@@ -156,18 +163,25 @@ at::Tensor attention_forward_cuda(
               " bytes of shared memory, but the device limit is ", properties->sharedMemPerBlock);
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
-  attention_forward_float_kernel<<<
-      static_cast<unsigned int>(query_rows), kThreads, shared_bytes, stream>>>(
-      q.const_data_ptr<float>(),
-      k.const_data_ptr<float>(),
-      v.const_data_ptr<float>(),
-      output.mutable_data_ptr<float>(),
-      query_length,
-      key_length,
-      head_dim,
-      value_dim,
-      static_cast<float>(scale),
-      causal);
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      scalar_type,
+      "attention_forward_cuda",
+      [&] {
+        attention_forward_kernel<scalar_t><<<
+            static_cast<unsigned int>(query_rows), kThreads, shared_bytes, stream>>>(
+            q.const_data_ptr<scalar_t>(),
+            k.const_data_ptr<scalar_t>(),
+            v.const_data_ptr<scalar_t>(),
+            output.mutable_data_ptr<scalar_t>(),
+            query_length,
+            key_length,
+            head_dim,
+            value_dim,
+            static_cast<float>(scale),
+            causal);
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }

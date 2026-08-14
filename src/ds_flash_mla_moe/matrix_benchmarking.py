@@ -18,7 +18,7 @@ from .mla_benchmarking import MLABenchmarkConfig, benchmark_mla
 from .router_benchmarking import RouterBenchmarkConfig, benchmark_router
 
 MatrixFamily = Literal["gemm", "attention", "mla", "experts", "router"]
-MatrixProfile = Literal["smoke", "representative"]
+MatrixProfile = Literal["smoke", "representative", "flash-attn-4"]
 MatrixSide = Literal["native", "baseline"]
 ShapeClass = Literal["regular", "tail", "decode", "skew"]
 BenchmarkConfig = (
@@ -43,6 +43,12 @@ _SMOKE_CASES = {
     "experts_skew_fp16",
     "router_skew_hot_expert",
 }
+_FLASH_ATTN_4_CASES = {
+    "attention_fa4_prefill_bfloat16",
+    "attention_fa4_prefill_tail_float16",
+    "attention_fa4_decode_bfloat16",
+    "attention_fa4_decode_tail_float16",
+}
 
 
 @dataclass(frozen=True)
@@ -66,8 +72,8 @@ class BenchmarkMatrixConfig:
             raise ValueError("matrix benchmark device must be a valid torch device") from error
         if device.type != "cuda":
             raise ValueError("the paired native matrix requires a CUDA device")
-        if self.profile not in {"smoke", "representative"}:
-            raise ValueError("profile must be smoke or representative")
+        if self.profile not in {"smoke", "representative", "flash-attn-4"}:
+            raise ValueError("profile must be smoke, representative, or flash-attn-4")
         if self.warmup < 0 or self.iterations <= 0:
             raise ValueError("warmup must be non-negative and iterations must be positive")
         if not self.families:
@@ -99,13 +105,18 @@ class BenchmarkMatrixCase:
             raise ValueError("paired matrix configurations must use the same config type")
         if _paired_configuration(self.native_config) != _paired_configuration(self.baseline_config):
             raise ValueError("paired matrix configurations differ beyond backend selection")
-        expected_native, expected_baseline = {
+        expected_native, default_baseline = {
             "gemm": ("cuda", "torch"),
             "attention": ("cuda", "sdpa"),
             "mla": ("cuda", "absorbed"),
             "experts": ("cuda", "reference"),
             "router": ("cuda", "reference"),
         }[self.family]
+        expected_baseline = (
+            "flash-attn-4"
+            if self.family == "attention" and self.baseline_label == "flash_attention_4"
+            else default_baseline
+        )
         if _backend_selector(self.native_config) != expected_native:
             raise ValueError(f"{self.name} does not select its native CUDA backend")
         if _backend_selector(self.baseline_config) != expected_baseline:
@@ -261,6 +272,95 @@ def _attention_cases(
                 baseline_label="torch_sdpa",
                 native_config=native,
                 baseline_config=replace(native, backend="sdpa"),
+            )
+        )
+    return cases
+
+
+def _flash_attention_4_cases(
+    config: BenchmarkMatrixConfig,
+    start_seed: int,
+) -> list[BenchmarkMatrixCase]:
+    shapes = (
+        (
+            "attention_fa4_prefill_bfloat16",
+            "regular",
+            "BF16 square causal prefill paired with FlashAttention-4",
+            "bfloat16",
+            {
+                "batch": 1,
+                "heads": 4,
+                "query_length": 128,
+                "key_length": 128,
+                "head_dim": 64,
+                "value_dim": 64,
+            },
+        ),
+        (
+            "attention_fa4_prefill_tail_float16",
+            "tail",
+            "FP16 tail prefill with unequal QK/V widths paired with FlashAttention-4",
+            "float16",
+            {
+                "batch": 2,
+                "heads": 3,
+                "query_length": 127,
+                "key_length": 127,
+                "head_dim": 40,
+                "value_dim": 48,
+            },
+        ),
+        (
+            "attention_fa4_decode_bfloat16",
+            "decode",
+            "BF16 single-query right-aligned decode paired with FlashAttention-4",
+            "bfloat16",
+            {
+                "batch": 2,
+                "heads": 4,
+                "query_length": 1,
+                "key_length": 128,
+                "head_dim": 64,
+                "value_dim": 64,
+            },
+        ),
+        (
+            "attention_fa4_decode_tail_float16",
+            "tail",
+            "FP16 tail decode with unequal QK/V widths paired with FlashAttention-4",
+            "float16",
+            {
+                "batch": 1,
+                "heads": 3,
+                "query_length": 7,
+                "key_length": 129,
+                "head_dim": 40,
+                "value_dim": 24,
+            },
+        ),
+    )
+    cases = []
+    for offset, (name, shape_class, description, dtype, shape) in enumerate(shapes):
+        native = AttentionBenchmarkConfig(
+            **shape,
+            dtype=dtype,
+            device=config.device,
+            causal=True,
+            backend="cuda",
+            warmup=config.warmup,
+            iterations=config.iterations,
+            seed=start_seed + offset,
+            verify=config.verify,
+        )
+        cases.append(
+            BenchmarkMatrixCase(
+                name=name,
+                family="attention",
+                shape_class=shape_class,
+                description=description,
+                baseline_label="flash_attention_4",
+                native_config=native,
+                baseline_config=replace(native, backend="flash-attn-4"),
             )
         )
     return cases
@@ -509,7 +609,14 @@ def build_benchmark_matrix_cases(
     """Build and validate the deterministic case manifest for one matrix profile."""
 
     config.validate()
-    builders = (_gemm_cases, _attention_cases, _mla_cases, _expert_cases, _router_cases)
+    builders = (
+        _gemm_cases,
+        _attention_cases,
+        _mla_cases,
+        _expert_cases,
+        _router_cases,
+        _flash_attention_4_cases,
+    )
     all_cases: list[BenchmarkMatrixCase] = []
     next_seed = config.seed
     for builder in builders:
@@ -522,8 +629,12 @@ def build_benchmark_matrix_cases(
     if missing:
         raise ValueError(f"unknown matrix case names: {', '.join(missing)}")
     selected = [case for case in all_cases if case.family in config.families]
-    if config.profile == "smoke":
+    if config.profile == "representative":
+        selected = [case for case in selected if case.name not in _FLASH_ATTN_4_CASES]
+    elif config.profile == "smoke":
         selected = [case for case in selected if case.name in _SMOKE_CASES]
+    else:
+        selected = [case for case in selected if case.name in _FLASH_ATTN_4_CASES]
     if config.cases:
         selected = [case for case in selected if case.name in config.cases]
     if not selected:

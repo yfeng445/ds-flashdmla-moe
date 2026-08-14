@@ -184,11 +184,22 @@ python benchmarks/attention.py \
   --output benchmark-results/fa4-attention.json
 ```
 
-SM120 本地 smoke 已覆盖 FP16/BF16、prefill/decode、tail、右对齐 causal 以及不同 QK/V
-宽度，但这只证明当前环境中的兼容性和数值语义。FA4 拒绝 FP32，而仓库 native Attention
-目前只支持 FP32，因此它尚未加入成对 matrix，也不应与 FP32 native 数据直接排名。下一步
-应先补齐 native 低精度 contract，再用完全相同的 dtype、shape、输入和计时边界形成 paired
-case；不同环境必须自行安装与其 PyTorch/CUDA/GPU 匹配的可选 FA4 版本。
+native Attention 现已支持 FP16/BF16 storage 与 FP32 accumulation，因此可运行独立的四组
+同 dtype paired matrix：
+
+```bash
+python benchmarks/matrix.py \
+  --device cuda --profile flash-attn-4 \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/operator-matrix-fa4.json
+```
+
+该 profile 覆盖 BF16/FP16、prefill/decode、tail、右对齐 causal 和不同 QK/V 宽度；每一对只
+改变 backend selector。它与默认 20-case representative profile 分开，避免把可选 beta 依赖
+变成普通 CI 的前置条件。SM120 本地四组均通过 reference 校验，但 correctness-first native
+实现仍是一个 query row 一个 CTA、每 key block reduction 的标量 kernel；paired 数据用于量化
+与 FA4 的真实差距，不应被包装成 native 已达到生产性能。不同环境仍须安装与其
+PyTorch/CUDA/GPU 匹配的 FA4 版本。
 
 ## 7.8 从 Kineto 定位到 Nsight 取证
 

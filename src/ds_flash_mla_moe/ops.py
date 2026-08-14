@@ -910,10 +910,10 @@ def _attention_backward(context, grad_output: Tensor):
         and _operator_has_cuda_kernel("attention_backward")
         and q.device.type == "cuda"
         and q.ndim == 4
-        and q.dtype == torch.float32
-        and k.dtype == torch.float32
-        and v.dtype == torch.float32
-        and grad_output.dtype == torch.float32
+        and q.dtype in {torch.float16, torch.bfloat16, torch.float32}
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and grad_output.dtype == q.dtype
         and q.is_contiguous()
         and k.is_contiguous()
         and v.is_contiguous()
@@ -1799,8 +1799,11 @@ def _cuda_ineligibility_reason(
         return "q, k, and v must be CUDA tensors"
     if q.ndim != 4:
         return "the CUDA kernel currently requires [batch, heads, sequence, dimension] tensors"
-    if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
-        return "the CUDA kernel currently supports float32 only"
+    supported_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+    if q.dtype not in supported_dtypes:
+        return "the CUDA kernel supports float16, bfloat16, and float32"
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        return "q, k, and v must have the same dtype"
     if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
         return "the CUDA kernel currently requires contiguous tensors"
     if attn_mask is not None:
@@ -1835,12 +1838,14 @@ def flash_attention_forward(
 ) -> Tensor:
     """Run the native CUDA forward kernel when eligible, otherwise use the specification.
 
-    The first native kernel intentionally has a narrow contract: contiguous
-    float32 rank-four CUDA tensors and no explicit mask.
+    The native kernel accepts contiguous float16, bfloat16, or float32
+    rank-four CUDA tensors with a shared dtype and no explicit mask. Dot
+    products, online-softmax state, and output accumulation use float32.
     ``backend="cuda"`` enforces that contract. ``backend="auto"`` falls back
     to the differentiable blockwise PyTorch specification for unsupported
-    shapes, dtypes, layouts, devices, or masks. Until a native backward exists,
-    autograd recomputes the differentiable specification during backward.
+    shapes, dtypes, layouts, devices, or masks. Autograd uses the native
+    float32-accumulating backward when eligible and the differentiable
+    specification for deterministic or higher-order gradients.
     """
 
     _validate_attention_inputs(q, k, v)

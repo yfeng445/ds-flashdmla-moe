@@ -1,5 +1,6 @@
 #include <ATen/ATen.h>
 #include <ATen/Context.h>
+#include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -17,14 +18,15 @@ namespace {
 constexpr int kThreads = 128;
 constexpr int kStatisticCount = 5;
 
+template <typename scalar_t>
 __device__ float reduce_dot(
     const float* __restrict__ left,
-    const float* __restrict__ right,
+    const scalar_t* __restrict__ right,
     int64_t dimension,
     float* __restrict__ reduction) {
   float partial = 0.0F;
   for (int64_t column = threadIdx.x; column < dimension; column += blockDim.x) {
-    partial += left[column] * right[column];
+    partial += left[column] * static_cast<float>(right[column]);
   }
   reduction[threadIdx.x] = partial;
   __syncthreads();
@@ -38,11 +40,12 @@ __device__ float reduce_dot(
   return reduction[0];
 }
 
-__global__ void attention_backward_float_kernel(
-    const float* __restrict__ grad_output,
-    const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
+template <typename scalar_t>
+__global__ void attention_backward_kernel(
+    const scalar_t* __restrict__ grad_output,
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
     float* __restrict__ grad_q,
     float* __restrict__ grad_k,
     float* __restrict__ grad_v,
@@ -66,11 +69,11 @@ __global__ void attention_backward_float_kernel(
   float* statistics = reduction + blockDim.x;
 
   for (int64_t column = threadIdx.x; column < head_dim; column += blockDim.x) {
-    query[column] = q[query_offset + column];
+    query[column] = static_cast<float>(q[query_offset + column]);
     query_gradient[column] = 0.0F;
   }
   for (int64_t column = threadIdx.x; column < value_dim; column += blockDim.x) {
-    upstream[column] = grad_output[grad_output_offset + column];
+    upstream[column] = static_cast<float>(grad_output[grad_output_offset + column]);
   }
   if (threadIdx.x == 0) {
     statistics[0] = -CUDART_INF_F;  // row maximum
@@ -168,9 +171,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> attention_backward_cuda(
               "grad_output, q, k, and v must be on the same CUDA device");
   TORCH_CHECK(grad_output.dim() == 4 && q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
               "grad_output, q, k, and v must be rank-four tensors");
-  TORCH_CHECK(grad_output.scalar_type() == at::kFloat && q.scalar_type() == at::kFloat &&
-                  k.scalar_type() == at::kFloat && v.scalar_type() == at::kFloat,
-              "the CUDA attention backward kernel currently supports float32 only");
+  const auto scalar_type = q.scalar_type();
+  TORCH_CHECK(scalar_type == at::kFloat || scalar_type == at::kHalf ||
+                  scalar_type == at::kBFloat16,
+              "the CUDA attention backward kernel supports float32, float16, and bfloat16");
+  TORCH_CHECK(grad_output.scalar_type() == scalar_type && k.scalar_type() == scalar_type &&
+                  v.scalar_type() == scalar_type,
+              "grad_output, q, k, and v must have the same dtype");
   TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
               "q, k, and v must be contiguous");
   TORCH_CHECK(q.size(0) == k.size(0) && k.size(0) == v.size(0) &&
@@ -188,9 +195,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> attention_backward_cuda(
   TORCH_CHECK(std::isfinite(scale), "scale must be finite");
 
   const auto grad_output_contiguous = grad_output.contiguous();
-  auto grad_q = at::empty_like(q);
-  auto grad_k = at::zeros_like(k);
-  auto grad_v = at::zeros_like(v);
+  const auto accumulation_options = q.options().dtype(at::kFloat);
+  auto grad_q_accumulation = at::empty(q.sizes(), accumulation_options);
+  auto grad_k_accumulation = at::zeros(k.sizes(), accumulation_options);
+  auto grad_v_accumulation = at::zeros(v.sizes(), accumulation_options);
   const auto batch = q.size(0);
   const auto heads = q.size(1);
   const auto query_length = q.size(2);
@@ -199,12 +207,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> attention_backward_cuda(
   const auto value_dim = v.size(3);
 
   if (batch == 0 || heads == 0 || query_length == 0) {
-    return {grad_q, grad_k, grad_v};
+    return {
+        grad_q_accumulation.to(scalar_type),
+        grad_k_accumulation.to(scalar_type),
+        grad_v_accumulation.to(scalar_type)};
   }
   if (value_dim == 0) {
-    grad_q.zero_();
-    grad_k.zero_();
-    return {grad_q, grad_k, grad_v};
+    grad_q_accumulation.zero_();
+    grad_k_accumulation.zero_();
+    return {
+        grad_q_accumulation.to(scalar_type),
+        grad_k_accumulation.to(scalar_type),
+        grad_v_accumulation.to(scalar_type)};
   }
 
   const int64_t query_rows = batch * heads * query_length;
@@ -219,23 +233,36 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> attention_backward_cuda(
               " bytes of shared memory, but the device limit is ", properties->sharedMemPerBlock);
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
-  attention_backward_float_kernel<<<
-      static_cast<unsigned int>(query_rows), kThreads, shared_bytes, stream>>>(
-      grad_output_contiguous.const_data_ptr<float>(),
-      q.const_data_ptr<float>(),
-      k.const_data_ptr<float>(),
-      v.const_data_ptr<float>(),
-      grad_q.mutable_data_ptr<float>(),
-      grad_k.mutable_data_ptr<float>(),
-      grad_v.mutable_data_ptr<float>(),
-      query_length,
-      key_length,
-      head_dim,
-      value_dim,
-      static_cast<float>(scale),
-      causal);
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      scalar_type,
+      "attention_backward_cuda",
+      [&] {
+        attention_backward_kernel<scalar_t><<<
+            static_cast<unsigned int>(query_rows), kThreads, shared_bytes, stream>>>(
+            grad_output_contiguous.const_data_ptr<scalar_t>(),
+            q.const_data_ptr<scalar_t>(),
+            k.const_data_ptr<scalar_t>(),
+            v.const_data_ptr<scalar_t>(),
+            grad_q_accumulation.mutable_data_ptr<float>(),
+            grad_k_accumulation.mutable_data_ptr<float>(),
+            grad_v_accumulation.mutable_data_ptr<float>(),
+            query_length,
+            key_length,
+            head_dim,
+            value_dim,
+            static_cast<float>(scale),
+            causal);
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {grad_q, grad_k, grad_v};
+  if (scalar_type == at::kFloat) {
+    return {grad_q_accumulation, grad_k_accumulation, grad_v_accumulation};
+  }
+  return {
+      grad_q_accumulation.to(scalar_type),
+      grad_k_accumulation.to(scalar_type),
+      grad_v_accumulation.to(scalar_type)};
 }
 
 }  // namespace

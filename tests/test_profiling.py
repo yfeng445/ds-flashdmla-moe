@@ -105,6 +105,20 @@ def test_unknown_profile_case_is_rejected() -> None:
         profiling._selected_case(OperatorProfileConfig(case="missing"))
 
 
+def test_flash_attn_4_matrix_case_can_be_selected_for_profiling() -> None:
+    case = profiling._selected_case(
+        OperatorProfileConfig(
+            case="attention_fa4_decode_bfloat16",
+            warmup=0,
+            iterations=1,
+        )
+    )
+
+    assert case.native_config.backend == "cuda"
+    assert case.baseline_config.backend == "flash-attn-4"
+    assert case.native_config.dtype == case.baseline_config.dtype == "bfloat16"
+
+
 def test_torch_profile_report_classifies_events_and_exports_trace(
     monkeypatch,
     tmp_path: Path,

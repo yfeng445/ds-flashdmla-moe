@@ -15,7 +15,11 @@ from ds_flash_mla_moe.matrix_benchmarking import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--profile", choices=("smoke", "representative"), default="representative")
+    parser.add_argument(
+        "--profile",
+        choices=("smoke", "representative", "flash-attn-4"),
+        default="representative",
+    )
     parser.add_argument(
         "--family",
         action="append",

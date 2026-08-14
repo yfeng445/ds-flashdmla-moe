@@ -23,7 +23,7 @@
 这是一个 correctness-first 的 DeepSeek MLA + MoE 学习与实现项目。它先用 PyTorch
 reference 固定数值语义，再逐步替换为 CUDA 和分布式实现。目前包括：
 
-- 分块 online-softmax attention 与 FP32 CUDA forward/backward；
+- 分块 online-softmax attention，以及 FP16/BF16/FP32 CUDA forward/backward；
 - MLA 的 naive/absorbed prefill、compressed cache decode，以及直接消费 latent cache 的
   FP32 CUDA absorbed-attention core；
 - DeepSeek 风格 grouped Top-K、route pack/combine、expert-major SwiGLU；
@@ -35,9 +35,9 @@ reference 固定数值语义，再逐步替换为 CUDA 和分布式实现。目�
 我在做一个 correctness-first 的 DeepSeek MLA + MoE 算子项目。我的方法不是先写一个看起来
 很快的 kernel，而是先用 PyTorch reference 固定 forward、backward、mask、路由身份和
 determinism 语义，再把已验证边界接入 PyTorch dispatcher 和 CUDA。当前最完整的一条链路是
-MLA：从 naive/absorbed 等价推导、compressed static cache，到一个直接读取 latent cache、融合
-causal mask 与 online softmax 的 FP32 CUDA core。它已经在单张 RTX 5090、CUDA 12.8 环境中
-完成原生构建和数值测试；但 query/output projection 仍由 PyTorch 完成，backward 是 reference
+MLA：从 naive/absorbed 等价推导、compressed static cache，到由 native query/cache projection、
+RoPE、absorbed attention 和 output projection 组成的 staged FP32 CUDA pipeline。它已经在单张
+RTX 5090、CUDA 12.8 环境中完成原生构建和数值测试；out-of-place backward 仍是 reference
 recompute，多卡 NCCL 与 NVSHMEM 也不能说成已经实机验证。这个项目主要证明的是我能把算法
 语义、PyTorch 算子契约和 CUDA 执行边界连起来，而不是宣称已经做出生产级 FA3。
 
@@ -68,6 +68,8 @@ recompute，多卡 NCCL 与 NVSHMEM 也不能说成已经实机验证。这个�
 - NCCL chunk pipeline 已有软件协议，但物理 overlap 仍需 Nsight timeline 证明。
 - 当前 MLA CUDA 是 correctness-first 的 FP32 absorbed attention core；不是 FA3、TMA 或
   WGMMA 实现。
+- 普通 Attention 已支持 FP16/BF16 storage 与 FP32 accumulation，但仍是 row-wise scalar
+  kernel；四组同 dtype FA4 对照均显示 FA4 median 更低，不能称为高性能实现。
 
 ## 1. Online Softmax 与 FlashAttention
 
@@ -164,8 +166,9 @@ positions。一个 block 负责一个 `(batch, head, query)` row：
 4. 直接累积 latent value；
 5. 乘 `value_up` 写出 head output。
 
-它没有写出 score matrix，也没有展开完整 K/V。目前仅 FP32；query projection、RoPE 和
-最终 `W_O` 仍由 PyTorch 完成，backward 走可追踪的 absorbed reference recompute。
+它没有写出 score matrix，也没有展开完整 K/V。目前 staged MLA pipeline 仍仅支持 FP32；
+query/cache projection、RoPE、attention 和最终 `W_O` 已分别接入 native CUDA stage，
+out-of-place backward 走可追踪的 absorbed reference recompute。
 
 ### 2.5 用维度证明 absorbed 等价
 
@@ -215,8 +218,8 @@ score。面试官若问前提，要说清这是线性结合律/分配律，且 `
 
 合理回答不是找借口，而是指出当前结构：一个 block 负责一个 `(batch, head, query)` row；
 每个 key 都进行 block reduction 和同步；latent query、numerator 与 reduction buffer 放在 shared
-memory；score/value 累积主要是标量 FP32 FMA；最后的 query projection、RoPE、`W_O` 仍是
-独立 PyTorch op。小 batch/decode 下 block 数少，kernel launch 与框架开销占比也高。
+memory；score/value 累积主要是标量 FP32 FMA；query projection、RoPE、attention 与 `W_O`
+仍是多个独立 native launch。小 batch/decode 下 block 数少，kernel launch 与框架开销占比也高。
 
 下一步优化顺序应先用 Nsight Compute/Systems 确认瓶颈，再考虑 warp-level reduction、减少
 每 key 同步、向量化/低精度、更多 query/head 并行、projection fusion 或更适合 decode 的
@@ -404,6 +407,7 @@ x -> RMSNorm -> Attention -> residual add
 | “做了多卡通信计算重叠” | “实现了 NCCL-only chunk/async 软件协议；物理 overlap 尚待多卡 timeline 验证” | async All-to-All 与 chunk pipeline 代码；Gloo 两 rank语义测试 | 本地只有单卡，不能声称多卡性能 |
 | “支持反向” | “CUDA forward 的一阶梯度通过可追踪 absorbed reference recompute 获得” | custom-op autograd 注册及梯度对照测试 | 不是 fused native MLA backward |
 | “支持任意输入” | “高层 API 可 fallback；原生 MLA kernel 当前限定 CUDA FP32、无显式 mask” | 输入契约和失败测试 | 不支持 FP16/BF16、任意 mask、生产尺寸调优 |
+| “低精度 Attention 已经很快” | “native Attention 已完成 FP16/BF16 correctness contract，但四组同 dtype FA4 paired median 仍低 2.08–19.99 倍” | CUDA forward/backward 测试与可选 FA4 matrix | 单机小 shape；尚无 Nsight/CUTLASS 或生产调度 |
 | “实现了 NVSHMEM FlashMoE” | “实现的是 symmetric-buffer 分析模型；NVSHMEM actor backend 是研究目标” | `symmetric_memory.py` 与讲义 | 没有 one-sided runtime backend |
 
 ## 11. 面试官评分视角

@@ -93,17 +93,18 @@ query 重复读取 K/V。它的价值是让 PyTorch dispatcher、张量约束、
 causal 坐标和数值 reference 首先形成一个完整可测闭环。此后可以替换 kernel 内部的
 工作划分，而不改变公开算子语义。
 
-原生入口的第一版约束是：
+当前原生入口的约束是：
 
-- contiguous FP32，形状为 `[B,H,S,D]`；
+- contiguous FP16/BF16/FP32，Q/K/V 使用相同 dtype，形状为 `[B,H,S,D]`；
 - Q/K 的 head dimension 相同，K/V 的序列长度相同；
 - 支持 `S_q != S_k` 与右下对齐 causal mask；
-- 暂不支持显式 mask、FP16/BF16 和 backward；
+- dot、在线 Softmax 状态和 value numerator 在 FP32 中计算；
+- 支持 native forward/backward，但暂不支持显式 mask；
 - shared memory 需求超过设备上限时明确报错。
 
 Python 的 `backend="auto"` 在请求满足这些条件时进入 CUDA forward；不支持的
-shape/dtype/mask 会回退到可微 reference。原生 backward 完成之前，autograd 在反向时
-用 reference 重算梯度，因此语义正确但不是最终训练性能。`backend="cuda"` 用于验证和
+shape/dtype/mask 会回退到可微 reference。普通一阶反向在允许非确定性原子累加时进入 native
+backward；deterministic 模式与高阶梯度仍使用解析 reference。`backend="cuda"` 用于验证和
 基准，它会对不支持的输入约束直接报错，避免把回退耗时误当成 kernel 性能。
 
 ## 2.7 Backward 的核心恒等式
@@ -148,7 +149,8 @@ Backward 可以利用 forward 保存的 log-sum-exp 重算 `P`，无需保存完
 第一版 CUDA backward 与 forward 一样采用一个 query row 一个 CTA。它进行三次 key
 遍历：第一次计算稳定 Softmax 的 `(m,l)`，第二次计算行校正项 `D_i`，第三次形成 `dS`
 并累加梯度。`dQ` 只属于当前 query row，可在 CTA 内累加；不同 query 都可能更新同一
-key/value row，所以 `dK/dV` 使用 `atomicAdd`。
+key/value row，所以 `dK/dV` 使用 FP32 `atomicAdd`。FP16/BF16 输入也先写入 FP32
+`dQ/dK/dV` workspace，kernel 完成后再 cast 回输入 dtype，避免把长归约直接压进低精度原子操作。
 
 原子累加的加法顺序由 GPU 调度决定，浮点结果不保证 bitwise deterministic。因此
 `torch.use_deterministic_algorithms(True)` 时必须走解析 reference，而不能悄悄调用原生
