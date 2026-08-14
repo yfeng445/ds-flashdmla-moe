@@ -1,0 +1,141 @@
+{
+  "benchmark": "deepseek_grouped_topk",
+  "configuration": {
+    "backend": "reference",
+    "backward": true,
+    "device": "cuda",
+    "dtype": "float32",
+    "experts": 8,
+    "hot_expert_bias": 0.4,
+    "iterations": 20,
+    "model_dim": 64,
+    "n_groups": 4,
+    "route_scale": 1.0,
+    "seed": 0,
+    "tokens": 256,
+    "topk": 3,
+    "topk_groups": 2,
+    "verify": true,
+    "warmup": 5
+  },
+  "derived": {
+    "forward_router_projection_tflops_equivalent_at_median": 0.00021324448100483537
+  },
+  "environment": {
+    "gpu": {
+      "compute_capability": [
+        12,
+        0
+      ],
+      "index": 0,
+      "multiprocessors": 170,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_memory_bytes": 34190458880
+    },
+    "machine": "x86_64",
+    "native_extension_loaded": true,
+    "package": "0.1.0.dev0",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "source_dirty": false,
+    "source_revision": "d5b95ae4f3243b1e0acc4b5d0abfbd78ae0ca233",
+    "torch": "2.10.0+cu128",
+    "torch_cuda_version": "12.8",
+    "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+  },
+  "expert_load": {
+    "coefficient_of_variation": 0.3227065848887431,
+    "maximum": 163,
+    "mean": 96.0,
+    "minimum": 70,
+    "peak_to_mean": 1.6979166666666667,
+    "total": 768,
+    "values": [
+      163,
+      131,
+      70,
+      82,
+      85,
+      71,
+      81,
+      85
+    ],
+    "zero_load_count": 0
+  },
+  "latency": {
+    "count": 20,
+    "max_ms": 3.576927900314331,
+    "mean_ms": 1.630291187763214,
+    "median_ms": 1.229312002658844,
+    "min_ms": 0.7191359996795654,
+    "p90_ms": 2.98191351890564,
+    "p99_ms": 3.481867108345031
+  },
+  "notes": [
+    "router matrix FLOPs count the dense gate projection only",
+    "sigmoid, group scoring, Top-K, gather, and normalization are excluded from FLOPs",
+    "correction bias affects selection but not gathered route-weight values",
+    "forward-equivalent FLOPs remain forward-only when backward timing is enabled",
+    "the CUDA selector is a correctness kernel with serial candidate scans per token"
+  ],
+  "output": {
+    "device": "cuda:0",
+    "dtype": "float32",
+    "indices_shape": [
+      256,
+      3
+    ],
+    "weights_shape": [
+      256,
+      3
+    ]
+  },
+  "raw_samples_ms": [
+    1.1372480392456055,
+    3.0766079425811768,
+    3.576927900314331,
+    1.2057600021362305,
+    0.8288959860801697,
+    0.8954880237579346,
+    2.9713919162750244,
+    2.1260159015655518,
+    0.8715519905090332,
+    2.7122879028320312,
+    1.1042239665985107,
+    1.1641600131988525,
+    1.9471360445022583,
+    1.4167040586471558,
+    0.9295039772987366,
+    0.7191359996795654,
+    1.2528640031814575,
+    1.4986239671707153,
+    1.0977280139923096,
+    2.073568105697632
+  ],
+  "schema_version": 1,
+  "verification": {
+    "atol": 5e-05,
+    "gradients": {
+      "max_absolute_error": 0.0,
+      "max_relative_error": 0.0,
+      "max_tolerance_ratio": 0.0,
+      "performed": true
+    },
+    "indices_exact": true,
+    "performed": true,
+    "reference": "deepseek_grouped_topk",
+    "rtol": 5e-05,
+    "weights": {
+      "max_absolute_error": 0.0,
+      "max_relative_error": 0.0,
+      "max_tolerance_ratio": 0.0
+    }
+  },
+  "work_estimate": {
+    "group_score_candidates": 1024,
+    "logit_elements": 2048,
+    "retained_expert_candidates": 1024,
+    "router_projection_matrix_flops": 262144,
+    "selected_routes": 768
+  }
+}

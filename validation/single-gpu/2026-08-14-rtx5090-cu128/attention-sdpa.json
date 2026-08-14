@@ -1,0 +1,104 @@
+{
+  "configuration": {
+    "backend": "sdpa",
+    "batch": 1,
+    "causal": true,
+    "device": "cuda",
+    "dtype": "float32",
+    "head_dim": 64,
+    "heads": 2,
+    "iterations": 20,
+    "key_length": 128,
+    "query_length": 128,
+    "reference_block_size": 64,
+    "seed": 0,
+    "value_dim": 64,
+    "verify": true,
+    "warmup": 5
+  },
+  "derived": {
+    "compulsory_bandwidth_gb_s_at_median": 4.122798196509532,
+    "matrix_tflops_at_median": 0.13192954228830503
+  },
+  "environment": {
+    "gpu": {
+      "compute_capability": [
+        12,
+        0
+      ],
+      "index": 0,
+      "multiprocessors": 170,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_memory_bytes": 34190458880
+    },
+    "machine": "x86_64",
+    "native_extension_loaded": true,
+    "package": "0.1.0.dev0",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "source_dirty": false,
+    "source_revision": "d5b95ae4f3243b1e0acc4b5d0abfbd78ae0ca233",
+    "torch": "2.10.0+cu128",
+    "torch_cuda_version": "12.8",
+    "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+  },
+  "latency": {
+    "count": 20,
+    "max_ms": 0.7305600047111511,
+    "mean_ms": 0.10634560007601976,
+    "median_ms": 0.06358399987220764,
+    "min_ms": 0.01587199978530407,
+    "p90_ms": 0.19261119514703753,
+    "p99_ms": 0.631145925074815
+  },
+  "notes": [
+    "matrix_flops counts QK^T and PV multiply-adds only",
+    "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic",
+    "backend=sdpa delegates kernel selection to PyTorch scaled_dot_product_attention"
+  ],
+  "output": {
+    "device": "cuda:0",
+    "dtype": "float32",
+    "shape": [
+      1,
+      2,
+      128,
+      64
+    ]
+  },
+  "raw_samples_ms": [
+    0.166143998503685,
+    0.12272000312805176,
+    0.0724480003118515,
+    0.7305600047111511,
+    0.01587199978530407,
+    0.01587199978530407,
+    0.01587199978530407,
+    0.19097599387168884,
+    0.01587199978530407,
+    0.01587199978530407,
+    0.01587199978530407,
+    0.08115199953317642,
+    0.01664000004529953,
+    0.03532800078392029,
+    0.1005759984254837,
+    0.12115199863910675,
+    0.11247999966144562,
+    0.20732800662517548,
+    0.05471999943256378,
+    0.01945599913597107
+  ],
+  "schema_version": 1,
+  "verification": {
+    "atol": 5e-05,
+    "max_absolute_error": 1.7285346984863281e-06,
+    "max_relative_error": 0.02564274095480694,
+    "performed": true,
+    "reference": "scaled_dot_product_attention_reference",
+    "rtol": 5e-05
+  },
+  "work_estimate": {
+    "compulsory_tensor_bytes_lower_bound": 262144,
+    "matrix_flops": 8388608
+  }
+}

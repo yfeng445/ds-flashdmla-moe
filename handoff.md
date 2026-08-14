@@ -2,7 +2,7 @@
 
 更新时间：2026-08-14
 
-当前基线：`main`，已包含 fused MLA CUDA、稳定输出布局契约和单 GPU 验证快照。
+当前基线：`main`，已包含 fused MLA CUDA、稳定输出布局契约和单 GPU 成对基线快照。
 
 远端：<https://github.com/yfeng445/ds-flashdmla-moe>
 
@@ -39,7 +39,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 | NCCL Expert Parallel | 代码已实现，待双 GPU 验证 | 包括可微 All-to-All 和异步 chunk pipeline |
 | MLA CUDA | correctness core 已进入 `main` | fused FP32 absorbed-attention core 已验证；完整生产级 prefill/decode backend 仍未实现 |
 | One-sided/NVSHMEM | 未实现 | 当前只有 symmetric-buffer 成本与布局模型 |
-| 性能结论 | 尚不可下结论 | 已有单卡原始样本，但仍缺持续 runner、Nsight trace 和 cuBLAS/SDPA/主流 FlashAttention 对照 |
+| 性能结论 | 尚不可下结论 | 已有单卡固定 shape 原始样本和 PyTorch/cuBLAS/SDPA 对照，但仍缺持续 runner、多 shape 与 Nsight trace |
 
 ## 3. 代码地图
 
@@ -99,10 +99,10 @@ pytest -ra --strict-markers -W error::UserWarning
 ```
 
 同一环境完成 GEMM、Attention、MLA prefill、MLA static-cache decode、FP32 experts、
-FP16 WMMA experts 和 grouped router 的 20-sample smoke benchmark。全部数值验证通过，
-环境、固定 shape、误差、latency 汇总和原始样本保存在
+FP16 WMMA experts 和 grouped router 的 native/PyTorch 成对 20-sample benchmark。全部数值
+验证通过，环境、固定 shape、误差、latency 汇总和原始样本保存在
 `validation/single-gpu/2026-08-14-rtx5090-cu128/`。这仍是本地快照，不是持续
-self-hosted CI 或跨实现性能对比。
+self-hosted CI 或普适性能结论。
 
 ## 5. 当前阻塞与已知缺口
 
@@ -136,7 +136,8 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
    保存每 rank 原始 latency 和通信量。
 3. 用 Nsight Systems/Compute 检查 Attention、MLA、router、experts 的 kernel bottleneck，
    并验证 NCCL chunk pipeline 是否真正 overlap。
-4. 增加固定 shape 的 PyTorch SDPA、cuBLAS/CUTLASS 或主流 FlashAttention 对照基线。
+4. 把当前单 shape 的 PyTorch/cuBLAS/SDPA 对照扩展为代表性 prefill/decode、规则/尾块和
+   skew shape 矩阵；如可用，再加入 CUTLASS 或主流 FlashAttention。
 5. 扩展完整 MLA prefill/decode CUDA backend，再根据 profiler 结果考虑 FA2/FA3、
    TMA/WGMMA、router 优化和 one-sided EP。
 

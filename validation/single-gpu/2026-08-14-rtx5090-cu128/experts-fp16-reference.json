@@ -1,0 +1,173 @@
+{
+  "benchmark": "swiglu_experts_expert_major",
+  "configuration": {
+    "backend": "reference",
+    "backward": true,
+    "device": "cuda",
+    "dtype": "float16",
+    "expert_counts": [
+      17,
+      0,
+      5,
+      31
+    ],
+    "hidden_dim": 65,
+    "iterations": 20,
+    "model_dim": 33,
+    "seed": 0,
+    "verify": true,
+    "warmup": 5
+  },
+  "derived": {
+    "active_row_compulsory_bandwidth_gb_s_at_median": 0.011603210471612417,
+    "forward_active_row_matrix_tflops_equivalent_at_median": 0.00017354439974546208
+  },
+  "environment": {
+    "gpu": {
+      "compute_capability": [
+        12,
+        0
+      ],
+      "index": 0,
+      "multiprocessors": 170,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_memory_bytes": 34190458880
+    },
+    "machine": "x86_64",
+    "native_extension_loaded": true,
+    "package": "0.1.0.dev0",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "source_dirty": false,
+    "source_revision": "d5b95ae4f3243b1e0acc4b5d0abfbd78ae0ca233",
+    "torch": "2.10.0+cu128",
+    "torch_cuda_version": "12.8",
+    "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+  },
+  "initialization": {
+    "activation_standard_deviation": 1.0,
+    "distribution": "normal",
+    "down_weight_standard_deviation": 0.12403473458920847,
+    "gate_up_weight_standard_deviation": 0.17407765595569785
+  },
+  "latency": {
+    "count": 20,
+    "max_ms": 4.65996789932251,
+    "mean_ms": 3.828267204761505,
+    "median_ms": 3.9304639101028442,
+    "min_ms": 2.77510404586792,
+    "p90_ms": 4.3639520645141605,
+    "p99_ms": 4.6470905113220216
+  },
+  "notes": [
+    "forward matrix FLOPs count the three SwiGLU projections only",
+    "the compulsory byte count assumes each active expert weight is read once",
+    "compulsory bytes are an analytical lower bound, not measured DRAM traffic",
+    "forward-equivalent FLOPs remain forward-only when backward timing is enabled",
+    "the native CUDA path uses expert-segmented shared-memory FP32 GEMM tiles",
+    "float16 uses WMMA with FP32 accumulation and an FP16 materialized hidden state",
+    "native grouped tile counts are analytical launch-work models, not profiler counters",
+    "native CUDA backward recomputes the traceable PyTorch reference"
+  ],
+  "output": {
+    "device": "cuda:0",
+    "dtype": "float16",
+    "shape": [
+      53,
+      33
+    ]
+  },
+  "raw_samples_ms": [
+    2.77510404586792,
+    3.996959924697876,
+    3.8811519145965576,
+    4.304128170013428,
+    3.6121599674224854,
+    4.002175807952881,
+    3.4900801181793213,
+    3.526815891265869,
+    3.979775905609131,
+    3.5751678943634033,
+    4.338592052459717,
+    3.092672109603882,
+    3.757920026779175,
+    4.083295822143555,
+    4.65996789932251,
+    4.063968181610107,
+    3.4184000492095947,
+    4.160160064697266,
+    3.2546560764312744,
+    4.59219217300415
+  ],
+  "schema_version": 1,
+  "verification": {
+    "atol": 0.005,
+    "gradients": {
+      "max_absolute_error": 0.0,
+      "max_relative_error": 0.0,
+      "max_tolerance_ratio": 0.0,
+      "performed": true
+    },
+    "output": {
+      "max_absolute_error": 0.0,
+      "max_relative_error": 0.0,
+      "max_tolerance_ratio": 0.0
+    },
+    "performed": true,
+    "reference": "swiglu_experts_padded_reference",
+    "rtol": 0.005
+  },
+  "work_estimate": {
+    "active_expert_count": 3,
+    "active_route_rows": 53,
+    "active_row_compulsory_tensor_bytes_lower_bound": 45606,
+    "expert_count": 4,
+    "expert_route_rows": {
+      "coefficient_of_variation": 0.9031017316056091,
+      "maximum": 31,
+      "mean": 13.25,
+      "minimum": 0,
+      "peak_to_mean": 2.339622641509434,
+      "total": 53,
+      "values": [
+        17,
+        0,
+        5,
+        31
+      ],
+      "zero_load_count": 1
+    },
+    "forward_active_row_matrix_flops": 682110,
+    "forward_padded_matrix_flops": 1595880,
+    "native_grouped_tile_model": {
+      "active_expert_row_tiles": 5,
+      "allocated_row_lanes": 80,
+      "analytical_only": true,
+      "down_projection_tasks": 15,
+      "hidden_output_tiles": 5,
+      "hidden_projection_tasks": 25,
+      "inactive_tail_row_lanes": 27,
+      "model_output_tiles": 3,
+      "row_lane_utilization": 0.6625,
+      "tile_shape": [
+        16,
+        16,
+        16
+      ]
+    },
+    "native_numeric_model": {
+      "accumulator_dtype": "float32",
+      "applies_to_backend": "cuda",
+      "configuration_dtype": "float16",
+      "forward_engine": "wmma_tensor_cores",
+      "materialized_hidden_dtype": "float16",
+      "minimum_compute_capability": "7.0",
+      "multiplicand_dtype": "float16",
+      "supported": true
+    },
+    "padded_capacity_per_expert": 31,
+    "padded_expert_slots": 124,
+    "padding_rows": 71,
+    "padding_utilization": 0.4274193548387097
+  }
+}

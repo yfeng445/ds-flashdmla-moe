@@ -286,8 +286,9 @@ are reported separately from routed expert compute.
 
 The checked-in [RTX 5090 / CUDA 12.8 single-GPU snapshot](validation/single-gpu/2026-08-14-rtx5090-cu128/README.md)
 contains fixed-shape configurations, numerical errors, latency summaries, and raw samples for
-the native GEMM, Attention, MLA, expert, and router paths. It is a local correctness/smoke run,
-not a cross-implementation performance claim or a replacement for self-hosted GPU CI.
+the native GEMM, Attention, MLA, expert, and router paths plus matching PyTorch/cuBLAS/SDPA
+baselines. It is a local diagnostic snapshot, not a general performance claim or a replacement
+for self-hosted GPU CI.
 
 ## Learning material
 
