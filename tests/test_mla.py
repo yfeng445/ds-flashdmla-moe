@@ -566,7 +566,10 @@ def test_cuda_mla_projection_stages_match_reference(
     actual_output = mla_output_projection(heads, weights.wo, backend="cuda")
     expected_output = mla_output_projection(heads, weights.wo, backend="reference")
 
-    for actual, expected in (*zip(actual_query, expected_query), *zip(actual_cache, expected_cache)):
+    for actual, expected in (
+        *zip(actual_query, expected_query),
+        *zip(actual_cache, expected_cache),
+    ):
         assert actual.dtype == expected.dtype == dtype
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     torch.testing.assert_close(actual_output, expected_output, rtol=rtol, atol=atol)
