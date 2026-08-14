@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from .attention import _broadcast_mask, _stable_probabilities
+
+MLABackend = Literal["auto", "cuda", "reference"]
 
 
 @dataclass(frozen=True)
@@ -414,8 +417,13 @@ def _validate_attention_request(
         raise ValueError("cache positional dimension does not match config")
     if cache.positions.numel() != cache.sequence_length:
         raise ValueError("cache positions do not match cache sequence length")
-    if cache.kv.device != query_x.device or cache.pe.device != query_x.device:
+    if (
+        cache.kv.device != query_x.device
+        or cache.pe.device != query_x.device
+        or cache.positions.device != query_x.device
+    ):
         raise ValueError("query and cache must be on the same device")
+    _validate_positions(cache.positions, cache.sequence_length, query_x.device)
     return _validate_positions(query_positions, query_x.shape[1], query_x.device)
 
 
@@ -510,4 +518,68 @@ def mla_absorbed_attention_reference(
     latent_output = torch.einsum("bhst,btr->bshr", probabilities, kv)
     heads = torch.einsum("bshr,hdr->bshd", latent_output, value_up)
     output = F.linear(heads.flatten(2), weights.wo.to(compute_dtype))
+    return output.to(query_x.dtype)
+
+
+def mla_absorbed_attention(
+    query_x: Tensor,
+    cache: MLALatentCache,
+    config: MLAConfig,
+    weights: MLAWeights,
+    *,
+    query_positions: Tensor,
+    causal: bool = True,
+    attn_mask: Tensor | None = None,
+    backend: MLABackend = "auto",
+) -> Tensor:
+    """Run absorbed MLA with an optional native fused attention core.
+
+    Query and output projections remain regular PyTorch linear operations. The
+    CUDA core consumes the compressed latent cache directly, fusing absorbed
+    content/position scores, causal masking, online softmax, and latent value
+    accumulation without materializing expanded K/V or an attention matrix.
+    """
+
+    if backend not in {"auto", "cuda", "reference"}:
+        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+    if attn_mask is not None:
+        if backend == "cuda":
+            raise RuntimeError("CUDA MLA is unavailable: explicit attention masks are unsupported")
+        return mla_absorbed_attention_reference(
+            query_x,
+            cache,
+            config,
+            weights,
+            query_positions=query_positions,
+            causal=causal,
+            attn_mask=attn_mask,
+        )
+
+    query_positions = _validate_attention_request(query_x, cache, query_positions, config, weights)
+    compute_dtype = _compute_dtype(query_x)
+    q_nope, q_pe = _project_query(query_x, config, weights, query_positions)
+    up = weights.wkv_b.to(compute_dtype).reshape(
+        config.n_heads,
+        config.qk_nope_head_dim + config.v_head_dim,
+        config.kv_lora_rank,
+    )
+    key_up = up[:, : config.qk_nope_head_dim]
+    value_up = up[:, config.qk_nope_head_dim :]
+
+    from .ops import mla_absorbed_attention as _mla_attention_core
+
+    heads = _mla_attention_core(
+        q_nope,
+        q_pe,
+        cache.kv,
+        cache.pe,
+        key_up,
+        value_up,
+        query_positions=query_positions,
+        key_positions=cache.positions,
+        causal=causal,
+        scale=config.qk_head_dim**-0.5,
+        backend=backend,
+    )
+    output = F.linear(heads.flatten(2).to(compute_dtype), weights.wo.to(compute_dtype))
     return output.to(query_x.dtype)

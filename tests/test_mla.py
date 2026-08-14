@@ -10,6 +10,8 @@ from ds_flash_mla_moe import (
     allocate_mla_static_cache,
     append_mla_cache,
     build_mla_cache,
+    cuda_mla_available,
+    mla_absorbed_attention,
     mla_absorbed_attention_reference,
     mla_naive_attention_reference,
     write_mla_static_cache,
@@ -83,6 +85,299 @@ def test_naive_and_absorbed_paths_are_equivalent(direct_query: bool, causal: boo
     )
 
     torch.testing.assert_close(absorbed, naive, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("direct_query", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_dispatchable_absorbed_reference_matches_specification(
+    direct_query: bool, causal: bool
+) -> None:
+    x, config, weights = make_fixture(direct_query=direct_query)
+    positions = torch.arange(x.shape[1])
+    cache = build_mla_cache(x, config, weights, positions=positions)
+
+    actual = mla_absorbed_attention(
+        x,
+        cache,
+        config,
+        weights,
+        query_positions=positions,
+        causal=causal,
+        backend="reference",
+    )
+    expected = mla_absorbed_attention_reference(
+        x,
+        cache,
+        config,
+        weights,
+        query_positions=positions,
+        causal=causal,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
+
+
+def test_dispatchable_absorbed_reference_preserves_gradients() -> None:
+    x, config, weights = make_fixture()
+    actual_x = x.detach().clone().requires_grad_(True)
+    expected_x = x.detach().clone().requires_grad_(True)
+    positions = torch.arange(x.shape[1])
+    actual_cache = build_mla_cache(actual_x, config, weights, positions=positions)
+    expected_cache = build_mla_cache(expected_x, config, weights, positions=positions)
+    upstream = torch.randn_like(x)
+
+    actual = mla_absorbed_attention(
+        actual_x,
+        actual_cache,
+        config,
+        weights,
+        query_positions=positions,
+        backend="reference",
+    )
+    expected = mla_absorbed_attention_reference(
+        expected_x,
+        expected_cache,
+        config,
+        weights,
+        query_positions=positions,
+    )
+    with torch.autograd.set_multithreading_enabled(False):
+        actual.backward(upstream)
+    expected.backward(upstream)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(actual_x.grad, expected_x.grad, rtol=1e-9, atol=1e-9)
+
+
+def test_raw_absorbed_operator_passes_opcheck() -> None:
+    torch.manual_seed(173)
+    inputs = (
+        torch.randn(2, 3, 4, 5, dtype=torch.float64, requires_grad=True),
+        torch.randn(2, 3, 4, 2, dtype=torch.float64, requires_grad=True),
+        torch.randn(2, 6, 7, dtype=torch.float64, requires_grad=True),
+        torch.randn(2, 6, 2, dtype=torch.float64, requires_grad=True),
+        torch.randn(4, 5, 7, dtype=torch.float64, requires_grad=True),
+        torch.randn(4, 3, 7, dtype=torch.float64, requires_grad=True),
+        torch.arange(3),
+        torch.arange(6),
+        True,
+        0.25,
+    )
+    torch.library.opcheck(
+        torch.ops.ds_flash_mla_moe.mla_absorbed_attention.default,
+        inputs,
+    )
+
+
+def test_raw_absorbed_operator_runs_through_torch_compile() -> None:
+    @torch.compile(fullgraph=True, backend="eager")
+    def compiled(
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv: torch.Tensor,
+        pe: torch.Tensor,
+        key_up: torch.Tensor,
+        value_up: torch.Tensor,
+        query_positions: torch.Tensor,
+        key_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops.ds_flash_mla_moe.mla_absorbed_attention.default(
+            q_nope,
+            q_pe,
+            kv,
+            pe,
+            key_up,
+            value_up,
+            query_positions,
+            key_positions,
+            True,
+            0.5,
+        )
+
+    tensors = (
+        torch.randn(1, 2, 3, 4),
+        torch.randn(1, 2, 3, 2),
+        torch.randn(1, 5, 6),
+        torch.randn(1, 5, 2),
+        torch.randn(3, 4, 6),
+        torch.randn(3, 7, 6),
+        torch.arange(2),
+        torch.arange(5),
+    )
+    actual = compiled(*tensors)
+    expected = torch.ops.ds_flash_mla_moe.mla_absorbed_attention.default(*tensors, True, 0.5)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_explicit_cuda_mla_fails_loudly_without_native_inputs() -> None:
+    x, config, weights = make_fixture()
+    positions = torch.arange(x.shape[1])
+    cache = build_mla_cache(x, config, weights, positions=positions)
+    with pytest.raises(RuntimeError, match="CUDA MLA is unavailable"):
+        mla_absorbed_attention(
+            x,
+            cache,
+            config,
+            weights,
+            query_positions=positions,
+            backend="cuda",
+        )
+
+
+def test_explicit_cuda_mla_rejects_attention_mask() -> None:
+    x, config, weights = make_fixture()
+    positions = torch.arange(x.shape[1])
+    cache = build_mla_cache(x, config, weights, positions=positions)
+    with pytest.raises(RuntimeError, match="explicit attention masks"):
+        mla_absorbed_attention(
+            x,
+            cache,
+            config,
+            weights,
+            query_positions=positions,
+            attn_mask=torch.ones(x.shape[1], x.shape[1], dtype=torch.bool),
+            backend="cuda",
+        )
+
+
+@pytest.mark.skipif(
+    not cuda_mla_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.cuda
+@pytest.mark.parametrize("query_length", [1, 3, 6])
+@pytest.mark.parametrize("causal", [False, True])
+def test_cuda_absorbed_mla_matches_reference(query_length: int, causal: bool) -> None:
+    x, config, weights = make_fixture()
+    x = x.float().cuda()
+    weights = MLAWeights(
+        **{
+            field.name: (
+                getattr(weights, field.name).float().cuda()
+                if getattr(weights, field.name) is not None
+                else None
+            )
+            for field in fields(MLAWeights)
+        }
+    )
+    positions = torch.arange(x.shape[1], device="cuda")
+    cache = build_mla_cache(x, config, weights, positions=positions)
+    query = x[:, -query_length:]
+    query_positions = positions[-query_length:]
+
+    with torch.no_grad():
+        actual = mla_absorbed_attention(
+            query,
+            cache,
+            config,
+            weights,
+            query_positions=query_positions,
+            causal=causal,
+            backend="cuda",
+        )
+        expected = mla_absorbed_attention_reference(
+            query,
+            cache,
+            config,
+            weights,
+            query_positions=query_positions,
+            causal=causal,
+        )
+    torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
+
+
+@pytest.mark.skipif(
+    not cuda_mla_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.filterwarnings(
+    "ignore:Attempting to run cuBLAS, but there was no current CUDA context!:UserWarning"
+)
+@pytest.mark.cuda
+def test_cuda_absorbed_mla_backward_matches_reference() -> None:
+    x, config, weights = make_fixture()
+    actual_x = x.float().cuda().requires_grad_(True)
+    expected_x = actual_x.detach().clone().requires_grad_(True)
+    weights = MLAWeights(
+        **{
+            field.name: (
+                getattr(weights, field.name).float().cuda()
+                if getattr(weights, field.name) is not None
+                else None
+            )
+            for field in fields(MLAWeights)
+        }
+    )
+    positions = torch.arange(x.shape[1], device="cuda")
+    actual_cache = build_mla_cache(actual_x, config, weights, positions=positions)
+    expected_cache = build_mla_cache(expected_x, config, weights, positions=positions)
+    upstream = torch.randn_like(actual_x)
+
+    actual = mla_absorbed_attention(
+        actual_x,
+        actual_cache,
+        config,
+        weights,
+        query_positions=positions,
+        backend="cuda",
+    )
+    expected = mla_absorbed_attention_reference(
+        expected_x,
+        expected_cache,
+        config,
+        weights,
+        query_positions=positions,
+    )
+    actual.backward(upstream)
+    expected.backward(upstream)
+
+    torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
+    torch.testing.assert_close(actual_x.grad, expected_x.grad, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.skipif(
+    not cuda_mla_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.cuda
+def test_cuda_absorbed_mla_uses_current_stream() -> None:
+    x, config, weights = make_fixture()
+    x = x.float().cuda()
+    weights = MLAWeights(
+        **{
+            field.name: (
+                getattr(weights, field.name).float().cuda()
+                if getattr(weights, field.name) is not None
+                else None
+            )
+            for field in fields(MLAWeights)
+        }
+    )
+    positions = torch.arange(x.shape[1], device="cuda")
+    cache = build_mla_cache(x, config, weights, positions=positions)
+    stream = torch.cuda.Stream()
+
+    with torch.no_grad(), torch.cuda.stream(stream):
+        x.fill_(0.125)
+        actual = mla_absorbed_attention(
+            x,
+            cache,
+            config,
+            weights,
+            query_positions=positions,
+            backend="cuda",
+        )
+        actual.record_stream(stream)
+    stream.synchronize()
+    with torch.no_grad():
+        expected = mla_absorbed_attention_reference(
+            x,
+            cache,
+            config,
+            weights,
+            query_positions=positions,
+        )
+    torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
 
 
 def test_incremental_latent_cache_decode_matches_causal_prefill() -> None:

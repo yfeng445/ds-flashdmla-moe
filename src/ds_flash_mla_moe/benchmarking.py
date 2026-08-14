@@ -351,4 +351,4 @@ def write_benchmark_report(report: dict[str, Any], path: str | Path | None) -> N
         return
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(rendered)
+    destination.write_text(rendered, encoding="utf-8")

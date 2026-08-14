@@ -105,8 +105,9 @@ def test_report_writer_emits_valid_json(tmp_path) -> None:
 
     write_benchmark_report(report, destination)
 
-    assert json.loads(destination.read_text()) == report
-    assert destination.read_text().endswith("\n")
+    rendered = destination.read_text(encoding="utf-8")
+    assert json.loads(rendered) == report
+    assert rendered.endswith("\n")
 
 
 @pytest.mark.parametrize(

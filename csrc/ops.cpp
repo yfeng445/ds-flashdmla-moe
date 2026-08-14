@@ -29,4 +29,6 @@ TORCH_LIBRARY(ds_flash_mla_moe, m) {
       "expert_major_pack(Tensor activations, Tensor expert_indices, Tensor local_expert_ids) -> (Tensor, Tensor, Tensor)");
   m.def(
       "grouped_topk(Tensor x, Tensor gate_weight, int topk, int n_groups, int topk_groups, Tensor? score_bias, float route_scale) -> (Tensor, Tensor)");
+  m.def(
+      "mla_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv, Tensor pe, Tensor key_up, Tensor value_up, Tensor query_positions, Tensor key_positions, bool causal, float scale) -> Tensor");
 }
