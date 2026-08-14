@@ -380,8 +380,9 @@ The checked-in [RTX 5090 / CUDA 12.8 single-GPU snapshot](validation/single-gpu/
 contains fixed-shape configurations, numerical errors, latency summaries, and raw samples for
 the native GEMM, Attention, MLA, expert, and router paths plus matching PyTorch/cuBLAS/SDPA
 baselines. It also contains the 20-case representative matrix and structured MLA
-prefill/decode Kineto aggregates described above. It is a local diagnostic snapshot, not a
-general performance claim, an Nsight report, or a replacement for self-hosted GPU CI.
+prefill/decode Kineto aggregates described above, plus four same-dtype FP16/BF16 pairs against
+the optional FlashAttention-4 backend. It is a local diagnostic snapshot, not a general
+performance claim, an Nsight report, or a replacement for self-hosted GPU CI.
 
 ## Learning material
 

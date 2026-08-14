@@ -1,0 +1,1069 @@
+{
+  "benchmark": "single_gpu_operator_matrix",
+  "cases": [
+    {
+      "baseline_label": "flash_attention_4",
+      "baseline_report": {
+        "configuration": {
+          "backend": "flash-attn-4",
+          "batch": 1,
+          "causal": true,
+          "device": "cuda",
+          "dtype": "bfloat16",
+          "head_dim": 64,
+          "heads": 4,
+          "iterations": 20,
+          "key_length": 128,
+          "query_length": 128,
+          "reference_block_size": 64,
+          "seed": 20260834,
+          "value_dim": 64,
+          "verify": true,
+          "warmup": 5
+        },
+        "derived": {
+          "compulsory_bandwidth_gb_s_at_median": 16.943122552022178,
+          "matrix_tflops_at_median": 1.0843598433294193
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "external_backend": {
+          "distribution": "flash-attn-4",
+          "provider": "Dao-AILab/flash-attention",
+          "version": "4.0.0b22"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.36403200030326843,
+          "mean_ms": 0.06554079973138868,
+          "median_ms": 0.01547200046479702,
+          "min_ms": 0.009727999567985535,
+          "p90_ms": 0.15787840038537984,
+          "p99_ms": 0.33020895898342106
+        },
+        "notes": [
+          "matrix_flops counts QK^T and PV multiply-adds only",
+          "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic",
+          "backend=flash-attn-4 uses the optional CuTeDSL implementation and supports float16/bfloat16 CUDA inputs only",
+          "latency includes the BHSD-to-BSHD layout adapter and contiguous BHSD output copy"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "bfloat16",
+          "shape": [
+            1,
+            4,
+            128,
+            64
+          ]
+        },
+        "raw_samples_ms": [
+          0.1547520011663437,
+          0.011776000261306763,
+          0.36403200030326843,
+          0.011776000261306763,
+          0.011776000261306763,
+          0.05225599929690361,
+          0.009727999567985535,
+          0.011776000261306763,
+          0.03680000081658363,
+          0.01119999960064888,
+          0.019168000668287277,
+          0.15263999998569489,
+          0.011744000017642975,
+          0.011680000461637974,
+          0.05711999908089638,
+          0.058848001062870026,
+          0.1860159933567047,
+          0.011776000261306763,
+          0.011776000261306763,
+          0.11417599767446518
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.02,
+          "max_absolute_error": 0.0078125,
+          "max_relative_error": 50.43712574850299,
+          "performed": true,
+          "reference": "scaled_dot_product_attention_reference",
+          "rtol": 0.02
+        },
+        "work_estimate": {
+          "compulsory_tensor_bytes_lower_bound": 262144,
+          "matrix_flops": 16777216
+        }
+      },
+      "comparison": {
+        "baseline_median_ms": 0.01547200046479702,
+        "lower_median": "baseline",
+        "native_median_ms": 0.12371200323104858,
+        "native_over_baseline": 7.995863463973311
+      },
+      "description": "BF16 square causal prefill paired with FlashAttention-4",
+      "execution_order": [
+        "native",
+        "baseline"
+      ],
+      "family": "attention",
+      "name": "attention_fa4_prefill_bfloat16",
+      "native_report": {
+        "configuration": {
+          "backend": "cuda",
+          "batch": 1,
+          "causal": true,
+          "device": "cuda",
+          "dtype": "bfloat16",
+          "head_dim": 64,
+          "heads": 4,
+          "iterations": 20,
+          "key_length": 128,
+          "query_length": 128,
+          "reference_block_size": 64,
+          "seed": 20260834,
+          "value_dim": 64,
+          "verify": true,
+          "warmup": 5
+        },
+        "derived": {
+          "compulsory_bandwidth_gb_s_at_median": 2.118985976731872,
+          "matrix_tflops_at_median": 0.1356151025108398
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.5564799904823303,
+          "mean_ms": 0.1619152005761862,
+          "median_ms": 0.12371200323104858,
+          "min_ms": 0.1231359988451004,
+          "p90_ms": 0.19396800100803407,
+          "p99_ms": 0.5246755132079123
+        },
+        "notes": [
+          "matrix_flops counts QK^T and PV multiply-adds only",
+          "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "bfloat16",
+          "shape": [
+            1,
+            4,
+            128,
+            64
+          ]
+        },
+        "raw_samples_ms": [
+          0.17228800058364868,
+          0.12387199699878693,
+          0.12316799908876419,
+          0.12371200323104858,
+          0.12371200323104858,
+          0.12374400347471237,
+          0.1233920007944107,
+          0.12355200201272964,
+          0.1231359988451004,
+          0.12348800152540207,
+          0.12355200201272964,
+          0.12348800152540207,
+          0.12377600371837616,
+          0.12355200201272964,
+          0.12374400347471237,
+          0.5564799904823303,
+          0.14313599467277527,
+          0.12396799772977829,
+          0.12345600128173828,
+          0.3890880048274994
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.02,
+          "max_absolute_error": 0.0009765625,
+          "max_relative_error": 0.006329113924050633,
+          "performed": true,
+          "reference": "scaled_dot_product_attention_reference",
+          "rtol": 0.02
+        },
+        "work_estimate": {
+          "compulsory_tensor_bytes_lower_bound": 262144,
+          "matrix_flops": 16777216
+        }
+      },
+      "paired_configuration": {
+        "batch": 1,
+        "causal": true,
+        "device": "cuda",
+        "dtype": "bfloat16",
+        "head_dim": 64,
+        "heads": 4,
+        "iterations": 20,
+        "key_length": 128,
+        "query_length": 128,
+        "reference_block_size": 64,
+        "seed": 20260834,
+        "value_dim": 64,
+        "verify": true,
+        "warmup": 5
+      },
+      "shape_class": "regular"
+    },
+    {
+      "baseline_label": "flash_attention_4",
+      "baseline_report": {
+        "configuration": {
+          "backend": "flash-attn-4",
+          "batch": 2,
+          "causal": true,
+          "device": "cuda",
+          "dtype": "float16",
+          "head_dim": 40,
+          "heads": 3,
+          "iterations": 20,
+          "key_length": 127,
+          "query_length": 127,
+          "reference_block_size": 64,
+          "seed": 20260835,
+          "value_dim": 48,
+          "verify": true,
+          "warmup": 5
+        },
+        "derived": {
+          "compulsory_bandwidth_gb_s_at_median": 6.136163800796857,
+          "matrix_tflops_at_median": 0.3896464013506004
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "external_backend": {
+          "distribution": "flash-attn-4",
+          "provider": "Dao-AILab/flash-attention",
+          "version": "4.0.0b22"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.21247999370098114,
+          "mean_ms": 0.06705119917169214,
+          "median_ms": 0.04371200129389763,
+          "min_ms": 0.009696000255644321,
+          "p90_ms": 0.187916798889637,
+          "p99_ms": 0.21133695349097253
+        },
+        "notes": [
+          "matrix_flops counts QK^T and PV multiply-adds only",
+          "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic",
+          "backend=flash-attn-4 uses the optional CuTeDSL implementation and supports float16/bfloat16 CUDA inputs only",
+          "latency includes the BHSD-to-BSHD layout adapter and contiguous BHSD output copy"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "float16",
+          "shape": [
+            2,
+            3,
+            127,
+            48
+          ]
+        },
+        "raw_samples_ms": [
+          0.011711999773979187,
+          0.04870399832725525,
+          0.17900800704956055,
+          0.009727999567985535,
+          0.04275200143456459,
+          0.06835199892520905,
+          0.06540799885988235,
+          0.04467200115323067,
+          0.045791998505592346,
+          0.2064639925956726,
+          0.009727999567985535,
+          0.009696000255644321,
+          0.18585599958896637,
+          0.009727999567985535,
+          0.009727999567985535,
+          0.21247999370098114,
+          0.009696000255644321,
+          0.009727999567985535,
+          0.1520639955997467,
+          0.009727999567985535
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.005,
+          "max_absolute_error": 0.0009765625,
+          "max_relative_error": 2.2950819672131146,
+          "performed": true,
+          "reference": "scaled_dot_product_attention_reference",
+          "rtol": 0.005
+        },
+        "work_estimate": {
+          "compulsory_tensor_bytes_lower_bound": 268224,
+          "matrix_flops": 17032224
+        }
+      },
+      "comparison": {
+        "baseline_median_ms": 0.04371200129389763,
+        "lower_median": "baseline",
+        "native_median_ms": 0.12592000514268875,
+        "native_over_baseline": 2.8806735316478793
+      },
+      "description": "FP16 tail prefill with unequal QK/V widths paired with FlashAttention-4",
+      "execution_order": [
+        "baseline",
+        "native"
+      ],
+      "family": "attention",
+      "name": "attention_fa4_prefill_tail_float16",
+      "native_report": {
+        "configuration": {
+          "backend": "cuda",
+          "batch": 2,
+          "causal": true,
+          "device": "cuda",
+          "dtype": "float16",
+          "head_dim": 40,
+          "heads": 3,
+          "iterations": 20,
+          "key_length": 127,
+          "query_length": 127,
+          "reference_block_size": 64,
+          "seed": 20260835,
+          "value_dim": 48,
+          "verify": true,
+          "warmup": 5
+        },
+        "derived": {
+          "compulsory_bandwidth_gb_s_at_median": 2.1301142713269163,
+          "matrix_tflops_at_median": 0.1352622562292592
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.7666559815406799,
+          "mean_ms": 0.17831359803676605,
+          "median_ms": 0.12592000514268875,
+          "min_ms": 0.1255359947681427,
+          "p90_ms": 0.16943359822034892,
+          "p99_ms": 0.7202595007419583
+        },
+        "notes": [
+          "matrix_flops counts QK^T and PV multiply-adds only",
+          "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "float16",
+          "shape": [
+            2,
+            3,
+            127,
+            48
+          ]
+        },
+        "raw_samples_ms": [
+          0.7666559815406799,
+          0.12972800433635712,
+          0.12716799974441528,
+          0.1257600039243698,
+          0.12595200538635254,
+          0.125791996717453,
+          0.12700800597667694,
+          0.12569600343704224,
+          0.12572799623012543,
+          0.125791996717453,
+          0.12588800489902496,
+          0.5224639773368835,
+          0.13020800054073334,
+          0.125791996717453,
+          0.12556800246238708,
+          0.127360001206398,
+          0.12559999525547028,
+          0.1255359947681427,
+          0.1260479986667633,
+          0.12652799487113953
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.005,
+          "max_absolute_error": 0.000244140625,
+          "max_relative_error": 0.00546448087431694,
+          "performed": true,
+          "reference": "scaled_dot_product_attention_reference",
+          "rtol": 0.005
+        },
+        "work_estimate": {
+          "compulsory_tensor_bytes_lower_bound": 268224,
+          "matrix_flops": 17032224
+        }
+      },
+      "paired_configuration": {
+        "batch": 2,
+        "causal": true,
+        "device": "cuda",
+        "dtype": "float16",
+        "head_dim": 40,
+        "heads": 3,
+        "iterations": 20,
+        "key_length": 127,
+        "query_length": 127,
+        "reference_block_size": 64,
+        "seed": 20260835,
+        "value_dim": 48,
+        "verify": true,
+        "warmup": 5
+      },
+      "shape_class": "tail"
+    },
+    {
+      "baseline_label": "flash_attention_4",
+      "baseline_report": {
+        "configuration": {
+          "backend": "flash-attn-4",
+          "batch": 2,
+          "causal": true,
+          "device": "cuda",
+          "dtype": "bfloat16",
+          "head_dim": 64,
+          "heads": 4,
+          "iterations": 20,
+          "key_length": 128,
+          "query_length": 1,
+          "reference_block_size": 64,
+          "seed": 20260836,
+          "value_dim": 64,
+          "verify": true,
+          "warmup": 5
+        },
+        "derived": {
+          "compulsory_bandwidth_gb_s_at_median": 38.22222215778467,
+          "matrix_tflops_at_median": 0.03792592586198788
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "external_backend": {
+          "distribution": "flash-attn-4",
+          "provider": "Dao-AILab/flash-attention",
+          "version": "4.0.0b22"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.35068801045417786,
+          "mean_ms": 0.07419200092554093,
+          "median_ms": 0.006912000011652708,
+          "min_ms": 0.005632000043988228,
+          "p90_ms": 0.3252224028110504,
+          "p99_ms": 0.3460246503353119
+        },
+        "notes": [
+          "matrix_flops counts QK^T and PV multiply-adds only",
+          "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic",
+          "backend=flash-attn-4 uses the optional CuTeDSL implementation and supports float16/bfloat16 CUDA inputs only",
+          "latency includes the BHSD-to-BSHD layout adapter and contiguous BHSD output copy"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "bfloat16",
+          "shape": [
+            2,
+            4,
+            1,
+            64
+          ]
+        },
+        "raw_samples_ms": [
+          0.007199999876320362,
+          0.006624000146985054,
+          0.01648000068962574,
+          0.15945599973201752,
+          0.007679999805986881,
+          0.007455999962985516,
+          0.005632000043988228,
+          0.21862399578094482,
+          0.005632000043988228,
+          0.005632000043988228,
+          0.005632000043988228,
+          0.3261440098285675,
+          0.005632000043988228,
+          0.005632000043988228,
+          0.005632000043988228,
+          0.3251200020313263,
+          0.007679999805986881,
+          0.005632000043988228,
+          0.005632000043988228,
+          0.35068801045417786
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.02,
+          "max_absolute_error": 0.001953125,
+          "max_relative_error": 1.8097560975609757,
+          "performed": true,
+          "reference": "scaled_dot_product_attention_reference",
+          "rtol": 0.02
+        },
+        "work_estimate": {
+          "compulsory_tensor_bytes_lower_bound": 264192,
+          "matrix_flops": 262144
+        }
+      },
+      "comparison": {
+        "baseline_median_ms": 0.006912000011652708,
+        "lower_median": "baseline",
+        "native_median_ms": 0.12168000265955925,
+        "native_over_baseline": 17.604167021762592
+      },
+      "description": "BF16 single-query right-aligned decode paired with FlashAttention-4",
+      "execution_order": [
+        "native",
+        "baseline"
+      ],
+      "family": "attention",
+      "name": "attention_fa4_decode_bfloat16",
+      "native_report": {
+        "configuration": {
+          "backend": "cuda",
+          "batch": 2,
+          "causal": true,
+          "device": "cuda",
+          "dtype": "bfloat16",
+          "head_dim": 64,
+          "heads": 4,
+          "iterations": 20,
+          "key_length": 128,
+          "query_length": 1,
+          "reference_block_size": 64,
+          "seed": 20260836,
+          "value_dim": 64,
+          "verify": true,
+          "warmup": 5
+        },
+        "derived": {
+          "compulsory_bandwidth_gb_s_at_median": 2.171203108362563,
+          "matrix_tflops_at_median": 0.0021543720765147913
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.3095040023326874,
+          "mean_ms": 0.13787680119276047,
+          "median_ms": 0.12168000265955925,
+          "min_ms": 0.12111999839544296,
+          "p90_ms": 0.13630399703979512,
+          "p99_ms": 0.29944160073995585
+        },
+        "notes": [
+          "matrix_flops counts QK^T and PV multiply-adds only",
+          "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "bfloat16",
+          "shape": [
+            2,
+            4,
+            1,
+            64
+          ]
+        },
+        "raw_samples_ms": [
+          0.25654399394989014,
+          0.12294399738311768,
+          0.12166400253772736,
+          0.12176000326871872,
+          0.12156800180673599,
+          0.12169600278139114,
+          0.12147200107574463,
+          0.12166400253772736,
+          0.12140800058841705,
+          0.12166400253772736,
+          0.12150400131940842,
+          0.12169600278139114,
+          0.12160000205039978,
+          0.12169600278139114,
+          0.12169600278139114,
+          0.3095040023326874,
+          0.12294399738311768,
+          0.12166400253772736,
+          0.12172800302505493,
+          0.12111999839544296
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.02,
+          "max_absolute_error": 0.0,
+          "max_relative_error": 0.0,
+          "performed": true,
+          "reference": "scaled_dot_product_attention_reference",
+          "rtol": 0.02
+        },
+        "work_estimate": {
+          "compulsory_tensor_bytes_lower_bound": 264192,
+          "matrix_flops": 262144
+        }
+      },
+      "paired_configuration": {
+        "batch": 2,
+        "causal": true,
+        "device": "cuda",
+        "dtype": "bfloat16",
+        "head_dim": 64,
+        "heads": 4,
+        "iterations": 20,
+        "key_length": 128,
+        "query_length": 1,
+        "reference_block_size": 64,
+        "seed": 20260836,
+        "value_dim": 64,
+        "verify": true,
+        "warmup": 5
+      },
+      "shape_class": "decode"
+    },
+    {
+      "baseline_label": "flash_attention_4",
+      "baseline_report": {
+        "configuration": {
+          "backend": "flash-attn-4",
+          "batch": 1,
+          "causal": true,
+          "device": "cuda",
+          "dtype": "float16",
+          "head_dim": 40,
+          "heads": 3,
+          "iterations": 20,
+          "key_length": 129,
+          "query_length": 7,
+          "reference_block_size": 64,
+          "seed": 20260837,
+          "value_dim": 24,
+          "verify": true,
+          "warmup": 5
+        },
+        "derived": {
+          "compulsory_bandwidth_gb_s_at_median": 0.31426921091896365,
+          "matrix_tflops_at_median": 0.0020866551283810603
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "external_backend": {
+          "distribution": "flash-attn-4",
+          "provider": "Dao-AILab/flash-attention",
+          "version": "4.0.0b22"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.3000960052013397,
+          "mean_ms": 0.1635744022205472,
+          "median_ms": 0.16617599874734879,
+          "min_ms": 0.01206399966031313,
+          "p90_ms": 0.22215680629014975,
+          "p99_ms": 0.2922041645646095
+        },
+        "notes": [
+          "matrix_flops counts QK^T and PV multiply-adds only",
+          "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic",
+          "backend=flash-attn-4 uses the optional CuTeDSL implementation and supports float16/bfloat16 CUDA inputs only",
+          "latency includes the BHSD-to-BSHD layout adapter and contiguous BHSD output copy"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "float16",
+          "shape": [
+            1,
+            3,
+            7,
+            24
+          ]
+        },
+        "raw_samples_ms": [
+          0.15353600680828094,
+          0.15193599462509155,
+          0.16803200542926788,
+          0.16595199704170227,
+          0.14582400023937225,
+          0.17843200266361237,
+          0.1664000004529953,
+          0.16332800686359406,
+          0.15001599490642548,
+          0.3000960052013397,
+          0.2585600018501282,
+          0.012896000407636166,
+          0.18483200669288635,
+          0.01206399966031313,
+          0.2181120067834854,
+          0.16771200299263,
+          0.18681600689888,
+          0.16515199840068817,
+          0.14899200201034546,
+          0.1728000044822693
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.005,
+          "max_absolute_error": 0.000244140625,
+          "max_relative_error": 1.1187214611872147,
+          "performed": true,
+          "reference": "scaled_dot_product_attention_reference",
+          "rtol": 0.005
+        },
+        "work_estimate": {
+          "compulsory_tensor_bytes_lower_bound": 52224,
+          "matrix_flops": 346752
+        }
+      },
+      "comparison": {
+        "baseline_median_ms": 0.16617599874734879,
+        "lower_median": "native",
+        "native_median_ms": 0.1236800029873848,
+        "native_over_baseline": 0.7442711578067649
+      },
+      "description": "FP16 tail decode with unequal QK/V widths paired with FlashAttention-4",
+      "execution_order": [
+        "baseline",
+        "native"
+      ],
+      "family": "attention",
+      "name": "attention_fa4_decode_tail_float16",
+      "native_report": {
+        "configuration": {
+          "backend": "cuda",
+          "batch": 1,
+          "causal": true,
+          "device": "cuda",
+          "dtype": "float16",
+          "head_dim": 40,
+          "heads": 3,
+          "iterations": 20,
+          "key_length": 129,
+          "query_length": 7,
+          "reference_block_size": 64,
+          "seed": 20260837,
+          "value_dim": 24,
+          "verify": true,
+          "warmup": 5
+        },
+        "derived": {
+          "compulsory_bandwidth_gb_s_at_median": 0.4222509600466842,
+          "matrix_tflops_at_median": 0.002803622183251146
+        },
+        "environment": {
+          "gpu": {
+            "compute_capability": [
+              12,
+              0
+            ],
+            "index": 0,
+            "multiprocessors": 170,
+            "name": "NVIDIA GeForce RTX 5090",
+            "total_memory_bytes": 34190458880
+          },
+          "machine": "x86_64",
+          "native_extension_loaded": true,
+          "package": "0.1.0.dev0",
+          "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+          "python": "3.12.13",
+          "source_dirty": false,
+          "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+          "torch": "2.10.0+cu128",
+          "torch_cuda_version": "12.8",
+          "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+        },
+        "latency": {
+          "count": 20,
+          "max_ms": 0.3882560133934021,
+          "mean_ms": 0.14787360243499278,
+          "median_ms": 0.1236800029873848,
+          "min_ms": 0.12310399860143661,
+          "p90_ms": 0.14833599478006393,
+          "p99_ms": 0.3785948920249938
+        },
+        "notes": [
+          "matrix_flops counts QK^T and PV multiply-adds only",
+          "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic"
+        ],
+        "output": {
+          "device": "cuda:0",
+          "dtype": "float16",
+          "shape": [
+            1,
+            3,
+            7,
+            24
+          ]
+        },
+        "raw_samples_ms": [
+          0.12732799351215363,
+          0.1236800029873848,
+          0.12374400347471237,
+          0.12374400347471237,
+          0.12348800152540207,
+          0.12348800152540207,
+          0.12352000176906586,
+          0.12329600006341934,
+          0.12374400347471237,
+          0.1260800063610077,
+          0.1236800029873848,
+          0.1236800029873848,
+          0.12364800274372101,
+          0.3882560133934021,
+          0.33740800619125366,
+          0.1249919980764389,
+          0.12345600128173828,
+          0.12358400225639343,
+          0.12355200201272964,
+          0.12310399860143661
+        ],
+        "schema_version": 1,
+        "verification": {
+          "atol": 0.005,
+          "max_absolute_error": 5.960464477539063e-08,
+          "max_relative_error": 0.0045662100456621,
+          "performed": true,
+          "reference": "scaled_dot_product_attention_reference",
+          "rtol": 0.005
+        },
+        "work_estimate": {
+          "compulsory_tensor_bytes_lower_bound": 52224,
+          "matrix_flops": 346752
+        }
+      },
+      "paired_configuration": {
+        "batch": 1,
+        "causal": true,
+        "device": "cuda",
+        "dtype": "float16",
+        "head_dim": 40,
+        "heads": 3,
+        "iterations": 20,
+        "key_length": 129,
+        "query_length": 7,
+        "reference_block_size": 64,
+        "seed": 20260837,
+        "value_dim": 24,
+        "verify": true,
+        "warmup": 5
+      },
+      "shape_class": "tail"
+    }
+  ],
+  "elapsed_wall_seconds": 11.90573328499886,
+  "environment": {
+    "gpu": {
+      "compute_capability": [
+        12,
+        0
+      ],
+      "index": 0,
+      "multiprocessors": 170,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_memory_bytes": 34190458880
+    },
+    "machine": "x86_64",
+    "native_extension_loaded": true,
+    "package": "0.1.0.dev0",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "source_dirty": false,
+    "source_revision": "c91b83b36e7d2800673990f5b4f3913cc7c50f5f",
+    "torch": "2.10.0+cu128",
+    "torch_cuda_version": "12.8",
+    "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+  },
+  "failures": [],
+  "matrix_configuration": {
+    "cases": [],
+    "device": "cuda",
+    "fail_fast": false,
+    "families": [
+      "gemm",
+      "attention",
+      "mla",
+      "experts",
+      "router"
+    ],
+    "iterations": 20,
+    "profile": "flash-attn-4",
+    "seed": 20260814,
+    "verify": true,
+    "warmup": 5
+  },
+  "notes": [
+    "each side independently verifies against its operator reference before comparison",
+    "native/baseline execution order alternates between adjacent cases",
+    "each ratio compares medians for one fixed case and environment",
+    "aggregate ratio statistics are unweighted descriptors across heterogeneous cases and baselines, not an overall speedup",
+    "nested reports retain every raw post-warmup latency sample",
+    "traffic, FLOPs, and tile counts remain analytical unless a profiler report says otherwise"
+  ],
+  "schema_version": 1,
+  "summary": {
+    "completed_by_family": {
+      "attention": 4
+    },
+    "completed_case_count": 4,
+    "failed_case_count": 0,
+    "lower_median_counts": {
+      "baseline": 3,
+      "native": 1,
+      "tie": 0
+    },
+    "native_over_baseline": {
+      "count": 4,
+      "geometric_mean": 4.167988580318792,
+      "maximum": 17.604167021762592,
+      "median": 5.438268497810595,
+      "minimum": 0.7442711578067649
+    },
+    "selected_by_family": {
+      "attention": 4
+    },
+    "selected_by_shape_class": {
+      "decode": 1,
+      "regular": 1,
+      "tail": 2
+    },
+    "selected_case_count": 4,
+    "status": "success",
+    "unattempted_case_count": 0
+  }
+}

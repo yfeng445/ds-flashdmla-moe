@@ -12,7 +12,7 @@ performance comparison or a sustained self-hosted CI result.
 - PyTorch 2.10.0 with CUDA 12.8
 - Native extension loaded with all 14 CUDA dispatcher kernels
 
-The current CUDA-aware test suite passed with `390 passed`. Each paired latency JSON contains
+The current CUDA-aware test suite passed with `427 passed`. Each paired latency JSON contains
 the exact configuration, environment metadata, numerical verification, latency summary, and
 all 20 raw post-warmup samples. Native and baseline reports use identical inputs and shapes.
 
@@ -49,6 +49,25 @@ Every nested native and baseline report retains 20 post-warmup samples.
 These ratios are only paired observations for this machine and configuration. Baselines and
 operator boundaries differ across families, so the aggregate ratio statistics in the JSON are
 unweighted descriptors, not an overall speedup or a cross-family ranking.
+
+## Optional FlashAttention-4 pairs
+
+[`operator-matrix-fa4.json`](operator-matrix-fa4.json) records four exact-dtype Attention pairs
+against the optional `flash-attn-4==4.0.0b22` backend. Both sides use the same generated inputs,
+causal semantics, warmup, iteration count, and numerical reference. The timed FA4 boundary
+includes its BHSD/BSHD layout adapter and output copy.
+
+| Case | Dtype | Native median (ms) | FA4 median (ms) | Native / FA4 | Lower median |
+| --- | --- | ---: | ---: | ---: | --- |
+| Prefill, `B=1,H=4,S=128,Dq=Dv=64` | BF16 | 0.123712 | 0.015472 | 7.996 | FA4 |
+| Tail prefill, `B=2,H=3,S=127,Dq=40,Dv=48` | FP16 | 0.125920 | 0.043712 | 2.881 | FA4 |
+| Decode, `B=2,H=4,Sq=1,Sk=128,Dq=Dv=64` | BF16 | 0.121680 | 0.006912 | 17.604 | FA4 |
+| Tail decode, `B=1,H=3,Sq=7,Sk=129,Dq=40,Dv=24` | FP16 | 0.123680 | 0.166176 | 0.744 | native |
+
+All eight outputs passed the materialized FP32-reference check. Three FA4 medians and one native
+median were lower in this particular run, but several raw samples show substantial desktop-WSL
+variation. The JSON is therefore a reproducible correctness and profiling baseline, not evidence
+that either implementation wins generally.
 
 ## MLA profiler triage
 

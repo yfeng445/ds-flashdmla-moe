@@ -45,7 +45,7 @@ triage 和首轮 CUDA kernel 专项优化。
 | NCCL Expert Parallel | 代码已实现，待双 GPU 验证 | 包括可微 All-to-All 和异步 chunk pipeline |
 | MLA CUDA | end-to-end correctness + 首轮 kernel specialization 已进入 `main` | direct/LoRA query、KV projection/static write、absorbed attention、output projection 均有 FP32 native op；小维度 attention 使用四 warp key partition，低精度、paged cache 与生产级调优仍未实现 |
 | One-sided/NVSHMEM | 未实现 | 当前只有 symmetric-buffer 成本与布局模型 |
-| 性能结论 | 尚不可下结论 | 已有单卡固定 shape、20-case matrix、Kineto 聚合和四组同 dtype FA4 对照，但仍缺持续 runner、Nsight trace 与 CUTLASS；当前 native Attention 明显慢于 FA4 |
+| 性能结论 | 尚不可下结论 | 已有单卡固定 shape、20-case matrix、Kineto 聚合和四组同 dtype FA4 对照，但仍缺持续 runner、Nsight trace 与 CUTLASS；正式快照中 FA4 三组 median 更低、native 一组更低，原始样本有明显 WSL 波动 |
 
 ## 3. 代码地图
 
@@ -160,10 +160,12 @@ causal/non-causal、regular/tail/decode、非连续 fallback 和 mixed-dtype rej
 
 `benchmarks/matrix.py --profile flash-attn-4` 使用 `flash-attn-4==4.0.0b22` 运行四组完全
 同 dtype/config 的 paired case。四组 native 与 FA4 side 都通过 FP32 materialized reference
-校验；首轮 20-sample 本机 median 的 native/FA4 比值为 2.081、4.470、3.439 与 19.987，
-即四组都是 FA4 更低。这个差距符合当前 row-wise scalar kernel 尚无二维 tiling/Tensor Core
-的事实；它是后续 profiler/tuning 的基线，不是跨机器或生产 workload 结论。FA4 仍保持可选
-依赖，避免 resolver 替换项目 PyTorch/CUDA 栈。
+校验；正式 20-sample 快照的 native/FA4 median 比值为 7.996、2.881、17.604 与 0.744，前三组
+FA4 更低，tail decode 一组 native 更低。原始样本存在明显桌面 WSL 波动，因此这里保留逐样本
+JSON 作为后续 profiler/tuning 基线，不把单次排序外推为跨机器或生产 workload 结论。当前
+row-wise scalar kernel 仍缺二维 tiling/Tensor Core；FA4 继续保持可选依赖，避免 resolver 替换
+项目 PyTorch/CUDA 栈。报告位于
+`validation/single-gpu/2026-08-14-rtx5090-cu128/operator-matrix-fa4.json`。
 
 ## 5. 当前阻塞与已知缺口
 
