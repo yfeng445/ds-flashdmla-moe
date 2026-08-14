@@ -246,6 +246,26 @@ On a native build, use `--device cuda --backend cuda --dtype float32`. The
 reported TFLOP/s-equivalent counts only the dense gate projection; sigmoid,
 group scoring, selection, gather, and normalization remain outside that count.
 
+The paired single-GPU matrix runner exercises all native operator families over
+representative regular, tail, decode, and skew cases:
+
+```bash
+python benchmarks/matrix.py \
+  --device cuda --profile representative \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/operator-matrix-representative.json
+```
+
+The representative profile contains 20 pairs: four GEMM, four Attention, five
+MLA, four expert, and three router cases. Each pair keeps the same seed, shape,
+dtype, verification policy, and measurement controls while changing only the
+backend selector. The baseline is family-specific: PyTorch/cuBLAS for GEMM,
+SDPA for Attention, absorbed PyTorch MLA, padded PyTorch experts, and the
+PyTorch router reference. `--list-cases` prints the selected manifest without a
+GPU; `--family` and `--case` narrow an execution. Nested reports retain every
+raw sample and numerical check. Cross-family ratio statistics are unweighted
+descriptors over heterogeneous workloads and baselines, not an overall speedup.
+
 The Expert Parallel validator is launched with `torchrun`; rank zero writes a
 single report containing the route-count matrix, per-rank metadata, global
 maximum latency samples, load-skew/capacity diagnostics, an overlap contract,
@@ -291,8 +311,8 @@ are reported separately from routed expert compute.
 The checked-in [RTX 5090 / CUDA 12.8 single-GPU snapshot](validation/single-gpu/2026-08-14-rtx5090-cu128/README.md)
 contains fixed-shape configurations, numerical errors, latency summaries, and raw samples for
 the native GEMM, Attention, MLA, expert, and router paths plus matching PyTorch/cuBLAS/SDPA
-baselines. It is a local diagnostic snapshot, not a general performance claim or a replacement
-for self-hosted GPU CI.
+baselines. It also contains the 20-case representative matrix described above. It is a local
+diagnostic snapshot, not a general performance claim or a replacement for self-hosted GPU CI.
 
 ## Learning material
 

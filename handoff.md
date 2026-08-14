@@ -24,8 +24,9 @@ correctness-first 的 DeepSeek MLA + MoE 学习与实现项目。核心原则是
 
 当前可视为 **v0.1 correctness + local single-GPU smoke milestone**。`main` 的
 CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并注册 14 个 native
-算子；RTX 5090 本地环境也已跑通完整 CUDA 测试和固定 shape smoke benchmark。尚未完成
-持续 self-hosted GPU CI、双 GPU NCCL、profiler 和多 shape 主流实现对照，因此仍不具备生产性能结论。
+算子；RTX 5090 本地环境也已跑通完整 CUDA 测试、固定 shape smoke benchmark 和 20-case
+代表性 shape matrix。尚未完成持续 self-hosted GPU CI、双 GPU NCCL、profiler 和主流
+第三方实现对照，因此仍不具备生产性能结论。
 
 粗略进度约为 **85%**。这里的百分比衡量的是学习/研究仓库的完成度，不代表生产可用性。
 
@@ -39,7 +40,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 | NCCL Expert Parallel | 代码已实现，待双 GPU 验证 | 包括可微 All-to-All 和异步 chunk pipeline |
 | MLA CUDA | end-to-end correctness backend 已进入 `main` | direct/LoRA query、KV projection/static write、absorbed attention、output projection 均有 FP32 native op；低精度、paged cache 与生产级调优仍未实现 |
 | One-sided/NVSHMEM | 未实现 | 当前只有 symmetric-buffer 成本与布局模型 |
-| 性能结论 | 尚不可下结论 | 已有单卡固定 shape 原始样本和 PyTorch/cuBLAS/SDPA 对照，但仍缺持续 runner、多 shape 与 Nsight trace |
+| 性能结论 | 尚不可下结论 | 已有单卡固定 shape 与 20-case matrix 原始样本，但仍缺持续 runner、Nsight trace 和 CUTLASS/主流 FlashAttention 对照 |
 
 ## 3. 代码地图
 
@@ -52,10 +53,10 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 - `src/ds_flash_mla_moe/expert_ops.py`：active-row expert-major SwiGLU 接口。
 - `src/ds_flash_mla_moe/expert_parallel.py`：Gloo/NCCL Expert Parallel 协议与 autograd。
 - `src/ds_flash_mla_moe/ops.py`：PyTorch dispatcher、FakeTensor、autograd 和 CUDA 注册。
-- `src/ds_flash_mla_moe/*_benchmarking.py`：结构化 benchmark 与报告模型。
+- `src/ds_flash_mla_moe/*_benchmarking.py`：结构化 benchmark、成对 shape matrix 与报告模型。
 - `csrc/`：supported CUDA/C++ extension 源码。
 - `csrc/experimental/`：未验证的课程时期原型，不属于 supported API。
-- `benchmarks/`：GEMM、Attention、MLA、router、experts、Expert Parallel CLI。
+- `benchmarks/`：GEMM、Attention、MLA、router、experts、成对 matrix、Expert Parallel CLI。
 - `tests/`：数值、梯度、dispatcher、benchmark schema 和 distributed contract 测试。
 - `validation/`：带环境、误差和原始 latency 的硬件验证快照。
 - `docs/`：讲义、练习、阅读顺序和参考资料。
@@ -69,7 +70,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 
 ```text
 pytest -ra --strict-markers -W error::UserWarning
-285 passed, 69 skipped in 11.16s
+295 passed, 69 skipped in 9.56s
 ```
 
 另已完成：
@@ -106,6 +107,12 @@ latency 汇总和原始样本保存在
 `validation/single-gpu/2026-08-14-rtx5090-cu128/`。这仍是本地快照，不是持续
 self-hosted CI 或普适性能结论。
 
+同一目录还保存了 20-case representative matrix：GEMM 4 组、Attention 4 组、MLA 5 组、
+experts 4 组、router 3 组，共覆盖 5 个 regular、8 个 tail、4 个 decode 和 3 个 skew case。
+20 组 native/baseline 均各自通过数值验证并保留 20 个 post-warmup raw samples。不同 family
+使用 cuBLAS、SDPA、absorbed MLA、padded experts 或 PyTorch router reference，因此跨 case
+汇总比值只是未加权描述统计，不是总体加速比。
+
 当前固定 shape 的完整 MLA 数据为：`prefill_with_cache` native 1.155536 ms、absorbed
 PyTorch 2.636864 ms；`decode_with_static_write` native 1.028400 ms、absorbed PyTorch
 2.058480 ms。这里只记录本机诊断结果，不外推到其他 shape、dtype 或硬件。
@@ -132,19 +139,21 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
 - MoE kernel 尚无 async copy、TMA、WGMMA 或 profiler-driven tuning；
 - staged MLA 已覆盖 FP32 correctness pipeline，但 prefill/decode 仍共用 correctness-first
   kernel；尚无 FP16/BF16、paged/per-slot cache、异步拷贝或 profiler-driven fusion；
+- 代表性单 GPU shape matrix 已覆盖 regular/tail/decode/skew，但尚未接入 CUTLASS 或主流
+  FlashAttention，也没有长上下文与更多低精度矩阵；
 - chunk pipeline 只证明了软件异步协议，尚无 profiler 证据证明物理 overlap；
 - one-sided symmetric memory 只有分析模型，没有 NVSHMEM/PGAS backend。
 
 ## 6. 下一步执行顺序
 
-1. 注册并运行单 GPU self-hosted runner，让现有 354-test + 9-paired-benchmark 本地快照变成可持续
-   workflow artifact。
+1. 注册并运行单 GPU self-hosted runner，让现有 354-test、9 组固定快照和 20-case matrix
+   变成可持续 workflow artifact。
 2. 在双 GPU runner 上验证 NCCL FP32、FP16 WMMA 与 chunked pipeline 的 forward/backward，
    保存每 rank 原始 latency 和通信量。
 3. 用 Nsight Systems/Compute 检查 Attention、MLA、router、experts 的 kernel bottleneck，
    并验证 NCCL chunk pipeline 是否真正 overlap。
-4. 把当前单 shape 的 PyTorch/cuBLAS/SDPA 对照扩展为代表性 prefill/decode、规则/尾块和
-   skew shape 矩阵；如可用，再加入 CUTLASS 或主流 FlashAttention。
+4. 在现有 20-case matrix 中加入可用的 CUTLASS 或主流 FlashAttention baseline，并按
+   profiler 结果补充长上下文与低精度 case，而不是继续堆叠任意 shape。
 5. 根据 profiler 把当前 staged MLA correctness backend 扩展为专用 prefill/decode、
    FP16/BF16 和 paged/per-slot cache，再考虑 FA2/FA3、TMA/WGMMA、router 优化和 one-sided EP。
 
@@ -169,6 +178,14 @@ DS_FLASH_BUILD_CUDA=1 python -m pip install --no-build-isolation .
 pytest -ra --strict-markers -W error::UserWarning
 ```
 
+代表性单 GPU 成对矩阵：
+
+```bash
+python benchmarks/matrix.py --device cuda --profile representative \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/operator-matrix-representative.json
+```
+
 两 rank Gloo smoke test：
 
 ```bash
@@ -186,7 +203,7 @@ torchrun --master-addr=127.0.0.1 --master-port=29572 \
 ## 8. 分支与协作状态
 
 - PR #1 已关闭且未 merge；其中的实现内容后来直接应用到 `main`。
-- `main` 当前已经包含 staged end-to-end MLA CUDA、两篇衍生面试文档和 14-operator native extension。
+- `main` 当前已经包含 staged end-to-end MLA CUDA、20-case operator matrix、两篇衍生面试文档和 14-operator native extension。
 - `AI INFRA.ipynb` 是原始面试笔记；后续整理继续写入独立 Markdown，不覆盖原文件。
 - 单 GPU JSON 是硬件相关证据快照；不要把它解释成跨实现性能领先结论。
 

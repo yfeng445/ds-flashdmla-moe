@@ -149,6 +149,12 @@ jobs:
           --n-groups 4 --topk-groups 2 --hot-expert-bias 0.4
           --warmup 5 --iterations 20 --backward
           --output benchmark-results/baseline-router-reference.json
+      - name: Run representative paired operator matrix
+        run: >-
+          python benchmarks/matrix.py
+          --device cuda --profile representative
+          --warmup 5 --iterations 20 --seed 20260814
+          --output benchmark-results/operator-matrix-representative.json
       - uses: actions/upload-artifact@v4
         with:
           name: cuda-smoke-report

@@ -134,7 +134,40 @@ reference，却让测量对象发生变化。
 若一个实现不支持某种输入，应报告“不支持”，不能悄悄改 dtype、pad shape 或删除 mask 后
 继续把数字放在同一张表里。
 
-## 7.7 分布式算子的计时边界
+## 7.7 代表性单 GPU shape matrix
+
+单个规整 shape 只能证明该点能够运行，不能说明 tail、decode 或负载倾斜时的行为。仓库的
+`benchmarks/matrix.py` 把五类 native 算子与各自的 PyTorch baseline 组织为固定矩阵：
+
+| Family | Case 数 | 覆盖重点 | Baseline |
+| --- | ---: | --- | --- |
+| GEMM | 4 | 规整、M/N/K 尾块、单行 decode、alpha/beta epilogue | PyTorch/cuBLAS |
+| Attention | 4 | prefill、decode、非 2 次幂序列、不同 QK/V 宽度 | PyTorch SDPA |
+| MLA | 5 | 完整 prefill、static-cache decode、direct/LoRA query、尾块 rank | absorbed PyTorch |
+| Experts | 4 | FP32/FP16、空 expert、行数与维度尾块、负载倾斜 | padded PyTorch |
+| Router | 3 | 规整、尾块、hot-expert skew | PyTorch reference |
+
+运行完整矩阵：
+
+```bash
+python benchmarks/matrix.py \
+  --device cuda --profile representative \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/operator-matrix-representative.json
+```
+
+每一对配置只能修改 backend selector；seed、shape、dtype、预热、迭代数和验证策略必须完全
+相同。native 与 baseline 分别先对 operator reference 做数值验证，再进入比较。相邻 case
+交替先运行 native 或 baseline，以减小固定执行顺序造成的偏差；单个 case 失败会被写入报告，
+其余 case 继续执行，CLI 最终以非零状态退出。`--list-cases` 可在没有 GPU 时检查 manifest，
+`--family` 与 `--case` 用于缩小复现实验范围。
+
+不同 family 使用的 baseline 并不相同，工作量与算子边界也不同。因此每个
+`native_median / baseline_median` 只能解释对应 case。报告中的跨 case minimum、median、
+geometric mean 和 maximum 是未加权描述统计，不是总体 speedup；不应把 GEMM/cuBLAS、
+Attention/SDPA 和 MoE/reference 的比值混成一个性能结论。
+
+## 7.8 分布式算子的计时边界
 
 多 rank 算子不能只测 rank 0。对第 `n` 次迭代，先让所有 rank 在相同边界开始，再取各
 rank 完成时间的最大值：
@@ -231,7 +264,7 @@ F_{router}=2TDE,
 CUDA 验证还必须要求 indices 与稳定 tie-break reference 完全一致；只比较归一化 weights
 可能让选错但分数相同的 expert 漏过测试。
 
-## 7.8 阶段分解不是端到端求和
+## 7.9 阶段分解不是端到端求和
 
 分布式流水线可以为每个阶段记录独立 latency，但需区分两种 max：
 
@@ -253,7 +286,7 @@ t_{e2e}\ne\sum_s t_{stage,s},
 线。端到端 pass 用于报告用户可见 latency，插入同步的 profiling pass 用于归因。二者
 必须分开运行、分别保留 raw samples。
 
-## 7.9 负载分布与流水线模型也要保留口径
+## 7.10 负载分布与流水线模型也要保留口径
 
 EP 报告不能用 `total_routes / world_size` 代替每 rank 的实际负载。至少分别保存 send、
 receive、cross-rank send、cross-rank receive 和 per-expert counts，再从原始整数计算
