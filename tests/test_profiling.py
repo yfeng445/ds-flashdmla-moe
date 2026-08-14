@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Self
 
 import pytest
 
@@ -38,7 +37,7 @@ class FakeProfiler:
         self.events = events
         self.exported_trace: str | None = None
 
-    def __enter__(self) -> Self:
+    def __enter__(self):
         return self
 
     def __exit__(self, *_args: object) -> None:
