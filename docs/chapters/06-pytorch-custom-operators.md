@@ -198,9 +198,9 @@ sizes，应把这次同步视为协议成本并在 benchmark 中明确，而不�
 公开 GEMM API 采用三种 backend 语义：`reference` 总是运行可微规范；`auto` 只在输入是
 contiguous FP32 CUDA 二维矩阵且 native schema 已注册时选择 kernel；`cuda` 对任何不满足
 条件的输入直接报错。这个边界防止 benchmark 配置写着 CUDA，实际却悄悄测到 reference。
-attention、router 与 expert wrapper 延续同一约定，并各自公开 capability flag；Attention
-wrapper 的 CUDA dtype 集合是 FP16/BF16/FP32，expert 是 FP16/FP32，而 router 与 route 原生
-路径仍只有 FP32。性能实验应显式选择 backend，而不是根据运行环境猜测实际命中的实现。
+attention、MLA、router 与 expert wrapper 延续同一约定，并各自公开 capability flag；Attention
+和 staged MLA 的 CUDA dtype 集合是 FP16/BF16/FP32，expert 是 FP16/FP32，而 router 与 route
+原生路径仍只有 FP32。性能实验应显式选择 backend，而不是根据运行环境猜测实际命中的实现。
 
 ## 6.6 构建与验证分层
 

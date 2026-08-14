@@ -19,6 +19,12 @@ from ds_flash_mla_moe import (
 from ds_flash_mla_moe.ops import (
     mla_absorbed_attention as dispatch_mla_absorbed_attention,
 )
+from ds_flash_mla_moe.ops import (
+    mla_cache_projection,
+    mla_output_projection,
+    mla_query_lora_projection,
+    mla_query_projection,
+)
 
 
 def make_fixture(*, direct_query: bool = False):
@@ -63,17 +69,79 @@ def make_fixture(*, direct_query: bool = False):
     return x, config, weights
 
 
-def cuda_weights(weights: MLAWeights, *, requires_grad: bool = False) -> MLAWeights:
+def cuda_weights(
+    weights: MLAWeights,
+    *,
+    dtype: torch.dtype = torch.float32,
+    requires_grad: bool = False,
+) -> MLAWeights:
     return MLAWeights(
         **{
             field.name: (
-                getattr(weights, field.name).float().cuda().detach().requires_grad_(requires_grad)
+                getattr(weights, field.name)
+                .to(device="cuda", dtype=dtype)
+                .detach()
+                .requires_grad_(requires_grad)
                 if getattr(weights, field.name) is not None
                 else None
             )
             for field in fields(MLAWeights)
         }
     )
+
+
+def _mla_cuda_tolerances(
+    dtype: torch.dtype,
+    *,
+    backward: bool = False,
+) -> tuple[float, float]:
+    if dtype == torch.float32:
+        return (1e-3, 1e-3) if backward else (5e-5, 5e-5)
+    if dtype == torch.float16:
+        return (8e-2, 8e-2) if backward else (3e-2, 3e-2)
+    return (3e-1, 3e-1) if backward else (1e-1, 1e-1)
+
+
+def _mla_cuda_stage_tolerances(dtype: torch.dtype) -> tuple[float, float]:
+    if dtype == torch.float32:
+        return 5e-5, 5e-5
+    if dtype == torch.float16:
+        return 5e-3, 5e-3
+    return 2e-2, 2e-2
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_mla_reference_projection_stages_preserve_storage_dtype(dtype: torch.dtype) -> None:
+    x, config, weights = make_fixture()
+    x = x.to(dtype)
+    weights = MLAWeights(
+        **{
+            field.name: (
+                getattr(weights, field.name).to(dtype)
+                if getattr(weights, field.name) is not None
+                else None
+            )
+            for field in fields(MLAWeights)
+        }
+    )
+    positions = torch.arange(x.shape[1])
+
+    cache = build_mla_cache(x, config, weights, positions=positions, backend="reference")
+    q_nope, q_pe = torch.ops.ds_flash_mla_moe.mla_query_lora_projection.default(
+        x,
+        weights.wq_a,
+        weights.q_norm_weight,
+        weights.wq_b,
+        positions,
+        config.n_heads,
+        config.qk_nope_head_dim,
+        config.qk_rope_head_dim,
+        config.rope_theta,
+        config.rms_norm_eps,
+    )
+
+    assert cache.kv.dtype == cache.pe.dtype == dtype
+    assert q_nope.dtype == q_pe.dtype == dtype
 
 
 @pytest.mark.parametrize("direct_query", [False, True])
@@ -354,14 +422,16 @@ def test_explicit_cuda_mla_rejects_attention_mask() -> None:
 @pytest.mark.parametrize("query_length", [1, 3, 6])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("direct_query", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_cuda_absorbed_mla_matches_reference(
     query_length: int,
     causal: bool,
     direct_query: bool,
+    dtype: torch.dtype,
 ) -> None:
     x, config, weights = make_fixture(direct_query=direct_query)
-    x = x.float().cuda()
-    weights = cuda_weights(weights)
+    x = x.to(device="cuda", dtype=dtype)
+    weights = cuda_weights(weights, dtype=dtype)
     positions = torch.arange(x.shape[1], device="cuda")
     cache = build_mla_cache(x, config, weights, positions=positions, backend="cuda")
     reference_cache = build_mla_cache(
@@ -392,7 +462,138 @@ def test_cuda_absorbed_mla_matches_reference(
             query_positions=query_positions,
             causal=causal,
         )
-    torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
+    rtol, atol = _mla_cuda_tolerances(dtype)
+    assert actual.dtype == cache.kv.dtype == reference_cache.kv.dtype == dtype
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(
+    not cuda_mla_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.cuda
+@pytest.mark.parametrize("direct_query", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cuda_mla_projection_stages_match_reference(
+    direct_query: bool,
+    dtype: torch.dtype,
+) -> None:
+    x, config, weights = make_fixture(direct_query=direct_query)
+    x = x.to(device="cuda", dtype=dtype)
+    weights = cuda_weights(weights, dtype=dtype)
+    positions = torch.arange(x.shape[1], device="cuda")
+    rtol, atol = _mla_cuda_stage_tolerances(dtype)
+
+    if direct_query:
+        assert weights.wq is not None
+        actual_query = mla_query_projection(
+            x,
+            weights.wq,
+            positions,
+            n_heads=config.n_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            rope_theta=config.rope_theta,
+            backend="cuda",
+        )
+        expected_query = mla_query_projection(
+            x,
+            weights.wq,
+            positions,
+            n_heads=config.n_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            rope_theta=config.rope_theta,
+            backend="reference",
+        )
+    else:
+        assert weights.wq_a is not None
+        assert weights.q_norm_weight is not None
+        assert weights.wq_b is not None
+        query_arguments = (
+            x,
+            weights.wq_a,
+            weights.q_norm_weight,
+            weights.wq_b,
+            positions,
+        )
+        query_keywords = {
+            "n_heads": config.n_heads,
+            "qk_nope_head_dim": config.qk_nope_head_dim,
+            "qk_rope_head_dim": config.qk_rope_head_dim,
+            "rope_theta": config.rope_theta,
+            "rms_norm_eps": config.rms_norm_eps,
+        }
+        actual_query = mla_query_lora_projection(
+            *query_arguments,
+            **query_keywords,
+            backend="cuda",
+        )
+        expected_query = mla_query_lora_projection(
+            *query_arguments,
+            **query_keywords,
+            backend="reference",
+        )
+
+    actual_cache = mla_cache_projection(
+        x,
+        weights.wkv_a,
+        weights.kv_norm_weight,
+        positions,
+        kv_lora_rank=config.kv_lora_rank,
+        rope_theta=config.rope_theta,
+        rms_norm_eps=config.rms_norm_eps,
+        backend="cuda",
+    )
+    expected_cache = mla_cache_projection(
+        x,
+        weights.wkv_a,
+        weights.kv_norm_weight,
+        positions,
+        kv_lora_rank=config.kv_lora_rank,
+        rope_theta=config.rope_theta,
+        rms_norm_eps=config.rms_norm_eps,
+        backend="reference",
+    )
+    heads = torch.randn(
+        x.shape[0],
+        x.shape[1],
+        config.n_heads,
+        config.v_head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    actual_output = mla_output_projection(heads, weights.wo, backend="cuda")
+    expected_output = mla_output_projection(heads, weights.wo, backend="reference")
+
+    for actual, expected in (*zip(actual_query, expected_query), *zip(actual_cache, expected_cache)):
+        assert actual.dtype == expected.dtype == dtype
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(actual_output, expected_output, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(
+    not cuda_mla_available(),
+    reason="requires a built native extension and a CUDA device",
+)
+@pytest.mark.cuda
+def test_cuda_mla_rejects_mixed_storage_dtypes() -> None:
+    x, config, weights = make_fixture()
+    x = x.to(device="cuda", dtype=torch.float16)
+    weights = cuda_weights(weights, dtype=torch.float16)
+    weights = MLAWeights(
+        **{
+            field.name: (
+                getattr(weights, field.name).to(torch.bfloat16)
+                if field.name == "wkv_a"
+                else getattr(weights, field.name)
+            )
+            for field in fields(MLAWeights)
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="same dtype"):
+        build_mla_cache(x, config, weights, backend="cuda")
 
 
 @pytest.mark.skipif(
@@ -411,20 +612,22 @@ def test_cuda_absorbed_mla_matches_reference(
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_cuda_absorbed_attention_dimension_dispatch_matches_reference(
     latent_dim: int,
     rope_dim: int,
     value_dim: int,
     strided: bool,
     causal: bool,
+    dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(20260814)
     batch, query_length, heads, key_length, nope_dim = 2, 5, 3, 17, 19
 
     def make_tensor(*shape: int) -> torch.Tensor:
         if not strided:
-            return torch.randn(*shape, device="cuda")
-        storage = torch.randn(*shape[:-1], shape[-1] * 2, device="cuda")
+            return torch.randn(*shape, device="cuda", dtype=dtype)
+        storage = torch.randn(*shape[:-1], shape[-1] * 2, device="cuda", dtype=dtype)
         return storage[..., ::2]
 
     q_nope = make_tensor(batch, query_length, heads, nope_dim)
@@ -457,7 +660,9 @@ def test_cuda_absorbed_attention_dimension_dispatch_matches_reference(
         )
 
     assert actual.is_contiguous()
-    torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
+    rtol, atol = _mla_cuda_stage_tolerances(dtype)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
 
 @pytest.mark.skipif(
@@ -468,11 +673,12 @@ def test_cuda_absorbed_attention_dimension_dispatch_matches_reference(
     "ignore:Attempting to run cuBLAS, but there was no current CUDA context!:UserWarning"
 )
 @pytest.mark.cuda
-def test_cuda_absorbed_mla_backward_matches_reference() -> None:
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cuda_absorbed_mla_backward_matches_reference(dtype: torch.dtype) -> None:
     x, config, weights = make_fixture()
-    actual_x = x.float().cuda().requires_grad_(True)
+    actual_x = x.to(device="cuda", dtype=dtype).requires_grad_(True)
     expected_x = actual_x.detach().clone().requires_grad_(True)
-    actual_weights = cuda_weights(weights, requires_grad=True)
+    actual_weights = cuda_weights(weights, dtype=dtype, requires_grad=True)
     expected_weights = MLAWeights(
         **{
             field.name: (
@@ -518,8 +724,15 @@ def test_cuda_absorbed_mla_backward_matches_reference() -> None:
     actual.backward(upstream)
     expected.backward(upstream)
 
-    torch.testing.assert_close(actual, expected, rtol=5e-5, atol=5e-5)
-    torch.testing.assert_close(actual_x.grad, expected_x.grad, rtol=1e-3, atol=1e-3)
+    forward_rtol, forward_atol = _mla_cuda_tolerances(dtype)
+    backward_rtol, backward_atol = _mla_cuda_tolerances(dtype, backward=True)
+    torch.testing.assert_close(actual, expected, rtol=forward_rtol, atol=forward_atol)
+    torch.testing.assert_close(
+        actual_x.grad,
+        expected_x.grad,
+        rtol=backward_rtol,
+        atol=backward_atol,
+    )
     for field in fields(MLAWeights):
         actual_weight = getattr(actual_weights, field.name)
         expected_weight = getattr(expected_weights, field.name)
@@ -527,8 +740,8 @@ def test_cuda_absorbed_mla_backward_matches_reference() -> None:
             torch.testing.assert_close(
                 actual_weight.grad,
                 expected_weight.grad,
-                rtol=1e-3,
-                atol=1e-3,
+                rtol=backward_rtol,
+                atol=backward_atol,
             )
 
 
@@ -573,10 +786,13 @@ def test_cuda_absorbed_mla_uses_current_stream() -> None:
     reason="requires a built native extension and a CUDA device",
 )
 @pytest.mark.cuda
-def test_cuda_static_cache_projection_write_matches_reference_on_current_stream() -> None:
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cuda_static_cache_projection_write_matches_reference_on_current_stream(
+    dtype: torch.dtype,
+) -> None:
     x, config, weights = make_fixture()
-    x = x.float().cuda()
-    weights = cuda_weights(weights)
+    x = x.to(device="cuda", dtype=dtype)
+    weights = cuda_weights(weights, dtype=dtype)
     positions = torch.arange(11, 11 + x.shape[1], device="cuda")
     static = allocate_mla_static_cache(
         batch_size=x.shape[0],
@@ -614,8 +830,9 @@ def test_cuda_static_cache_projection_write_matches_reference_on_current_stream(
         backend="reference",
     )
 
-    torch.testing.assert_close(cache.kv, expected.kv, rtol=5e-5, atol=5e-5)
-    torch.testing.assert_close(cache.pe, expected.pe, rtol=5e-5, atol=5e-5)
+    rtol, atol = _mla_cuda_stage_tolerances(dtype)
+    torch.testing.assert_close(cache.kv, expected.kv, rtol=rtol, atol=atol)
+    torch.testing.assert_close(cache.pe, expected.pe, rtol=rtol, atol=atol)
     torch.testing.assert_close(cache.positions, positions)
     assert static.valid_length == x.shape[1]
     assert pointers == (

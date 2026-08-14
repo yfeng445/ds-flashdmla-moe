@@ -18,7 +18,7 @@ from .mla_benchmarking import MLABenchmarkConfig, benchmark_mla
 from .router_benchmarking import RouterBenchmarkConfig, benchmark_router
 
 MatrixFamily = Literal["gemm", "attention", "mla", "experts", "router"]
-MatrixProfile = Literal["smoke", "representative", "flash-attn-4"]
+MatrixProfile = Literal["smoke", "representative", "flash-attn-4", "mla-low-precision"]
 MatrixSide = Literal["native", "baseline"]
 ShapeClass = Literal["regular", "tail", "decode", "skew"]
 BenchmarkConfig = (
@@ -49,6 +49,12 @@ _FLASH_ATTN_4_CASES = {
     "attention_fa4_decode_bfloat16",
     "attention_fa4_decode_tail_float16",
 }
+_MLA_LOW_PRECISION_CASES = {
+    "mla_low_precision_prefill_bfloat16",
+    "mla_low_precision_prefill_tail_float16",
+    "mla_low_precision_decode_bfloat16",
+    "mla_low_precision_decode_tail_float16",
+}
 
 
 @dataclass(frozen=True)
@@ -72,8 +78,15 @@ class BenchmarkMatrixConfig:
             raise ValueError("matrix benchmark device must be a valid torch device") from error
         if device.type != "cuda":
             raise ValueError("the paired native matrix requires a CUDA device")
-        if self.profile not in {"smoke", "representative", "flash-attn-4"}:
-            raise ValueError("profile must be smoke, representative, or flash-attn-4")
+        if self.profile not in {
+            "smoke",
+            "representative",
+            "flash-attn-4",
+            "mla-low-precision",
+        }:
+            raise ValueError(
+                "profile must be smoke, representative, flash-attn-4, or mla-low-precision"
+            )
         if self.warmup < 0 or self.iterations <= 0:
             raise ValueError("warmup must be non-negative and iterations must be positive")
         if not self.families:
@@ -463,6 +476,93 @@ def _mla_cases(config: BenchmarkMatrixConfig, start_seed: int) -> list[Benchmark
     return cases
 
 
+def _mla_low_precision_cases(
+    config: BenchmarkMatrixConfig,
+    start_seed: int,
+) -> list[BenchmarkMatrixCase]:
+    regular = {
+        "batch": 1,
+        "sequence_length": 128,
+        "model_dim": 128,
+        "n_heads": 4,
+        "q_lora_rank": 32,
+        "kv_lora_rank": 32,
+        "qk_nope_head_dim": 32,
+        "qk_rope_head_dim": 16,
+        "v_head_dim": 32,
+    }
+    tail = {
+        "batch": 1,
+        "sequence_length": 127,
+        "model_dim": 96,
+        "n_heads": 3,
+        "q_lora_rank": 17,
+        "kv_lora_rank": 19,
+        "qk_nope_head_dim": 24,
+        "qk_rope_head_dim": 10,
+        "v_head_dim": 20,
+    }
+    shapes = (
+        (
+            "mla_low_precision_prefill_bfloat16",
+            "regular",
+            "BF16 full prefill with low-precision staged storage",
+            regular,
+            "prefill_with_cache",
+            "bfloat16",
+        ),
+        (
+            "mla_low_precision_prefill_tail_float16",
+            "tail",
+            "FP16 full prefill with tail dimensions",
+            tail,
+            "prefill_with_cache",
+            "float16",
+        ),
+        (
+            "mla_low_precision_decode_bfloat16",
+            "decode",
+            "BF16 static-cache write and single-token decode",
+            regular,
+            "decode_with_static_write",
+            "bfloat16",
+        ),
+        (
+            "mla_low_precision_decode_tail_float16",
+            "tail",
+            "FP16 static-cache decode with tail dimensions",
+            {**tail, "sequence_length": 129},
+            "decode_with_static_write",
+            "float16",
+        ),
+    )
+    cases = []
+    for offset, (name, shape_class, description, shape, workload, dtype) in enumerate(shapes):
+        native = MLABenchmarkConfig(
+            **shape,
+            dtype=dtype,
+            device=config.device,
+            implementation="cuda",
+            workload=workload,
+            warmup=config.warmup,
+            iterations=config.iterations,
+            seed=start_seed + offset,
+            verify=config.verify,
+        )
+        cases.append(
+            BenchmarkMatrixCase(
+                name=name,
+                family="mla",
+                shape_class=shape_class,
+                description=description,
+                baseline_label="pytorch_absorbed",
+                native_config=native,
+                baseline_config=replace(native, implementation="absorbed"),
+            )
+        )
+    return cases
+
+
 def _expert_cases(config: BenchmarkMatrixConfig, start_seed: int) -> list[BenchmarkMatrixCase]:
     shapes = (
         (
@@ -616,6 +716,7 @@ def build_benchmark_matrix_cases(
         _expert_cases,
         _router_cases,
         _flash_attention_4_cases,
+        _mla_low_precision_cases,
     )
     all_cases: list[BenchmarkMatrixCase] = []
     next_seed = config.seed
@@ -630,11 +731,14 @@ def build_benchmark_matrix_cases(
         raise ValueError(f"unknown matrix case names: {', '.join(missing)}")
     selected = [case for case in all_cases if case.family in config.families]
     if config.profile == "representative":
-        selected = [case for case in selected if case.name not in _FLASH_ATTN_4_CASES]
+        optional_cases = _FLASH_ATTN_4_CASES | _MLA_LOW_PRECISION_CASES
+        selected = [case for case in selected if case.name not in optional_cases]
     elif config.profile == "smoke":
         selected = [case for case in selected if case.name in _SMOKE_CASES]
-    else:
+    elif config.profile == "flash-attn-4":
         selected = [case for case in selected if case.name in _FLASH_ATTN_4_CASES]
+    else:
+        selected = [case for case in selected if case.name in _MLA_LOW_PRECISION_CASES]
     if config.cases:
         selected = [case for case in selected if case.name in config.cases]
     if not selected:

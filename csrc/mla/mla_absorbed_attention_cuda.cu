@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -30,16 +31,17 @@ __device__ __forceinline__ float warp_sum(float value) {
 // an independent online-softmax state, then warp zero performs one stable merge
 // and the latent-to-value projection. This removes block-wide barriers from the
 // per-key loop while preserving the generic strided-tensor contract.
-__global__ void mla_absorbed_attention_warp_partition_float_kernel(
-    const float* __restrict__ q_nope,
-    const float* __restrict__ q_pe,
-    const float* __restrict__ kv,
-    const float* __restrict__ pe,
-    const float* __restrict__ key_up,
-    const float* __restrict__ value_up,
+template <typename scalar_t>
+__global__ void mla_absorbed_attention_warp_partition_kernel(
+    const scalar_t* __restrict__ q_nope,
+    const scalar_t* __restrict__ q_pe,
+    const scalar_t* __restrict__ kv,
+    const scalar_t* __restrict__ pe,
+    const scalar_t* __restrict__ key_up,
+    const scalar_t* __restrict__ value_up,
     const int64_t* __restrict__ query_positions,
     const int64_t* __restrict__ key_positions,
-    float* __restrict__ output,
+    scalar_t* __restrict__ output,
     int64_t heads,
     int64_t query_length,
     int64_t key_length,
@@ -99,9 +101,9 @@ __global__ void mla_absorbed_attention_warp_partition_float_kernel(
     float accumulator = 0.0F;
     for (int64_t column = 0; column < nope_dim; ++column) {
       accumulator = fmaf(
-          q_nope[q_nope_offset + column * q_nope_stride_dim],
-          key_up[key_up_offset + column * key_up_stride_nope +
-                 lane * key_up_stride_latent],
+          static_cast<float>(q_nope[q_nope_offset + column * q_nope_stride_dim]),
+          static_cast<float>(key_up[key_up_offset + column * key_up_stride_nope +
+                                    lane * key_up_stride_latent]),
           accumulator);
     }
     shared_q_latent[lane] = accumulator;
@@ -125,12 +127,12 @@ __global__ void mla_absorbed_attention_warp_partition_float_kernel(
     const int64_t pe_offset = batch * pe_stride_batch + key_index * pe_stride_key;
     float partial = 0.0F;
     if (lane < latent_dim) {
-      partial = q_latent * kv[kv_offset + lane * kv_stride_dim];
+      partial = q_latent * static_cast<float>(kv[kv_offset + lane * kv_stride_dim]);
     }
     if (lane < rope_dim) {
       partial = fmaf(
-          q_pe[q_pe_offset + lane * q_pe_stride_dim],
-          pe[pe_offset + lane * pe_stride_dim],
+          static_cast<float>(q_pe[q_pe_offset + lane * q_pe_stride_dim]),
+          static_cast<float>(pe[pe_offset + lane * pe_stride_dim]),
           partial);
     }
     partial = warp_sum(partial);
@@ -151,7 +153,7 @@ __global__ void mla_absorbed_attention_warp_partition_float_kernel(
     current_scale = __shfl_sync(kFullWarpMask, current_scale, 0);
     if (lane < latent_dim) {
       numerator = numerator * previous_scale +
-          current_scale * kv[kv_offset + lane * kv_stride_dim];
+          current_scale * static_cast<float>(kv[kv_offset + lane * kv_stride_dim]);
     }
   }
 
@@ -203,25 +205,26 @@ __global__ void mla_absorbed_attention_warp_partition_float_kernel(
         }
         accumulator = fmaf(
             combined_numerator / global_denominator,
-            value_up[value_up_offset + lane * value_up_stride_value +
-                     latent * value_up_stride_latent],
+            static_cast<float>(value_up[value_up_offset + lane * value_up_stride_value +
+                                        latent * value_up_stride_latent]),
             accumulator);
       }
     }
-    output[output_offset + lane] = accumulator;
+    output[output_offset + lane] = static_cast<scalar_t>(accumulator);
   }
 }
 
-__global__ void mla_absorbed_attention_generic_float_kernel(
-    const float* __restrict__ q_nope,
-    const float* __restrict__ q_pe,
-    const float* __restrict__ kv,
-    const float* __restrict__ pe,
-    const float* __restrict__ key_up,
-    const float* __restrict__ value_up,
+template <typename scalar_t>
+__global__ void mla_absorbed_attention_generic_kernel(
+    const scalar_t* __restrict__ q_nope,
+    const scalar_t* __restrict__ q_pe,
+    const scalar_t* __restrict__ kv,
+    const scalar_t* __restrict__ pe,
+    const scalar_t* __restrict__ key_up,
+    const scalar_t* __restrict__ value_up,
     const int64_t* __restrict__ query_positions,
     const int64_t* __restrict__ key_positions,
-    float* __restrict__ output,
+    scalar_t* __restrict__ output,
     int64_t heads,
     int64_t query_length,
     int64_t key_length,
@@ -277,9 +280,9 @@ __global__ void mla_absorbed_attention_generic_float_kernel(
     float accumulator = 0.0F;
     for (int64_t column = 0; column < nope_dim; ++column) {
       accumulator = fmaf(
-          q_nope[q_nope_offset + column * q_nope_stride_dim],
-          key_up[key_up_offset + column * key_up_stride_nope +
-                 latent * key_up_stride_latent],
+          static_cast<float>(q_nope[q_nope_offset + column * q_nope_stride_dim]),
+          static_cast<float>(key_up[key_up_offset + column * key_up_stride_nope +
+                                    latent * key_up_stride_latent]),
           accumulator);
     }
     q_latent[latent] = accumulator;
@@ -303,12 +306,14 @@ __global__ void mla_absorbed_attention_generic_float_kernel(
     float partial = 0.0F;
     for (int64_t latent = threadIdx.x; latent < latent_dim; latent += blockDim.x) {
       partial = fmaf(
-          q_latent[latent], kv[kv_offset + latent * kv_stride_dim], partial);
+          q_latent[latent],
+          static_cast<float>(kv[kv_offset + latent * kv_stride_dim]),
+          partial);
     }
     for (int64_t column = threadIdx.x; column < rope_dim; column += blockDim.x) {
       partial = fmaf(
-          q_pe[q_pe_offset + column * q_pe_stride_dim],
-          pe[pe_offset + column * pe_stride_dim],
+          static_cast<float>(q_pe[q_pe_offset + column * q_pe_stride_dim]),
+          static_cast<float>(pe[pe_offset + column * pe_stride_dim]),
           partial);
     }
     reduction[threadIdx.x] = partial;
@@ -339,7 +344,7 @@ __global__ void mla_absorbed_attention_generic_float_kernel(
     for (int64_t latent = threadIdx.x; latent < latent_dim; latent += blockDim.x) {
       numerator[latent] =
           numerator[latent] * previous_scale +
-          current_scale * kv[kv_offset + latent * kv_stride_dim];
+          current_scale * static_cast<float>(kv[kv_offset + latent * kv_stride_dim]);
     }
     __syncthreads();
   }
@@ -351,18 +356,22 @@ __global__ void mla_absorbed_attention_generic_float_kernel(
       for (int64_t latent = 0; latent < latent_dim; ++latent) {
         accumulator = fmaf(
             numerator[latent] / denominator,
-            value_up[value_up_offset + value * value_up_stride_value +
-                     latent * value_up_stride_latent],
+            static_cast<float>(value_up[value_up_offset + value * value_up_stride_value +
+                                        latent * value_up_stride_latent]),
             accumulator);
       }
     }
-    output[output_offset + value] = accumulator;
+    output[output_offset + value] = static_cast<scalar_t>(accumulator);
   }
 }
 
-void check_cuda_float_tensor(const at::Tensor& tensor, const char* name) {
+void check_cuda_mla_tensor(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
-  TORCH_CHECK(tensor.scalar_type() == at::kFloat, name, " must use float32");
+  TORCH_CHECK(
+      tensor.scalar_type() == at::kFloat || tensor.scalar_type() == at::kHalf ||
+          tensor.scalar_type() == at::kBFloat16,
+      name,
+      " must use float16, bfloat16, or float32");
 }
 
 void check_cuda_long_vector(const at::Tensor& tensor, const char* name) {
@@ -382,12 +391,18 @@ at::Tensor mla_absorbed_attention_cuda(
     const at::Tensor& key_positions,
     bool causal,
     double scale) {
-  check_cuda_float_tensor(q_nope, "q_nope");
-  check_cuda_float_tensor(q_pe, "q_pe");
-  check_cuda_float_tensor(kv, "kv");
-  check_cuda_float_tensor(pe, "pe");
-  check_cuda_float_tensor(key_up, "key_up");
-  check_cuda_float_tensor(value_up, "value_up");
+  check_cuda_mla_tensor(q_nope, "q_nope");
+  check_cuda_mla_tensor(q_pe, "q_pe");
+  check_cuda_mla_tensor(kv, "kv");
+  check_cuda_mla_tensor(pe, "pe");
+  check_cuda_mla_tensor(key_up, "key_up");
+  check_cuda_mla_tensor(value_up, "value_up");
+  const auto scalar_type = q_nope.scalar_type();
+  TORCH_CHECK(
+      q_pe.scalar_type() == scalar_type && kv.scalar_type() == scalar_type &&
+          pe.scalar_type() == scalar_type && key_up.scalar_type() == scalar_type &&
+          value_up.scalar_type() == scalar_type,
+      "all floating-point MLA tensors must have the same dtype");
   check_cuda_long_vector(query_positions, "query_positions");
   check_cuda_long_vector(key_positions, "key_positions");
   TORCH_CHECK(
@@ -453,48 +468,55 @@ at::Tensor mla_absorbed_attention_cuda(
   const bool use_warp_partition =
       latent_dim <= kWarpSize && rope_dim <= kWarpSize && value_dim <= kWarpSize;
   if (use_warp_partition) {
-    mla_absorbed_attention_warp_partition_float_kernel<<<
-        static_cast<unsigned int>(rows), kThreads, 0, stream>>>(
-        q_nope.const_data_ptr<float>(),
-        q_pe.const_data_ptr<float>(),
-        kv.const_data_ptr<float>(),
-        pe.const_data_ptr<float>(),
-        key_up.const_data_ptr<float>(),
-        value_up.const_data_ptr<float>(),
-        query_positions.const_data_ptr<int64_t>(),
-        key_positions.const_data_ptr<int64_t>(),
-        output.mutable_data_ptr<float>(),
-        heads,
-        query_length,
-        key_length,
-        nope_dim,
-        rope_dim,
-        latent_dim,
-        value_dim,
-        q_nope.stride(0),
-        q_nope.stride(1),
-        q_nope.stride(2),
-        q_nope.stride(3),
-        q_pe.stride(0),
-        q_pe.stride(1),
-        q_pe.stride(2),
-        q_pe.stride(3),
-        kv.stride(0),
-        kv.stride(1),
-        kv.stride(2),
-        pe.stride(0),
-        pe.stride(1),
-        pe.stride(2),
-        key_up.stride(0),
-        key_up.stride(1),
-        key_up.stride(2),
-        value_up.stride(0),
-        value_up.stride(1),
-        value_up.stride(2),
-        query_positions.stride(0),
-        key_positions.stride(0),
-        static_cast<float>(scale),
-        causal);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        scalar_type,
+        "mla_absorbed_attention_warp_partition_cuda",
+        [&] {
+          mla_absorbed_attention_warp_partition_kernel<scalar_t><<<
+              static_cast<unsigned int>(rows), kThreads, 0, stream>>>(
+              q_nope.const_data_ptr<scalar_t>(),
+              q_pe.const_data_ptr<scalar_t>(),
+              kv.const_data_ptr<scalar_t>(),
+              pe.const_data_ptr<scalar_t>(),
+              key_up.const_data_ptr<scalar_t>(),
+              value_up.const_data_ptr<scalar_t>(),
+              query_positions.const_data_ptr<int64_t>(),
+              key_positions.const_data_ptr<int64_t>(),
+              output.mutable_data_ptr<scalar_t>(),
+              heads,
+              query_length,
+              key_length,
+              nope_dim,
+              rope_dim,
+              latent_dim,
+              value_dim,
+              q_nope.stride(0),
+              q_nope.stride(1),
+              q_nope.stride(2),
+              q_nope.stride(3),
+              q_pe.stride(0),
+              q_pe.stride(1),
+              q_pe.stride(2),
+              q_pe.stride(3),
+              kv.stride(0),
+              kv.stride(1),
+              kv.stride(2),
+              pe.stride(0),
+              pe.stride(1),
+              pe.stride(2),
+              key_up.stride(0),
+              key_up.stride(1),
+              key_up.stride(2),
+              value_up.stride(0),
+              value_up.stride(1),
+              value_up.stride(2),
+              query_positions.stride(0),
+              key_positions.stride(0),
+              static_cast<float>(scale),
+              causal);
+        });
   } else {
     const size_t shared_bytes =
         static_cast<size_t>(2 * latent_dim + kThreads + 2) * sizeof(float);
@@ -503,48 +525,55 @@ at::Tensor mla_absorbed_attention_cuda(
         "MLA latent dimension requires ", shared_bytes,
         " bytes of shared memory, but the device limit is ",
         properties->sharedMemPerBlock);
-    mla_absorbed_attention_generic_float_kernel<<<
-        static_cast<unsigned int>(rows), kThreads, shared_bytes, stream>>>(
-        q_nope.const_data_ptr<float>(),
-        q_pe.const_data_ptr<float>(),
-        kv.const_data_ptr<float>(),
-        pe.const_data_ptr<float>(),
-        key_up.const_data_ptr<float>(),
-        value_up.const_data_ptr<float>(),
-        query_positions.const_data_ptr<int64_t>(),
-        key_positions.const_data_ptr<int64_t>(),
-        output.mutable_data_ptr<float>(),
-        heads,
-        query_length,
-        key_length,
-        nope_dim,
-        rope_dim,
-        latent_dim,
-        value_dim,
-        q_nope.stride(0),
-        q_nope.stride(1),
-        q_nope.stride(2),
-        q_nope.stride(3),
-        q_pe.stride(0),
-        q_pe.stride(1),
-        q_pe.stride(2),
-        q_pe.stride(3),
-        kv.stride(0),
-        kv.stride(1),
-        kv.stride(2),
-        pe.stride(0),
-        pe.stride(1),
-        pe.stride(2),
-        key_up.stride(0),
-        key_up.stride(1),
-        key_up.stride(2),
-        value_up.stride(0),
-        value_up.stride(1),
-        value_up.stride(2),
-        query_positions.stride(0),
-        key_positions.stride(0),
-        static_cast<float>(scale),
-        causal);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        scalar_type,
+        "mla_absorbed_attention_generic_cuda",
+        [&] {
+          mla_absorbed_attention_generic_kernel<scalar_t><<<
+              static_cast<unsigned int>(rows), kThreads, shared_bytes, stream>>>(
+              q_nope.const_data_ptr<scalar_t>(),
+              q_pe.const_data_ptr<scalar_t>(),
+              kv.const_data_ptr<scalar_t>(),
+              pe.const_data_ptr<scalar_t>(),
+              key_up.const_data_ptr<scalar_t>(),
+              value_up.const_data_ptr<scalar_t>(),
+              query_positions.const_data_ptr<int64_t>(),
+              key_positions.const_data_ptr<int64_t>(),
+              output.mutable_data_ptr<scalar_t>(),
+              heads,
+              query_length,
+              key_length,
+              nope_dim,
+              rope_dim,
+              latent_dim,
+              value_dim,
+              q_nope.stride(0),
+              q_nope.stride(1),
+              q_nope.stride(2),
+              q_nope.stride(3),
+              q_pe.stride(0),
+              q_pe.stride(1),
+              q_pe.stride(2),
+              q_pe.stride(3),
+              kv.stride(0),
+              kv.stride(1),
+              kv.stride(2),
+              pe.stride(0),
+              pe.stride(1),
+              pe.stride(2),
+              key_up.stride(0),
+              key_up.stride(1),
+              key_up.stride(2),
+              value_up.stride(0),
+              value_up.stride(1),
+              value_up.stride(2),
+              query_positions.stride(0),
+              key_positions.stride(0),
+              static_cast<float>(scale),
+              causal);
+        });
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;

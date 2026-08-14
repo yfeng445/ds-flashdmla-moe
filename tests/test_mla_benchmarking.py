@@ -21,6 +21,26 @@ def test_mla_error_report_uses_composed_fp32_tolerance(implementation: str) -> N
     assert report["max_tolerance_ratio"] <= 1
 
 
+@pytest.mark.parametrize(
+    ("dtype", "expected_rtol", "expected_atol"),
+    [
+        (torch.float16, 1e-2, 2e-2),
+        (torch.bfloat16, 5e-2, 3e-1),
+    ],
+)
+def test_mla_error_report_uses_composed_low_precision_tolerance(
+    dtype: torch.dtype,
+    expected_rtol: float,
+    expected_atol: float,
+) -> None:
+    expected = torch.tensor([1.0], dtype=dtype)
+    report = _error_report(expected, expected, implementation="cuda")
+
+    assert report["rtol"] == expected_rtol
+    assert report["atol"] == expected_atol
+    assert report["max_tolerance_ratio"] == 0
+
+
 def _small_config(**overrides) -> MLABenchmarkConfig:
     values = {
         "batch": 2,
@@ -118,6 +138,16 @@ def test_small_mla_benchmark_reports_verified_workloads(
 def test_mla_benchmark_can_skip_verification() -> None:
     report = benchmark_mla(_small_config(verify=False))
     assert report["verification"] == {"performed": False}
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32"])
+def test_cuda_mla_benchmark_accepts_supported_storage_dtypes(dtype: str) -> None:
+    _small_config(device="cuda", implementation="cuda", dtype=dtype).validate()
+
+
+def test_cuda_mla_benchmark_rejects_float64_storage() -> None:
+    with pytest.raises(ValueError, match="float16, bfloat16, or float32"):
+        _small_config(device="cuda", implementation="cuda", dtype="float64").validate()
 
 
 @pytest.mark.parametrize(

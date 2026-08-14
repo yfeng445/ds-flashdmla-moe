@@ -353,14 +353,14 @@ def _project_query(
 
     if config.q_lora_rank == 0:
         assert weights.wq is not None
-        q = F.linear(x_compute, weights.wq.to(compute_dtype))
+        q = F.linear(x_compute, weights.wq.to(compute_dtype)).to(x.dtype)
     else:
         assert weights.wq_a is not None
         assert weights.q_norm_weight is not None
         assert weights.wq_b is not None
-        q_latent = F.linear(x_compute, weights.wq_a.to(compute_dtype))
+        q_latent = F.linear(x_compute, weights.wq_a.to(compute_dtype)).to(x.dtype)
         q_latent = _rms_norm(q_latent, weights.q_norm_weight, config.rms_norm_eps)
-        q = F.linear(q_latent.to(compute_dtype), weights.wq_b.to(compute_dtype))
+        q = F.linear(q_latent.to(compute_dtype), weights.wq_b.to(compute_dtype)).to(x.dtype)
 
     q = q.reshape(x.shape[0], x.shape[1], config.n_heads, config.qk_head_dim)
     q_nope, q_pe = torch.split(
@@ -374,7 +374,7 @@ def _project_query(
         config.rope_theta,
         _positions_validated=True,
     )
-    return q_nope, q_pe
+    return q_nope.to(x.dtype).contiguous(), q_pe.to(x.dtype).contiguous()
 
 
 def build_mla_cache(
@@ -419,7 +419,7 @@ def build_mla_cache(
         return _validated_latent_cache(kv=kv, pe=k_pe, positions=positions)
 
     compute_dtype = _compute_dtype(x)
-    projected = F.linear(x.to(compute_dtype), weights.wkv_a.to(compute_dtype))
+    projected = F.linear(x.to(compute_dtype), weights.wkv_a.to(compute_dtype)).to(x.dtype)
     kv, k_pe = torch.split(
         projected,
         [config.kv_lora_rank, config.qk_rope_head_dim],
@@ -432,7 +432,11 @@ def build_mla_cache(
         config.rope_theta,
         _positions_validated=True,
     ).squeeze(2)
-    return _validated_latent_cache(kv=kv, pe=k_pe, positions=positions)
+    return _validated_latent_cache(
+        kv=kv.to(x.dtype).contiguous(),
+        pe=k_pe.to(x.dtype).contiguous(),
+        positions=positions,
+    )
 
 
 def append_mla_cache(
@@ -794,8 +798,8 @@ def mla_absorbed_attention_reference(
     )
 
     latent_output = torch.einsum("bhst,btr->bshr", probabilities, kv)
-    heads = torch.einsum("bshr,hdr->bshd", latent_output, value_up)
-    output = F.linear(heads.flatten(2), weights.wo.to(compute_dtype))
+    heads = torch.einsum("bshr,hdr->bshd", latent_output, value_up).to(query_x.dtype)
+    output = F.linear(heads.flatten(2).to(compute_dtype), weights.wo.to(compute_dtype))
     return output.to(query_x.dtype)
 
 
@@ -833,7 +837,6 @@ def mla_absorbed_attention(
         )
 
     query_positions = _validate_attention_request(query_x, cache, query_positions, config, weights)
-    compute_dtype = _compute_dtype(query_x)
     q_nope, q_pe = _project_query(
         query_x,
         config,
@@ -842,7 +845,7 @@ def mla_absorbed_attention(
         backend=backend,
         _positions_validated=True,
     )
-    up = weights.wkv_b.to(compute_dtype).reshape(
+    up = weights.wkv_b.reshape(
         config.n_heads,
         config.qk_nope_head_dim + config.v_head_dim,
         config.kv_lora_rank,

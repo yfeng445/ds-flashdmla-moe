@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -16,10 +17,11 @@ namespace {
 constexpr int kTile = 16;
 constexpr int kElementwiseThreads = 256;
 
-__global__ void linear_weight_float_kernel(
-    const float* __restrict__ input,
-    const float* __restrict__ weight,
-    float* __restrict__ output,
+template <typename scalar_t>
+__global__ void linear_weight_kernel(
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    scalar_t* __restrict__ output,
     int64_t sequence,
     int64_t rows,
     int64_t output_features,
@@ -41,10 +43,10 @@ __global__ void linear_weight_float_kernel(
     if (row < rows && reduction_feature < input_features) {
       const int64_t batch = row / sequence;
       const int64_t sequence_index = row - batch * sequence;
-      input_tile[threadIdx.y][threadIdx.x] =
+      input_tile[threadIdx.y][threadIdx.x] = static_cast<float>(
           input[batch * input_stride_batch +
                 sequence_index * input_stride_sequence +
-                reduction_feature * input_stride_feature];
+                reduction_feature * input_stride_feature]);
     } else {
       input_tile[threadIdx.y][threadIdx.x] = 0.0F;
     }
@@ -56,7 +58,7 @@ __global__ void linear_weight_float_kernel(
         static_cast<int64_t>(blockIdx.x) * kTile + threadIdx.y;
     weight_tile[threadIdx.y][threadIdx.x] =
         weight_output < output_features && reduction_feature < input_features
-        ? weight[weight_output * input_features + reduction_feature]
+        ? static_cast<float>(weight[weight_output * input_features + reduction_feature])
         : 0.0F;
     __syncthreads();
 
@@ -71,14 +73,15 @@ __global__ void linear_weight_float_kernel(
   }
 
   if (row < rows && output_feature < output_features) {
-    output[row * output_features + output_feature] = accumulator;
+    output[row * output_features + output_feature] = static_cast<scalar_t>(accumulator);
   }
 }
 
-__global__ void rms_norm_prefix_float_kernel(
-    const float* __restrict__ input,
-    const float* __restrict__ weight,
-    float* __restrict__ output,
+template <typename scalar_t>
+__global__ void rms_norm_prefix_kernel(
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    scalar_t* __restrict__ output,
     int64_t sequence,
     int64_t rows,
     int64_t input_width,
@@ -93,7 +96,7 @@ __global__ void rms_norm_prefix_float_kernel(
   float sum_squares = 0.0F;
   for (int64_t feature = threadIdx.x; feature < normalized_width;
        feature += blockDim.x) {
-    const float value = input[row * input_width + feature];
+    const float value = static_cast<float>(input[row * input_width + feature]);
     sum_squares = fmaf(value, value, sum_squares);
   }
   reduction[threadIdx.x] = sum_squares;
@@ -113,14 +116,16 @@ __global__ void rms_norm_prefix_float_kernel(
       (sequence_index + output_sequence_start) * output_stride_sequence;
   for (int64_t feature = threadIdx.x; feature < normalized_width;
        feature += blockDim.x) {
-    output[output_offset + feature * output_stride_feature] =
-        input[row * input_width + feature] * inverse_rms * weight[feature];
+    output[output_offset + feature * output_stride_feature] = static_cast<scalar_t>(
+        static_cast<float>(input[row * input_width + feature]) * inverse_rms *
+        static_cast<float>(weight[feature]));
   }
 }
 
-__global__ void copy_query_nope_float_kernel(
-    const float* __restrict__ projected,
-    float* __restrict__ q_nope,
+template <typename scalar_t>
+__global__ void copy_query_nope_kernel(
+    const scalar_t* __restrict__ projected,
+    scalar_t* __restrict__ q_nope,
     int64_t total,
     int64_t heads,
     int64_t nope_dim,
@@ -138,10 +143,11 @@ __global__ void copy_query_nope_float_kernel(
   }
 }
 
-__global__ void query_rope_float_kernel(
-    const float* __restrict__ projected,
+template <typename scalar_t>
+__global__ void query_rope_kernel(
+    const scalar_t* __restrict__ projected,
     const int64_t* __restrict__ positions,
-    float* __restrict__ q_pe,
+    scalar_t* __restrict__ q_pe,
     int64_t total,
     int64_t sequence,
     int64_t heads,
@@ -161,24 +167,26 @@ __global__ void query_rope_float_kernel(
     const int64_t pair_feature = rope_feature & ~int64_t{1};
     const int64_t input_offset =
         row * heads * head_dim + head * head_dim + nope_dim + pair_feature;
-    const float even = projected[input_offset];
-    const float odd = projected[input_offset + 1];
+    const float even = static_cast<float>(projected[input_offset]);
+    const float odd = static_cast<float>(projected[input_offset + 1]);
     const float inverse_frequency =
         powf(theta, -static_cast<float>(pair_feature) / static_cast<float>(rope_dim));
     const float angle = static_cast<float>(positions[sequence_index * position_stride]) *
         inverse_frequency;
     const float cosine = cosf(angle);
     const float sine = sinf(angle);
-    q_pe[index] = (rope_feature & 1) == 0
-        ? even * cosine - odd * sine
-        : even * sine + odd * cosine;
+    q_pe[index] = static_cast<scalar_t>(
+        (rope_feature & 1) == 0
+            ? even * cosine - odd * sine
+            : even * sine + odd * cosine);
   }
 }
 
-__global__ void cache_rope_float_kernel(
-    const float* __restrict__ projected,
+template <typename scalar_t>
+__global__ void cache_rope_kernel(
+    const scalar_t* __restrict__ projected,
     const int64_t* __restrict__ positions,
-    float* __restrict__ pe,
+    scalar_t* __restrict__ pe,
     int64_t total,
     int64_t sequence,
     int64_t projected_width,
@@ -200,8 +208,8 @@ __global__ void cache_rope_float_kernel(
     const int64_t pair_feature = rope_feature & ~int64_t{1};
     const int64_t input_offset =
         row * projected_width + latent_dim + pair_feature;
-    const float even = projected[input_offset];
-    const float odd = projected[input_offset + 1];
+    const float even = static_cast<float>(projected[input_offset]);
+    const float odd = static_cast<float>(projected[input_offset + 1]);
     const float inverse_frequency =
         powf(theta, -static_cast<float>(pair_feature) / static_cast<float>(rope_dim));
     const float angle = static_cast<float>(positions[sequence_index * position_stride]) *
@@ -211,9 +219,10 @@ __global__ void cache_rope_float_kernel(
     const int64_t output_offset = batch * output_stride_batch +
         (sequence_index + output_sequence_start) * output_stride_sequence +
         rope_feature * output_stride_feature;
-    pe[output_offset] = (rope_feature & 1) == 0
-        ? even * cosine - odd * sine
-        : even * sine + odd * cosine;
+    pe[output_offset] = static_cast<scalar_t>(
+        (rope_feature & 1) == 0
+            ? even * cosine - odd * sine
+            : even * sine + odd * cosine);
   }
 }
 
@@ -230,14 +239,31 @@ __global__ void copy_positions_kernel(
   }
 }
 
-void check_cuda_float_tensor(const at::Tensor& tensor, const char* name) {
+void check_cuda_mla_tensor(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
-  TORCH_CHECK(tensor.scalar_type() == at::kFloat, name, " must use float32");
+  TORCH_CHECK(
+      tensor.scalar_type() == at::kFloat || tensor.scalar_type() == at::kHalf ||
+          tensor.scalar_type() == at::kBFloat16,
+      name,
+      " must use float16, bfloat16, or float32");
 }
 
-void check_contiguous_cuda_float_tensor(const at::Tensor& tensor, const char* name) {
-  check_cuda_float_tensor(tensor, name);
+void check_contiguous_cuda_mla_tensor(const at::Tensor& tensor, const char* name) {
+  check_cuda_mla_tensor(tensor, name);
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_same_dtype(
+    const at::Tensor& reference,
+    const at::Tensor& tensor,
+    const char* reference_name,
+    const char* tensor_name) {
+  TORCH_CHECK(
+      tensor.scalar_type() == reference.scalar_type(),
+      reference_name,
+      " and ",
+      tensor_name,
+      " must have the same dtype");
 }
 
 void check_cuda_long_vector(const at::Tensor& tensor, const char* name) {
@@ -285,17 +311,24 @@ void launch_linear_weight(
       "MLA projection grid exceeds the CUDA device limit");
   const dim3 threads(kTile, kTile);
   const dim3 blocks(static_cast<unsigned int>(grid_x), static_cast<unsigned int>(grid_y));
-  linear_weight_float_kernel<<<blocks, threads, 0, stream>>>(
-      input.const_data_ptr<float>(),
-      weight.const_data_ptr<float>(),
-      output.mutable_data_ptr<float>(),
-      sequence,
-      rows,
-      output_features,
-      input_features,
-      input.stride(0),
-      input.stride(1),
-      input.stride(2));
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      input.scalar_type(),
+      "mla_linear_weight_cuda",
+      [&] {
+        linear_weight_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            input.const_data_ptr<scalar_t>(),
+            weight.const_data_ptr<scalar_t>(),
+            output.mutable_data_ptr<scalar_t>(),
+            sequence,
+            rows,
+            output_features,
+            input_features,
+            input.stride(0),
+            input.stride(1),
+            input.stride(2));
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -319,20 +352,27 @@ void launch_rms_norm_prefix(
       rows <= static_cast<int64_t>(properties->maxGridSize[0]),
       "too many MLA RMSNorm rows for a one-dimensional CUDA launch: ",
       rows);
-  rms_norm_prefix_float_kernel<<<
-      static_cast<unsigned int>(rows), kElementwiseThreads, 0, stream>>>(
-      projected.const_data_ptr<float>(),
-      weight.const_data_ptr<float>(),
-      output.mutable_data_ptr<float>(),
-      sequence,
-      rows,
-      input_width,
-      normalized_width,
-      output.stride(0),
-      output.stride(1),
-      output.stride(2),
-      output_sequence_start,
-      static_cast<float>(epsilon));
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      projected.scalar_type(),
+      "mla_rms_norm_prefix_cuda",
+      [&] {
+        rms_norm_prefix_kernel<scalar_t><<<
+            static_cast<unsigned int>(rows), kElementwiseThreads, 0, stream>>>(
+            projected.const_data_ptr<scalar_t>(),
+            weight.const_data_ptr<scalar_t>(),
+            output.mutable_data_ptr<scalar_t>(),
+            sequence,
+            rows,
+            input_width,
+            normalized_width,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            output_sequence_start,
+            static_cast<float>(epsilon));
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -352,29 +392,43 @@ std::tuple<at::Tensor, at::Tensor> split_query_and_apply_rope(
   const int64_t rope_total = batch * sequence * heads * rope_dim;
   const cudaDeviceProp* properties = at::cuda::getDeviceProperties(projected.get_device());
   if (nope_total > 0) {
-    copy_query_nope_float_kernel<<<
-        elementwise_blocks(nope_total, properties), kElementwiseThreads, 0, stream>>>(
-        projected.const_data_ptr<float>(),
-        q_nope.mutable_data_ptr<float>(),
-        nope_total,
-        heads,
-        nope_dim,
-        rope_dim);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        projected.scalar_type(),
+        "mla_copy_query_nope_cuda",
+        [&] {
+          copy_query_nope_kernel<scalar_t><<<
+              elementwise_blocks(nope_total, properties), kElementwiseThreads, 0, stream>>>(
+              projected.const_data_ptr<scalar_t>(),
+              q_nope.mutable_data_ptr<scalar_t>(),
+              nope_total,
+              heads,
+              nope_dim,
+              rope_dim);
+        });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   if (rope_total > 0) {
-    query_rope_float_kernel<<<
-        elementwise_blocks(rope_total, properties), kElementwiseThreads, 0, stream>>>(
-        projected.const_data_ptr<float>(),
-        positions.const_data_ptr<int64_t>(),
-        q_pe.mutable_data_ptr<float>(),
-        rope_total,
-        sequence,
-        heads,
-        nope_dim,
-        rope_dim,
-        positions.stride(0),
-        static_cast<float>(theta));
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        projected.scalar_type(),
+        "mla_query_rope_cuda",
+        [&] {
+          query_rope_kernel<scalar_t><<<
+              elementwise_blocks(rope_total, properties), kElementwiseThreads, 0, stream>>>(
+              projected.const_data_ptr<scalar_t>(),
+              positions.const_data_ptr<int64_t>(),
+              q_pe.mutable_data_ptr<scalar_t>(),
+              rope_total,
+              sequence,
+              heads,
+              nope_dim,
+              rope_dim,
+              positions.stride(0),
+              static_cast<float>(theta));
+        });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return {q_nope, q_pe};
@@ -396,22 +450,29 @@ void launch_cache_rope(
     return;
   }
   const cudaDeviceProp* properties = at::cuda::getDeviceProperties(projected.get_device());
-  cache_rope_float_kernel<<<
-      elementwise_blocks(total, properties), kElementwiseThreads, 0, stream>>>(
-      projected.const_data_ptr<float>(),
-      positions.const_data_ptr<int64_t>(),
-      pe.mutable_data_ptr<float>(),
-      total,
-      sequence,
-      latent_dim + rope_dim,
-      latent_dim,
-      rope_dim,
-      positions.stride(0),
-      pe.stride(0),
-      pe.stride(1),
-      pe.stride(2),
-      output_sequence_start,
-      static_cast<float>(theta));
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      projected.scalar_type(),
+      "mla_cache_rope_cuda",
+      [&] {
+        cache_rope_kernel<scalar_t><<<
+            elementwise_blocks(total, properties), kElementwiseThreads, 0, stream>>>(
+            projected.const_data_ptr<scalar_t>(),
+            positions.const_data_ptr<int64_t>(),
+            pe.mutable_data_ptr<scalar_t>(),
+            total,
+            sequence,
+            latent_dim + rope_dim,
+            latent_dim,
+            rope_dim,
+            positions.stride(0),
+            pe.stride(0),
+            pe.stride(1),
+            pe.stride(2),
+            output_sequence_start,
+            static_cast<float>(theta));
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -422,7 +483,7 @@ void validate_query_common(
     int64_t nope_dim,
     int64_t rope_dim,
     double theta) {
-  check_cuda_float_tensor(x, "x");
+  check_cuda_mla_tensor(x, "x");
   check_cuda_long_vector(positions, "positions");
   TORCH_CHECK(x.dim() == 3, "MLA query input must have shape [batch, sequence, model_dim]");
   TORCH_CHECK(x.device() == positions.device(), "query input and positions must share a device");
@@ -440,7 +501,8 @@ std::tuple<at::Tensor, at::Tensor> mla_query_projection_cuda(
     int64_t rope_dim,
     double theta) {
   validate_query_common(x, positions, heads, nope_dim, rope_dim, theta);
-  check_contiguous_cuda_float_tensor(wq, "wq");
+  check_contiguous_cuda_mla_tensor(wq, "wq");
+  check_same_dtype(x, wq, "x", "wq");
   TORCH_CHECK(wq.device() == x.device(), "x and wq must share a CUDA device");
   TORCH_CHECK(wq.dim() == 2, "wq must be a matrix");
   TORCH_CHECK(wq.size(1) == x.size(2), "wq input dimension must match x");
@@ -476,9 +538,12 @@ std::tuple<at::Tensor, at::Tensor> mla_query_lora_projection_cuda(
     double theta,
     double epsilon) {
   validate_query_common(x, positions, heads, nope_dim, rope_dim, theta);
-  check_contiguous_cuda_float_tensor(wq_a, "wq_a");
-  check_contiguous_cuda_float_tensor(q_norm_weight, "q_norm_weight");
-  check_contiguous_cuda_float_tensor(wq_b, "wq_b");
+  check_contiguous_cuda_mla_tensor(wq_a, "wq_a");
+  check_contiguous_cuda_mla_tensor(q_norm_weight, "q_norm_weight");
+  check_contiguous_cuda_mla_tensor(wq_b, "wq_b");
+  check_same_dtype(x, wq_a, "x", "wq_a");
+  check_same_dtype(x, q_norm_weight, "x", "q_norm_weight");
+  check_same_dtype(x, wq_b, "x", "wq_b");
   check_rms_epsilon(epsilon);
   TORCH_CHECK(
       x.device() == wq_a.device() && x.device() == q_norm_weight.device() &&
@@ -530,9 +595,11 @@ void validate_cache_projection_common(
     const at::Tensor& positions,
     double theta,
     double epsilon) {
-  check_cuda_float_tensor(x, "x");
-  check_contiguous_cuda_float_tensor(wkv_a, "wkv_a");
-  check_contiguous_cuda_float_tensor(kv_norm_weight, "kv_norm_weight");
+  check_cuda_mla_tensor(x, "x");
+  check_contiguous_cuda_mla_tensor(wkv_a, "wkv_a");
+  check_contiguous_cuda_mla_tensor(kv_norm_weight, "kv_norm_weight");
+  check_same_dtype(x, wkv_a, "x", "wkv_a");
+  check_same_dtype(x, kv_norm_weight, "x", "kv_norm_weight");
   check_cuda_long_vector(positions, "positions");
   TORCH_CHECK(x.dim() == 3, "MLA cache input must have shape [batch, sequence, model_dim]");
   TORCH_CHECK(wkv_a.dim() == 2, "wkv_a must be a matrix");
@@ -604,8 +671,10 @@ void mla_cache_projection_write_cuda(
     double theta,
     double epsilon) {
   validate_cache_projection_common(x, wkv_a, kv_norm_weight, positions, theta, epsilon);
-  check_contiguous_cuda_float_tensor(kv_storage, "kv_storage");
-  check_contiguous_cuda_float_tensor(pe_storage, "pe_storage");
+  check_contiguous_cuda_mla_tensor(kv_storage, "kv_storage");
+  check_contiguous_cuda_mla_tensor(pe_storage, "pe_storage");
+  check_same_dtype(x, kv_storage, "x", "kv_storage");
+  check_same_dtype(x, pe_storage, "x", "pe_storage");
   TORCH_CHECK(position_storage.is_cuda(), "position_storage must be a CUDA tensor");
   TORCH_CHECK(position_storage.scalar_type() == at::kLong, "position_storage must use int64");
   TORCH_CHECK(position_storage.is_contiguous(), "position_storage must be contiguous");
@@ -670,8 +739,9 @@ void mla_cache_projection_write_cuda(
 }
 
 at::Tensor mla_output_projection_cuda(const at::Tensor& heads, const at::Tensor& wo) {
-  check_contiguous_cuda_float_tensor(heads, "heads");
-  check_contiguous_cuda_float_tensor(wo, "wo");
+  check_contiguous_cuda_mla_tensor(heads, "heads");
+  check_contiguous_cuda_mla_tensor(wo, "wo");
+  check_same_dtype(heads, wo, "heads", "wo");
   TORCH_CHECK(heads.dim() == 4, "heads must have shape [batch, sequence, heads, value_dim]");
   TORCH_CHECK(wo.dim() == 2, "wo must be a matrix");
   TORCH_CHECK(heads.device() == wo.device(), "heads and wo must share a CUDA device");

@@ -201,6 +201,23 @@ python benchmarks/matrix.py \
 与 FA4 的真实差距，不应被包装成 native 已达到生产性能。不同环境仍须安装与其
 PyTorch/CUDA/GPU 匹配的 FA4 版本。
 
+### 7.7.2 staged MLA 低精度矩阵
+
+staged MLA 的六个 native operator 使用统一 storage dtype 和 FP32 accumulation。独立 profile
+将 FP16/BF16 的 prefill/decode、regular/tail 组合与同 dtype 的 PyTorch absorbed staged
+reference 成对运行，不改变默认 20-case representative manifest：
+
+```bash
+python benchmarks/matrix.py \
+  --device cuda --profile mla-low-precision \
+  --warmup 5 --iterations 20 --seed 20260814 \
+  --output benchmark-results/operator-matrix-mla-low-precision.json
+```
+
+低精度 reference 也在每个公开 stage 写回 storage dtype，因此比较不会把 native 的中间量化
+误差与一条全程 FP32 的基线混在一起。逐 stage CUDA 回归仍使用更严格的普通 FP16/BF16 容差；
+端到端 benchmark 另用组合流水线容差处理多级量化在未缩放随机权重下的累积。
+
 ## 7.8 从 Kineto 定位到 Nsight 取证
 
 shape matrix 回答“哪些固定 workload 能正确运行、延迟分布如何”，但不能解释时间消耗在

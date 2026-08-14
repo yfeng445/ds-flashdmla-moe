@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--profile",
-        choices=("smoke", "representative", "flash-attn-4"),
+        choices=("smoke", "representative", "flash-attn-4", "mla-low-precision"),
         default="representative",
     )
     parser.add_argument(

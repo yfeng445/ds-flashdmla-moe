@@ -57,7 +57,12 @@ class OperatorProfileConfig:
 
 def _selected_case(config: OperatorProfileConfig) -> BenchmarkMatrixCase:
     config.validate()
-    profile = "flash-attn-4" if config.case.startswith("attention_fa4_") else "representative"
+    if config.case.startswith("attention_fa4_"):
+        profile = "flash-attn-4"
+    elif config.case.startswith("mla_low_precision_"):
+        profile = "mla-low-precision"
+    else:
+        profile = "representative"
     selected = build_benchmark_matrix_cases(
         BenchmarkMatrixConfig(
             device=config.device,

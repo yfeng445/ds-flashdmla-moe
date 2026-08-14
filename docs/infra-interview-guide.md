@@ -25,7 +25,7 @@ reference 固定数值语义，再逐步替换为 CUDA 和分布式实现。目�
 
 - 分块 online-softmax attention，以及 FP16/BF16/FP32 CUDA forward/backward；
 - MLA 的 naive/absorbed prefill、compressed cache decode，以及直接消费 latent cache 的
-  FP32 CUDA absorbed-attention core；
+  FP16/BF16/FP32 staged CUDA pipeline；
 - DeepSeek 风格 grouped Top-K、route pack/combine、expert-major SwiGLU；
 - FP32 CUDA-core 与 FP16 WMMA expert kernel；
 - 两 rank Gloo reference，以及代码层面的 NCCL variable All-to-All/chunk pipeline。
@@ -36,7 +36,7 @@ reference 固定数值语义，再逐步替换为 CUDA 和分布式实现。目�
 很快的 kernel，而是先用 PyTorch reference 固定 forward、backward、mask、路由身份和
 determinism 语义，再把已验证边界接入 PyTorch dispatcher 和 CUDA。当前最完整的一条链路是
 MLA：从 naive/absorbed 等价推导、compressed static cache，到由 native query/cache projection、
-RoPE、absorbed attention 和 output projection 组成的 staged FP32 CUDA pipeline。它已经在单张
+RoPE、absorbed attention 和 output projection 组成的 staged FP16/BF16/FP32 CUDA pipeline。它已经在单张
 RTX 5090、CUDA 12.8 环境中完成原生构建和数值测试；out-of-place backward 仍是 reference
 recompute，多卡 NCCL 与 NVSHMEM 也不能说成已经实机验证。这个项目主要证明的是我能把算法
 语义、PyTorch 算子契约和 CUDA 执行边界连起来，而不是宣称已经做出生产级 FA3。
@@ -66,8 +66,8 @@ recompute，多卡 NCCL 与 NVSHMEM 也不能说成已经实机验证。这个�
 - 不能把 FlashMoE/NVSHMEM 的论文或原型设计说成此仓库已经实现。
 - 没有保存可复核 benchmark 前，不说“训练 step 提升 1.2×”。
 - NCCL chunk pipeline 已有软件协议，但物理 overlap 仍需 Nsight timeline 证明。
-- 当前 MLA CUDA 是 correctness-first 的 FP32 absorbed attention core；不是 FA3、TMA 或
-  WGMMA 实现。
+- 当前 MLA CUDA 是 correctness-first 的同 dtype staged pipeline，低精度 storage 配合 FP32
+  accumulation；不是 FA3、TMA 或 WGMMA 实现。
 - 普通 Attention 已支持 FP16/BF16 storage 与 FP32 accumulation，但仍是 row-wise scalar
   kernel；四组同 dtype FA4 正式快照中 FA4 三组 median 更低、native 一组更低，且原始样本
   波动明显，不能称为高性能实现或给出普适排序。
@@ -167,8 +167,9 @@ positions。一个 block 负责一个 `(batch, head, query)` row：
 4. 直接累积 latent value；
 5. 乘 `value_up` 写出 head output。
 
-它没有写出 score matrix，也没有展开完整 K/V。目前 staged MLA pipeline 仍仅支持 FP32；
-query/cache projection、RoPE、attention 和最终 `W_O` 已分别接入 native CUDA stage，
+它没有写出 score matrix，也没有展开完整 K/V。目前 staged MLA pipeline 支持相同 dtype 的
+FP16/BF16/FP32 storage；query/cache projection、RoPE、attention 和最终 `W_O` 已分别接入
+native CUDA stage，
 out-of-place backward 走可追踪的 absorbed reference recompute。
 
 ### 2.5 用维度证明 absorbed 等价
@@ -403,11 +404,11 @@ x -> RMSNorm -> Attention -> residual add
 
 | 容易失分的说法 | 建议说法 | 当前证据 | 个人边界 / 风险 |
 | --- | --- | --- | --- |
-| “我实现了 FlashMLA” | “项目实现了一个 correctness-first、FP32、absorbed MLA CUDA core” | 原生 CUDA 源码、dispatcher、CUDA 测试和 smoke 报告 | 不是官方 FlashMLA，也没有 FA3/TMA/WGMMA |
+| “我实现了 FlashMLA” | “项目实现了一个 correctness-first、FP16/BF16/FP32 staged absorbed MLA CUDA pipeline” | 原生 CUDA 源码、dispatcher、CUDA 测试和 smoke 报告 | 不是官方 FlashMLA，也没有 FA3/TMA/WGMMA |
 | “MLA 快了 1.21x” | “在 RTX 5090 的一个 B1/S128 FP32 smoke shape 下，median 相对项目 absorbed baseline 为约 1.21x” | 两份同 harness benchmark JSON | shape 很小；非生产模型；开发态源码 |
 | “做了多卡通信计算重叠” | “实现了 NCCL-only chunk/async 软件协议；物理 overlap 尚待多卡 timeline 验证” | async All-to-All 与 chunk pipeline 代码；Gloo 两 rank语义测试 | 本地只有单卡，不能声称多卡性能 |
 | “支持反向” | “CUDA forward 的一阶梯度通过可追踪 absorbed reference recompute 获得” | custom-op autograd 注册及梯度对照测试 | 不是 fused native MLA backward |
-| “支持任意输入” | “高层 API 可 fallback；原生 MLA kernel 当前限定 CUDA FP32、无显式 mask” | 输入契约和失败测试 | 不支持 FP16/BF16、任意 mask、生产尺寸调优 |
+| “支持任意输入” | “高层 API 可 fallback；原生 MLA 当前限定同 dtype CUDA FP16/BF16/FP32、无显式 mask” | 输入契约和失败测试 | 不支持 mixed dtype、任意 mask、paged cache 或生产尺寸调优 |
 | “低精度 Attention 已经很快” | “native Attention 已完成 FP16/BF16 correctness contract；正式四组 paired 快照里 FA4 三组 median 更低、native 一组更低，样本波动使其不能外推” | CUDA forward/backward 测试与可选 FA4 matrix | 单机小 shape；尚无 Nsight/CUTLASS 或生产调度 |
 | “实现了 NVSHMEM FlashMoE” | “实现的是 symmetric-buffer 分析模型；NVSHMEM actor backend 是研究目标” | `symmetric_memory.py` 与讲义 | 没有 one-sided runtime backend |
 

@@ -404,14 +404,20 @@ def _composite_mla_query_projection(
 ) -> tuple[Tensor, Tensor]:
     compute_dtype = _mla_projection_compute_dtype(x)
     head_dim = qk_nope_head_dim + qk_rope_head_dim
-    projected = torch.nn.functional.linear(x.to(compute_dtype), wq.to(compute_dtype))
+    projected = torch.nn.functional.linear(
+        x.to(compute_dtype),
+        wq.to(compute_dtype),
+    ).to(x.dtype)
     projected = projected.reshape(x.shape[0], x.shape[1], n_heads, head_dim)
     q_nope, q_pe = torch.split(
         projected,
         [qk_nope_head_dim, qk_rope_head_dim],
         dim=-1,
     )
-    return q_nope.contiguous(), _composite_mla_rope(q_pe, positions, rope_theta).contiguous()
+    return (
+        q_nope.to(x.dtype).contiguous(),
+        _composite_mla_rope(q_pe, positions, rope_theta).to(x.dtype).contiguous(),
+    )
 
 
 def _composite_mla_query_lora_projection(
@@ -427,9 +433,15 @@ def _composite_mla_query_lora_projection(
     rms_norm_eps: float,
 ) -> tuple[Tensor, Tensor]:
     compute_dtype = _mla_projection_compute_dtype(x)
-    latent = torch.nn.functional.linear(x.to(compute_dtype), wq_a.to(compute_dtype))
-    latent = _composite_mla_rms_norm(latent, q_norm_weight, rms_norm_eps)
-    projected = torch.nn.functional.linear(latent, wq_b.to(compute_dtype))
+    latent = torch.nn.functional.linear(
+        x.to(compute_dtype),
+        wq_a.to(compute_dtype),
+    ).to(x.dtype)
+    latent = _composite_mla_rms_norm(latent, q_norm_weight, rms_norm_eps).to(x.dtype)
+    projected = torch.nn.functional.linear(
+        latent.to(compute_dtype),
+        wq_b.to(compute_dtype),
+    ).to(x.dtype)
     head_dim = qk_nope_head_dim + qk_rope_head_dim
     projected = projected.reshape(x.shape[0], x.shape[1], n_heads, head_dim)
     q_nope, q_pe = torch.split(
@@ -437,7 +449,10 @@ def _composite_mla_query_lora_projection(
         [qk_nope_head_dim, qk_rope_head_dim],
         dim=-1,
     )
-    return q_nope.contiguous(), _composite_mla_rope(q_pe, positions, rope_theta).contiguous()
+    return (
+        q_nope.to(x.dtype).contiguous(),
+        _composite_mla_rope(q_pe, positions, rope_theta).to(x.dtype).contiguous(),
+    )
 
 
 def _composite_mla_cache_projection(
@@ -450,14 +465,22 @@ def _composite_mla_cache_projection(
     rms_norm_eps: float,
 ) -> tuple[Tensor, Tensor]:
     compute_dtype = _mla_projection_compute_dtype(x)
-    projected = torch.nn.functional.linear(x.to(compute_dtype), wkv_a.to(compute_dtype))
+    projected = torch.nn.functional.linear(
+        x.to(compute_dtype),
+        wkv_a.to(compute_dtype),
+    ).to(x.dtype)
     kv, pe = torch.split(
         projected,
         [kv_lora_rank, projected.shape[-1] - kv_lora_rank],
         dim=-1,
     )
-    kv = _composite_mla_rms_norm(kv, kv_norm_weight, rms_norm_eps).contiguous()
-    pe = _composite_mla_rope(pe.unsqueeze(2), positions, rope_theta).squeeze(2).contiguous()
+    kv = _composite_mla_rms_norm(kv, kv_norm_weight, rms_norm_eps).to(x.dtype).contiguous()
+    pe = (
+        _composite_mla_rope(pe.unsqueeze(2), positions, rope_theta)
+        .squeeze(2)
+        .to(x.dtype)
+        .contiguous()
+    )
     return kv, pe
 
 
@@ -718,16 +741,9 @@ def _fake_mla_query_outputs(
     torch._check(n_heads > 0 and qk_nope_head_dim > 0)
     torch._check(qk_rope_head_dim > 0 and qk_rope_head_dim % 2 == 0)
     torch._check(math.isfinite(rope_theta) and rope_theta > 0)
-    output_dtype = _mla_projection_compute_dtype(x)
     return (
-        x.new_empty(
-            (x.shape[0], x.shape[1], n_heads, qk_nope_head_dim),
-            dtype=output_dtype,
-        ),
-        x.new_empty(
-            (x.shape[0], x.shape[1], n_heads, qk_rope_head_dim),
-            dtype=output_dtype,
-        ),
+        x.new_empty((x.shape[0], x.shape[1], n_heads, qk_nope_head_dim)),
+        x.new_empty((x.shape[0], x.shape[1], n_heads, qk_rope_head_dim)),
     )
 
 
@@ -807,10 +823,9 @@ def _fake_mla_cache_projection(
     torch._check(positions.dtype == torch.long)
     torch._check(math.isfinite(rope_theta) and rope_theta > 0)
     torch._check(math.isfinite(rms_norm_eps) and rms_norm_eps > 0)
-    output_dtype = _mla_projection_compute_dtype(x)
     return (
-        x.new_empty((x.shape[0], x.shape[1], kv_lora_rank), dtype=output_dtype),
-        x.new_empty((x.shape[0], x.shape[1], rope_dim), dtype=output_dtype),
+        x.new_empty((x.shape[0], x.shape[1], kv_lora_rank)),
+        x.new_empty((x.shape[0], x.shape[1], rope_dim)),
     )
 
 
@@ -1432,8 +1447,11 @@ def _mla_projection_cuda_ineligibility_reason(
     tensors = floating_tensors + (() if positions is None else (positions,))
     if any(tensor.device.type != "cuda" for tensor in tensors):
         return "all MLA projection tensors must be CUDA tensors"
-    if any(tensor.dtype != torch.float32 for tensor in floating_tensors):
-        return "the CUDA MLA projection kernels currently support float32 only"
+    storage_dtype = floating_tensors[0].dtype
+    if storage_dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        return "the CUDA MLA projection kernels support float16, bfloat16, and float32"
+    if any(tensor.dtype != storage_dtype for tensor in floating_tensors[1:]):
+        return "all floating-point MLA projection tensors must have the same dtype"
     if positions is not None and positions.dtype != torch.long:
         return "MLA positions must use int64"
     if len({tensor.device for tensor in tensors}) != 1:
@@ -1456,7 +1474,7 @@ def mla_query_projection(
     rope_theta: float,
     backend: MLABackend = "auto",
 ) -> tuple[Tensor, Tensor]:
-    """Project direct MLA queries with native CUDA when its FP32 contract holds."""
+    """Project direct MLA queries with native CUDA when its storage contract holds."""
 
     _validate_mla_backend(backend)
     reason = _mla_projection_cuda_ineligibility_reason(
@@ -1662,10 +1680,15 @@ def _mla_cuda_ineligibility_reason(
         return "the native extension is not installed"
     if any(tensor.device.type != "cuda" for tensor in tensors):
         return "all MLA tensors must be CUDA tensors"
-    if any(tensor.dtype != torch.float32 for tensor in tensors[:6]):
-        return "the CUDA MLA kernel currently supports float32 only"
+    storage_dtype = q_nope.dtype
+    if storage_dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        return "the CUDA MLA kernel supports float16, bfloat16, and float32"
+    if any(tensor.dtype != storage_dtype for tensor in tensors[1:6]):
+        return "all floating-point MLA tensors must have the same dtype"
     if query_positions.dtype != torch.long or key_positions.dtype != torch.long:
         return "MLA positions must use int64"
+    if len({tensor.device for tensor in tensors}) != 1:
+        return "all MLA tensors must share a CUDA device"
     if not _operator_has_cuda_kernel("mla_absorbed_attention"):
         return "the loaded native extension does not register a CUDA MLA kernel"
     return None

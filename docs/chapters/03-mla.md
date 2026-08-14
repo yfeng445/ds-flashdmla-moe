@@ -193,7 +193,7 @@ FLOPs 计数约定和所有 raw samples。若要观察函数式 cache 复制造�
 ## 3.10 当前 staged CUDA correctness backend
 
 仓库当前没有把整层 MLA 伪装成一个超大 fused kernel，而是沿用 3.6 节的可验证分层，注册
-以下 native FP32 算子：
+以下 native FP16/BF16/FP32 算子：
 
 1. direct query projection + RoPE；
 2. LoRA query projection + RMSNorm + RoPE；
@@ -205,8 +205,10 @@ FLOPs 计数约定和所有 raw samples。若要观察函数式 cache 复制造�
 `backend="cuda"` 要求这六个阶段全部可用，不再只替换 attention core。out-of-place 算子的
 backward 通过可追踪 PyTorch specification 重计算，以便先固定一阶梯度语义；static cache
 写入会修改 storage，因此仍严格限定为 inference-only。该实现证明了完整 prefill/decode
-数据流和 dispatcher 契约。absorbed-attention 已有按 head 维度选择的 warp specialization，
-但还不是生产内核：当前只有 FP32，prefill/decode 尚未使用各自专用调度，也没有 paged cache、
+数据流和 dispatcher 契约。同一次 native 请求中的输入、权重、cache 和 stage 输出使用统一
+storage dtype；linear reduction、RMSNorm 统计、RoPE、在线 Softmax 和 latent/value 累积使用
+FP32，每个公开 stage 再写回 storage dtype。absorbed-attention 已有按 head 维度选择的 warp
+specialization，但还不是生产内核：prefill/decode 尚未使用各自专用调度，也没有 paged cache、
 continuous-batching slot 生命周期或 profiler 驱动的跨算子融合。
 
 ## 3.11 位置校验也可能成为 GPU 同步边界

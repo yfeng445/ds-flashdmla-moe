@@ -24,7 +24,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Blockwise online attention | yes | CPU + CUDA | FP32-accumulating online-softmax kernel | no |
 | DeepSeek grouped Top-K gate | yes | CPU | FP32 sigmoid source | replicated in EP |
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
-| MLA prefill/decode | naive + absorbed | CPU + CUDA pipeline | staged FP32 ops + small-dimension warp-partition attention | no |
+| MLA prefill/decode | naive + absorbed | CPU + CUDA pipeline | staged FP16/BF16/FP32 storage with FP32 accumulation | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
 | One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
 
@@ -107,18 +107,20 @@ The current one-thread-per-token selector uses serial candidate scans, so it
 establishes routing, stream, dispatcher, and autograd semantics rather than a
 production-performance claim.
 
-`mla_absorbed_attention(..., backend="cuda")` now selects a staged native FP32
-pipeline: direct or LoRA query projection, RMSNorm/RoPE, absorbed attention over
-the compressed `[B,S,r_kv]` cache, and output projection. `build_mla_cache` uses
-the matching native KV projection, while `write_mla_static_cache` projects
+`mla_absorbed_attention(..., backend="cuda")` selects a staged native pipeline:
+direct or LoRA query projection, RMSNorm/RoPE, absorbed attention over the
+compressed `[B,S,r_kv]` cache, and output projection. All floating tensors in one
+native request use the same FP16, BF16, or FP32 storage dtype; linear reductions,
+RMSNorm statistics, RoPE, online softmax, and latent/value accumulation use FP32.
+Each public stage writes back to the selected storage dtype. `build_mla_cache`
+uses the matching native KV projection, while `write_mla_static_cache` projects
 directly into preallocated KV/position storage without reallocating it. The
 out-of-place operators use traceable PyTorch-recompute backward; static cache
 writes remain explicitly inference-only. When latent, RoPE, and value dimensions
 are all at most 32, the attention core assigns strided key partitions to four
 warps, merges their online-softmax states stably, and avoids block-wide barriers
 inside the key loop; larger dimensions retain the generic kernel. This remains a
-correctness-oriented FP32 backend, not yet a low-precision, paged-cache, or
-FA2/FA3-class implementation.
+correctness-oriented backend, not yet a paged-cache or FA2/FA3-class implementation.
 
 ## Repository layout
 
@@ -301,6 +303,8 @@ raw sample and numerical check. Cross-family ratio statistics are unweighted
 descriptors over heterogeneous workloads and baselines, not an overall speedup.
 The optional `--profile flash-attn-4` profile adds four low-precision Attention-only pairs without
 making the beta FA4 package a default dependency or changing the representative manifest.
+The optional `--profile mla-low-precision` profile adds four staged MLA pairs covering FP16/BF16,
+prefill/decode, regular dimensions, and tails while keeping the default matrix unchanged.
 
 One exact side of that matrix can be captured with PyTorch/Kineto before moving
 to Nsight:

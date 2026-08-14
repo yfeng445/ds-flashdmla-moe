@@ -119,6 +119,20 @@ def test_flash_attn_4_matrix_case_can_be_selected_for_profiling() -> None:
     assert case.native_config.dtype == case.baseline_config.dtype == "bfloat16"
 
 
+def test_mla_low_precision_matrix_case_can_be_selected_for_profiling() -> None:
+    case = profiling._selected_case(
+        OperatorProfileConfig(
+            case="mla_low_precision_decode_bfloat16",
+            warmup=0,
+            iterations=1,
+        )
+    )
+
+    assert case.native_config.implementation == "cuda"
+    assert case.baseline_config.implementation == "absorbed"
+    assert case.native_config.dtype == case.baseline_config.dtype == "bfloat16"
+
+
 def test_torch_profile_report_classifies_events_and_exports_trace(
     monkeypatch,
     tmp_path: Path,

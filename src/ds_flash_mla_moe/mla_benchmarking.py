@@ -87,8 +87,12 @@ class MLABenchmarkConfig:
             raise ValueError("implementation must be naive, absorbed, or cuda")
         if self.implementation == "cuda" and torch.device(self.device).type != "cuda":
             raise ValueError("the CUDA MLA implementation requires device=cuda")
-        if self.implementation == "cuda" and self.dtype != "float32":
-            raise ValueError("the CUDA MLA implementation currently requires float32")
+        if self.implementation == "cuda" and self.dtype not in {
+            "float16",
+            "bfloat16",
+            "float32",
+        }:
+            raise ValueError("the CUDA MLA implementation requires float16, bfloat16, or float32")
         if self.workload not in {
             "prefill_attention",
             "prefill_with_cache",
@@ -331,6 +335,14 @@ def _error_report(
         # the references delegate reductions to BLAS. These paths remain
         # within ordinary FP32 error of a float64 oracle at smoke-test sizes.
         rtol, atol = 5e-4, 5e-4
+    elif actual.dtype == torch.float16:
+        # Full MLA writes several projection, normalization, RoPE, attention,
+        # and output-projection boundaries back to storage dtype. The benchmark
+        # deliberately uses unscaled random weights, so composed error is wider
+        # than the per-operator FP16 contract checked in CUDA unit tests.
+        rtol, atol = 1e-2, 2e-2
+    elif actual.dtype == torch.bfloat16:
+        rtol, atol = 5e-2, 3e-1
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     difference = (actual.to(torch.float64) - expected.to(torch.float64)).abs()
     tolerance = atol + rtol * expected.to(torch.float64).abs()
@@ -523,7 +535,8 @@ def benchmark_mla(config: MLABenchmarkConfig) -> dict[str, Any]:
             "decode_with_static_write reuses fixed storage and writes only the new cache entry",
             (
                 "cuda covers query projection, cache projection/static write, absorbed online "
-                "attention, and output projection with native FP32 operators"
+                "attention, and output projection with same-dtype native operators and FP32 "
+                "accumulation"
                 if config.implementation == "cuda"
                 else "naive and absorbed paths are correctness references, not fused MLA kernels"
             ),

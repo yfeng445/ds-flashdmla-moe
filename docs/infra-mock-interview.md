@@ -37,11 +37,12 @@ Kernel / 推理系统工程师**，基于当前仓库事实；不修改根目录
 这是一个 correctness-first 的 DeepSeek MLA + MoE 算子项目。项目先用 PyTorch reference
 固定 attention、MLA、routing 和 expert parallel 的数值/梯度语义，再逐步接入 PyTorch
 custom op 与 CUDA。当前最完整的链路是 MLA：我能解释并复现 naive 到 absorbed 的等价
-推导、compressed static cache，以及直接读取 latent cache 的 FP32 CUDA core。这个 core
+推导、compressed static cache，以及直接读取 latent cache 的 FP16/BF16/FP32 CUDA core。这个 core
 融合了 causal mask、online softmax 和 latent value accumulation，不展开完整 per-head K/V，
 也不写出完整 score matrix。staged pipeline 已将 projection、RoPE、attention 与 `W_O` 分别
 接入 native CUDA，并在单张 RTX 5090、CUDA 12.8 环境完成 forward、reference-recompute
-backward、非默认 stream 和全仓测试。MLA 当前边界仍是 FP32、无显式 mask；多卡 NCCL 与
+backward、非默认 stream 和全仓测试。MLA 当前边界是同 dtype 低精度 storage、FP32 accumulation、
+无显式 mask；多卡 NCCL 与
 NVSHMEM 也没有本地性能验证。普通 Attention 另有 FP16/BF16/FP32 native forward/backward，
 不要把两条 dtype contract 混在一起。
 
@@ -68,7 +69,7 @@ NVSHMEM 也没有本地性能验证。普通 Attention 另有 FP16/BF16/FP32 nat
 absorbed MLA；框架层能说明 schema、CUDA dispatch、FakeTensor 和 autograd registration；
 CUDA 层能解释一个 block 对应 `(B,H,S_q)` 中一行、shared memory 里各缓冲区、在线 softmax
 状态更新、绝对位置 causal mask、当前 stream 和 device guard。与此同时，我也会主动指出它
-现在 MLA 每 key 仍有同步且只支持 FP32；普通 Attention 虽已补齐 FP16/BF16 contract，仍无
+现在 MLA 每 key 仍有同步，低精度路径也仍是标量 FP32 accumulation；普通 Attention 同样尚无
 二维 tiling/Tensor Core 调度。我的定位是已有完整 correctness kernel 闭环、正向生产级优化
 能力推进，而不是已经具备成熟 FA3/FA4 优化经验。
 
