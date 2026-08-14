@@ -81,10 +81,10 @@ pytest -ra --strict-markers -W error::UserWarning
 - `ruff check`：通过；
 - `git diff --check`：通过；
 - GitHub Actions `Reference tests` 的 Python 3.10/3.12 matrix：通过：
-  <https://github.com/yfeng445/ds-flashdmla-moe/actions/runs/31767920497>；
+  <https://github.com/yfeng445/ds-flashdmla-moe/actions/runs/31772488212>；
 - GitHub Actions `CUDA build / wheel`：通过，并检查 14 个 CUDA dispatch kernel；wheel
   同时携带 forward-compatible PTX：
-  <https://github.com/yfeng445/ds-flashdmla-moe/actions/runs/31767920481>。
+  <https://github.com/yfeng445/ds-flashdmla-moe/actions/runs/31772197874>。
 
 ### 4.1 已解决的 MLA output-layout contract
 
