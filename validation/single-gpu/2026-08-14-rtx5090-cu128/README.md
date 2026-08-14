@@ -12,7 +12,7 @@ performance comparison or a sustained self-hosted CI result.
 - PyTorch 2.10.0 with CUDA 12.8
 - Native extension loaded with all 14 CUDA dispatcher kernels
 
-The current CUDA-aware test suite passed with `380 passed`. Each paired latency JSON contains
+The current CUDA-aware test suite passed with `390 passed`. Each paired latency JSON contains
 the exact configuration, environment metadata, numerical verification, latency summary, and
 all 20 raw post-warmup samples. Native and baseline reports use identical inputs and shapes.
 
@@ -40,11 +40,11 @@ Every nested native and baseline report retains 20 post-warmup samples.
 
 | Family | Cases | Coverage | Baseline | Native lower | Baseline lower | Native / baseline range |
 | --- | ---: | --- | --- | ---: | ---: | ---: |
-| GEMM | 4 | regular, decode, tails | PyTorch/cuBLAS | 2 | 2 | 0.411–6.598 |
-| Attention | 4 | prefill, decode, tails | PyTorch SDPA | 2 | 2 | 0.632–1.337 |
-| MLA | 5 | prefill, decode, direct/LoRA, tails | absorbed PyTorch | 5 | 0 | 0.251–0.696 |
-| Experts | 4 | FP32/FP16, tails, skew/empty experts | padded PyTorch | 4 | 0 | 0.050–0.204 |
-| Router | 3 | regular, tail, hot-expert skew | PyTorch reference | 3 | 0 | 0.250–0.322 |
+| GEMM | 4 | regular, decode, tails | PyTorch/cuBLAS | 2 | 2 | 0.122–2.650 |
+| Attention | 4 | prefill, decode, tails | PyTorch SDPA | 1 | 3 | 0.380–7.349 |
+| MLA | 5 | prefill, decode, direct/LoRA, tails | absorbed PyTorch | 5 | 0 | 0.059–0.258 |
+| Experts | 4 | FP32/FP16, tails, skew/empty experts | padded PyTorch | 4 | 0 | 0.060–0.212 |
+| Router | 3 | regular, tail, hot-expert skew | PyTorch reference | 3 | 0 | 0.228–0.299 |
 
 These ratios are only paired observations for this machine and configuration. Baselines and
 operator boundaries differ across families, so the aggregate ratio statistics in the JSON are
@@ -58,18 +58,20 @@ PyTorch/Kineto aggregates for one native side of the representative matrix. Each
 one unprofiled preflight and then records fresh setup, one output call, 5 warmup calls, and 20
 timed calls. No large Chrome trace is checked in.
 
-| Case | Main-path calls | DtoH scalar reads before | After | Stream synchronizations before | After | Absorbed-attention share of custom-op self-device time |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `mla_prefill_regular` | 26 | 212 | 28 | 220 | 36 | 67.2% |
-| `mla_decode_regular` | 26 | 162 | 29 | 170 | 37 | 81.3% |
+| Case | Calls | DtoH reads before/after | Stream sync before/after | Absorbed kernel before/after (ms) | Current custom-op share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `mla_prefill_regular` | 26 | 212 / 28 | 220 / 36 | 2.632 / 0.429 | 41.8% |
+| `mla_decode_regular` | 26 | 162 / 29 | 170 / 37 | 2.699 / 0.491 | 44.3% |
 
-The pre-change counts were captured during the same optimization session; the checked-in JSON
-files contain the post-change aggregates. The reduction comes from reusing successful position
-validation only while the Tensor identity/version is unchanged. Mutation regression tests cover
-both latent and static-cache storage. These counts diagnose host synchronization; they are not
-an Nsight report and do not imply an equal latency reduction. The custom-op share only compares
-the mutually relevant custom-operator rows in this capture; parent operator and child kernel
-views elsewhere in the profiler table are correlated and must not be summed.
+The pre-change counts and kernel times were captured with the same cases before the corresponding
+optimization; the checked-in JSON files contain the current aggregates. Position validation is
+reused only while Tensor identity/version is unchanged, with mutation regressions for latent and
+static-cache storage. For latent, RoPE, and value dimensions at most 32, absorbed attention now
+partitions keys across four warps, maintains one online-softmax state per warp, and performs one
+stable merge. Larger dimensions retain the generic block-wide kernel. The current reports name
+`mla_absorbed_attention_warp_partition_float_kernel` explicitly; the 6.13x/5.50x reductions above
+are profiler kernel self-device observations, not end-to-end speedups or Nsight counter results.
+Parent operator and child kernel rows are correlated and must not be summed.
 
 The commands and fixed shapes mirror `.github/workflows/cuda-tests.yml`. Re-run that workflow
 on a registered single-GPU runner before treating this snapshot as continuously reproducible.

@@ -2,8 +2,8 @@
 
 更新时间：2026-08-14
 
-当前基线：`main`，已包含 staged end-to-end MLA CUDA、稳定输出布局契约、单 GPU 成对基线
-快照，以及可复现的单 case Kineto/NVTX profiling 入口。
+当前基线：`main`，已包含 staged end-to-end MLA CUDA、小维度 absorbed-attention warp-partition
+调度、稳定输出布局契约、单 GPU 成对基线快照，以及可复现的单 case Kineto/NVTX profiling 入口。
 
 远端：<https://github.com/yfeng445/ds-flashdmla-moe>
 
@@ -26,10 +26,11 @@ correctness-first 的 DeepSeek MLA + MoE 学习与实现项目。核心原则是
 当前可视为 **v0.1 correctness + local single-GPU smoke milestone**。`main` 的
 CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并注册 14 个 native
 算子；RTX 5090 本地环境也已跑通完整 CUDA 测试、固定 shape smoke benchmark、20-case
-代表性 shape matrix 和 MLA PyTorch/Kineto profiler triage。尚未完成持续 self-hosted GPU
-CI、双 GPU NCCL、原生 Nsight 取证和主流第三方实现对照，因此仍不具备生产性能结论。
+代表性 shape matrix、MLA PyTorch/Kineto profiler triage 和首轮 CUDA kernel 专项优化。
+尚未完成持续 self-hosted GPU CI、双 GPU NCCL、原生 Nsight 取证和主流第三方实现对照，
+因此仍不具备生产性能结论。
 
-粗略进度约为 **86%**。这里的百分比衡量的是学习/研究仓库的完成度，不代表生产可用性。
+粗略进度约为 **87%**。这里的百分比衡量的是学习/研究仓库的完成度，不代表生产可用性。
 
 | 方向 | 状态 | 说明 |
 | --- | --- | --- |
@@ -39,7 +40,7 @@ CI、双 GPU NCCL、原生 Nsight 取证和主流第三方实现对照，因此�
 | CUDA 算子源码 | `main` 有 14 个算子 | Attention forward/backward、tiled GEMM、router、route pack/combine、expert-major pack、SwiGLU experts，以及 6 个 staged MLA 算子 |
 | FP16 Tensor Core | 已实现并完成本地单卡 smoke | expert-major SwiGLU 使用 WMMA、FP32 accumulation 和显式 FP16 hidden boundary；仍缺持续 GPU CI |
 | NCCL Expert Parallel | 代码已实现，待双 GPU 验证 | 包括可微 All-to-All 和异步 chunk pipeline |
-| MLA CUDA | end-to-end correctness backend 已进入 `main` | direct/LoRA query、KV projection/static write、absorbed attention、output projection 均有 FP32 native op；低精度、paged cache 与生产级调优仍未实现 |
+| MLA CUDA | end-to-end correctness + 首轮 kernel specialization 已进入 `main` | direct/LoRA query、KV projection/static write、absorbed attention、output projection 均有 FP32 native op；小维度 attention 使用四 warp key partition，低精度、paged cache 与生产级调优仍未实现 |
 | One-sided/NVSHMEM | 未实现 | 当前只有 symmetric-buffer 成本与布局模型 |
 | 性能结论 | 尚不可下结论 | 已有单卡固定 shape、20-case matrix 和 Kineto 聚合，但仍缺持续 runner、Nsight trace 和 CUTLASS/主流 FlashAttention 对照 |
 
@@ -72,7 +73,7 @@ CI、双 GPU NCCL、原生 Nsight 取证和主流第三方实现对照，因此�
 
 ```text
 pytest -ra --strict-markers -W error::UserWarning
-311 passed, 69 skipped in 9.47s
+311 passed, 79 skipped in 9.66s
 ```
 
 另已完成：
@@ -99,7 +100,7 @@ WSL2 / RTX 5090 / PyTorch 2.10 + CUDA 12.8 环境运行：
 
 ```text
 pytest -ra --strict-markers -W error::UserWarning
-380 passed in 26.04s
+390 passed in 27.4s
 ```
 
 同一环境完成 GEMM、Attention、MLA attention-only、完整 MLA prefill、完整 MLA
@@ -117,11 +118,11 @@ experts 4 组、router 3 组，共覆盖 5 个 regular、8 个 tail、4 个 deco
 
 原固定 shape 快照仍保留完整 MLA 的 1.155536/2.636864 ms prefill 和
 1.028400/2.058480 ms decode native/baseline 数据。应用 Python-side position validation
-优化后，最新 representative matrix 中对应 regular case 为 0.325520/1.299392 ms 和
-0.441744/1.689824 ms。两轮都只是本机诊断样本；系统状态和测量轮次不同，不应把两组差值
-全部归因于一次代码修改，也不能外推到其他 shape、dtype 或硬件。
+优化并加入小维度 warp-partition kernel 后，最新 representative matrix 中对应 regular case 为
+0.272960/1.835232 ms 和 0.258352/4.389200 ms。各轮都只是本机诊断样本；系统状态和测量轮次
+不同，不应把差值全部归因于一次代码修改，也不能外推到其他 shape、dtype 或硬件。
 
-### 4.3 MLA profiler-driven Python 同步优化
+### 4.3 MLA profiler-driven 同步与 kernel 优化
 
 新增 `benchmarks/profile.py`，可对 20-case matrix 中任意一个 `native`/`baseline` side 运行
 PyTorch/Kineto 聚合或 NVTX 标记。runner 在 capture 外先完整预热一次，再捕获 fresh setup、
@@ -132,9 +133,15 @@ PyTorch/Kineto 聚合或 NVTX 标记。runner 在 capture 外先完整预热一�
 对 `mla_prefill_regular`/`mla_decode_regular` 的 26-call capture，重复 position 校验优化使
 `aten::_local_scalar_dense` 从 212/162 降到 28/29，`cudaStreamSynchronize` 从 220/170
 降到 36/37。成功校验只在 Tensor identity/version 未变化时复用；latent cache、query
-positions 和 static position storage 原地修改都会使缓存失效并重新校验。修改后的结构化报告
-保存在单 GPU validation 目录。该次 capture 中 absorbed-attention 分别占 custom-operator
-self-device 时间的 67.2%/81.3%，是下一轮 MLA CUDA profiler 的首要目标。
+positions 和 static position storage 原地修改都会使缓存失效并重新校验。
+
+该次 capture 将 absorbed-attention 定位为首要 device 热点后，`latent_dim`、`rope_dim` 和
+`value_dim` 均不超过 32 的常见 DeepSeek-style shape 改用四 warp key partition：每个 warp
+维护独立 online-softmax 状态，最后做一次稳定合并；任一维度超过 32 时仍走原 generic kernel。
+specialized 边界、tail、causal/non-causal、非连续 stride 和三种 generic fallback 均已有 CUDA
+回归测试。相同 26-call Kineto 口径下，absorbed kernel self-device 总时间从 prefill/decode 的
+2.632/2.699 ms 降至 0.429/0.491 ms，当前占 custom-op self-device 时间的 41.8%/44.3%。这是
+本机 profiler 观察，不是端到端或跨硬件加速结论；结构化报告保存在单 GPU validation 目录。
 
 ## 5. 当前阻塞与已知缺口
 
@@ -157,9 +164,9 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
 - Attention CUDA 仍是 correctness-first FP32 路径，不是 FA2/FA3 级实现；
 - grouped router 使用 one-thread-per-token 的串行候选扫描；
 - MoE kernel 尚无 async copy、TMA、WGMMA 或 profiler-driven tuning；
-- staged MLA 已覆盖 FP32 correctness pipeline，Python 重复同步已按 Kineto 结果优化；但
-  prefill/decode 仍共用 correctness-first absorbed-attention kernel，尚无 FP16/BF16、
-  paged/per-slot cache、异步拷贝或 profiler-driven fusion；
+- staged MLA 已覆盖 FP32 correctness pipeline，Python 重复同步和常见小维度 absorbed-attention
+  已按 Kineto 结果优化；但 prefill/decode 仍共享同一算子入口和维度调度，尚无 FP16/BF16、
+  paged/per-slot cache、长上下文分块、异步拷贝或 profiler-driven fusion；
 - 代表性单 GPU shape matrix 已覆盖 regular/tail/decode/skew，但尚未接入 CUTLASS 或主流
   FlashAttention，也没有长上下文与更多低精度矩阵；
 - chunk pipeline 只证明了软件异步协议，尚无 profiler 证据证明物理 overlap；
@@ -167,18 +174,17 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
 
 ## 6. 下一步执行顺序
 
-1. 注册并运行单 GPU self-hosted runner，让现有 380-test、9 组固定快照和 20-case matrix
+1. 注册并运行单 GPU self-hosted runner，让现有 390-test、9 组固定快照和 20-case matrix
    变成可持续 workflow artifact。
 2. 在双 GPU runner 上验证 NCCL FP32、FP16 WMMA 与 chunked pipeline 的 forward/backward，
    保存每 rank 原始 latency 和通信量。
 3. 在已有 Kineto/NVTX 入口上用 Nsight Systems/Compute 检查 Attention、MLA、router、experts
-   的 kernel bottleneck；MLA 先分析 absorbed-attention，再在双卡上验证 NCCL chunk
-   pipeline 是否真正 overlap。
+   的 kernel bottleneck；MLA 先验证 warp-partition kernel 的 occupancy/访存，再分析 projection
+   与 launch 边界，并在双卡上验证 NCCL chunk pipeline 是否真正 overlap。
 4. 在现有 20-case matrix 中加入可用的 CUTLASS 或主流 FlashAttention baseline，并按
    profiler 结果补充长上下文与低精度 case，而不是继续堆叠任意 shape。
-5. 根据原生 profiler 先优化 absorbed-attention，并把 staged MLA correctness backend 扩展为
-   专用 prefill/decode、FP16/BF16 和 paged/per-slot cache，再考虑 FA2/FA3、TMA/WGMMA、
-   router 优化和 one-sided EP。
+5. 根据原生 profiler 把当前维度 specialization 继续扩展为专用 prefill/decode、FP16/BF16 和
+   paged/per-slot cache，再考虑 FA2/FA3、TMA/WGMMA、router 优化和 one-sided EP。
 
 前三步完成前，不应在 README 中加入“高性能”“快于某实现”等未经证实的结论。
 

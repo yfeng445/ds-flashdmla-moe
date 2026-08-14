@@ -205,8 +205,9 @@ FLOPs 计数约定和所有 raw samples。若要观察函数式 cache 复制造�
 `backend="cuda"` 要求这六个阶段全部可用，不再只替换 attention core。out-of-place 算子的
 backward 通过可追踪 PyTorch specification 重计算，以便先固定一阶梯度语义；static cache
 写入会修改 storage，因此仍严格限定为 inference-only。该实现证明了完整 prefill/decode
-数据流和 dispatcher 契约，但还不是生产内核：当前只有 FP32，prefill/decode 尚未使用各自
-专用调度，也没有 paged cache、continuous-batching slot 生命周期或 profiler 驱动的融合。
+数据流和 dispatcher 契约。absorbed-attention 已有按 head 维度选择的 warp specialization，
+但还不是生产内核：当前只有 FP32，prefill/decode 尚未使用各自专用调度，也没有 paged cache、
+continuous-batching slot 生命周期或 profiler 驱动的跨算子融合。
 
 ## 3.11 位置校验也可能成为 GPU 同步边界
 
@@ -238,7 +239,32 @@ RTX 5090 上对 representative MLA case 的同口径 capture 包含一次输出�
 | `mla_decode_regular` | 162 | 29 | 170 | 37 |
 
 这证明的是 Python-side 隐式同步减少，不等价于宣称 kernel 延迟按相同比例下降。修改后的聚合
-报告保存在 `validation/single-gpu/2026-08-14-rtx5090-cu128/`。该次快照中，absorbed-attention
-分别占 prefill/decode custom-operator self-device 时间的 67.2% 和 81.3%，因此下一轮 CUDA
-工作应先用 Nsight Compute 分解它的访存、occupancy 和指令瓶颈，再决定专用 prefill/decode
-调度或融合边界。
+报告保存在 `validation/single-gpu/2026-08-14-rtx5090-cu128/`。第一轮快照中，absorbed-attention
+分别占 prefill/decode custom-operator self-device 时间的 67.2% 和 81.3%，因此它成为下一轮
+CUDA 优化目标。
+
+## 3.12 小 head 维度的 warp-partition attention
+
+原 generic kernel 为每个 `[batch, head, query]` 行启动一个 128-thread block。每处理一个 key，
+它都需要在整个 block 上归约 latent dot 与 RoPE dot，并同步在线 Softmax 状态和 latent numerator。
+当 `R_kv=32`、`D_rope=16`、`D_v=32` 时，大量线程不持有有效分量，而每个 key 仍承担多次
+block-wide barrier。
+
+当前 specialized 路径在 `R_kv`、`D_rope`、`D_v` 都不超过 32 时采用四个 warp：
+
+1. warp 0 先计算并共享一次 absorbed latent query；
+2. 四个 warp 分别处理 `key_index = warp_id + 4n` 的 key 子序列；
+3. 每个 warp 用 shuffle 完成 dot reduction，并维护自己的 online-softmax maximum、denominator
+   和 latent numerator；
+4. key 循环结束后，warp 0 用各 partition maximum 做一次数值稳定合并，再完成 latent-to-value
+   projection。
+
+这样每个 key 的循环内不再需要 block-wide barrier。任一受管维度大于 32 时仍选择 generic
+kernel，因此优化没有缩小公开算子的 shape/stride 契约。CUDA 回归覆盖 32 临界点、非整齐维度、
+causal/non-causal、非连续 last-dimension stride，以及 latent、RoPE、value 三种独立 fallback。
+
+同一 RTX 5090 上，包含 26 次主路径调用的 Kineto capture 将 absorbed kernel self-device 总时间
+从 prefill/decode 的 2.632/2.699 ms 降到 0.429/0.491 ms；它在当前 custom-op self-device 时间中
+所占比例也降到 41.8%/44.3%。这只是相同固定 case 的本机 kernel 观察：它不包含可泛化的 Nsight
+counter，也不能当作端到端或其它 shape/hardware 的加速比。下一步仍需用 Nsight Compute 检查
+occupancy、memory traffic 和指令分布，再决定 prefill/decode 专用调度与融合边界。

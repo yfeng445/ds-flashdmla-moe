@@ -24,7 +24,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Blockwise online attention | yes | CPU | FP32 forward/backward source | no |
 | DeepSeek grouped Top-K gate | yes | CPU | FP32 sigmoid source | replicated in EP |
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
-| MLA prefill/decode | naive + absorbed | CPU + CUDA pipeline | staged FP32 projection/cache/attention/output ops | no |
+| MLA prefill/decode | naive + absorbed | CPU + CUDA pipeline | staged FP32 ops + small-dimension warp-partition attention | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
 | One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
 
@@ -111,8 +111,12 @@ the compressed `[B,S,r_kv]` cache, and output projection. `build_mla_cache` uses
 the matching native KV projection, while `write_mla_static_cache` projects
 directly into preallocated KV/position storage without reallocating it. The
 out-of-place operators use traceable PyTorch-recompute backward; static cache
-writes remain explicitly inference-only. This is an end-to-end correctness
-backend, not yet a low-precision, paged-cache, or FA2/FA3-class implementation.
+writes remain explicitly inference-only. When latent, RoPE, and value dimensions
+are all at most 32, the attention core assigns strided key partitions to four
+warps, merges their online-softmax states stably, and avoids block-wide barriers
+inside the key loop; larger dimensions retain the generic kernel. This remains a
+correctness-oriented FP32 backend, not yet a low-precision, paged-cache, or
+FA2/FA3-class implementation.
 
 ## Repository layout
 
