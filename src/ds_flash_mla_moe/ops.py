@@ -334,8 +334,10 @@ def _composite_mla_absorbed_attention(
         torch.zeros_like(numerators),
     )
     latent_output = torch.einsum("bhst,btr->bshr", probabilities, kv_compute)
-    return torch.einsum("bshr,hdr->bshd", latent_output, value_up.to(compute_dtype)).to(
-        q_nope.dtype
+    return (
+        torch.einsum("bshr,hdr->bshd", latent_output, value_up.to(compute_dtype))
+        .to(q_nope.dtype)
+        .contiguous()
     )
 
 

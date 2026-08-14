@@ -167,6 +167,9 @@ def test_raw_absorbed_operator_passes_opcheck() -> None:
         torch.ops.ds_flash_mla_moe.mla_absorbed_attention.default,
         inputs,
     )
+    output = torch.ops.ds_flash_mla_moe.mla_absorbed_attention.default(*inputs)
+    assert output.is_contiguous()
+    assert output.stride() == torch.empty_like(output).stride()
 
 
 def test_raw_absorbed_operator_runs_through_torch_compile() -> None:
