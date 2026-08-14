@@ -225,22 +225,21 @@ scatter race，后者是明确的生命周期操作，会一起替换 latent、R
 
 ### 2.7 当前单卡性能证据怎么说
 
-可以准确说：在 RTX 5090、PyTorch `2.10.0+cu128`、CUDA 12.8、FP32，配置
-`B=1, S=128, D=128, H=4, r_kv=32`，5 次 warmup、20 次采样：
+可以准确说：在 RTX 5090、PyTorch `2.10.0+cu128`、CUDA 12.8，paged decode profile
+使用 `page_size=16`、5 次 warmup、20 次采样：
 
-- fused CUDA prefill median 为约 `1.904 ms`；同一 benchmark harness 下 absorbed PyTorch
-  路径约 `2.304 ms`，这个特定 shape 下约 `1.21x`；
-- static-cache decode median 为约 `2.722 ms`；absorbed PyTorch 路径约 `3.038 ms`，约
-  `1.12x`；
-- 对 absorbed reference 的最大 tolerance ratio 分别约 `0.356` 与 `0.012`，均在设置的
-  FP32 组合运算容差内。
+- BF16 `B=2,S=257,H=4,r_kv=32` 的 native/PyTorch-paged median 为
+  `0.336480/2.139152 ms`，比值 `0.157`；
+- FP16 `B=1,S=129,H=3,r_kv=19` 的 median 为 `0.524192/1.846000 ms`，比值 `0.284`；
+- 两对都通过 alternate naive/absorbed reference；FP16 native 最大绝对误差为 `0.0625`，
+  tolerance ratio 为 `0.428`。
 
-必须紧接着补充：这是小 shape、单卡、source-dirty 开发态 smoke，不是生产模型吞吐，也没有
-与 FlashMLA、FlashAttention、Triton、cuDNN SDPA 或 CUTLASS 做同等语义对比。decode 结果还
-包含 Python/PyTorch 周边操作，不能单独归因于 CUDA core。报告位于 `benchmark-results/`；
-没有这些限定时，不要只说“提升 1.21x”。
+必须紧接着补充：baseline 是项目内同 dtype PyTorch paged specification，不是 vLLM、FlashMLA
+或生产 serving runtime；这是两个小 shape、单卡桌面 WSL 的 clean-source 快照，计时包含 per-slot
+write、校验缓存、dispatcher、query/output projection 和 paged attention。它不能外推为生产吞吐，
+也不能把 `1/0.157` 单独包装成普适加速比。报告位于 `validation/single-gpu/`。
 
-### 2.8 如果被问“为什么目前只快一点”
+### 2.8 如果被问“既然这两个 median 更低，为什么还不称高性能”
 
 合理回答不是找借口，而是指出当前结构：一个 block 负责一个 `(batch, head, query)` row；
 每个 key 都进行 block reduction 和同步；latent query、numerator 与 reduction buffer 放在 shared
@@ -429,7 +428,7 @@ x -> RMSNorm -> Attention -> residual add
 | 容易失分的说法 | 建议说法 | 当前证据 | 个人边界 / 风险 |
 | --- | --- | --- | --- |
 | “我实现了 FlashMLA” | “项目实现了一个 correctness-first、FP16/BF16/FP32 staged absorbed MLA CUDA pipeline” | 原生 CUDA 源码、dispatcher、CUDA 测试和 smoke 报告 | 不是官方 FlashMLA，也没有 FA3/TMA/WGMMA |
-| “MLA 快了 1.21x” | “在 RTX 5090 的一个 B1/S128 FP32 smoke shape 下，median 相对项目 absorbed baseline 为约 1.21x” | 两份同 harness benchmark JSON | shape 很小；非生产模型；开发态源码 |
+| “paged MLA 快 6.36×” | “RTX 5090 的一个 BF16 B2/S257 paired case 中，native/PyTorch-paged median 比值为 0.157” | clean-source matrix、同输入/精度/计时控制与 reference 校验 | 只有两个小 case；baseline 不是生产 serving runtime；不能外推 |
 | “做了多卡通信计算重叠” | “实现了 NCCL-only chunk/async 软件协议；物理 overlap 尚待多卡 timeline 验证” | async All-to-All 与 chunk pipeline 代码；Gloo 两 rank语义测试 | 本地只有单卡，不能声称多卡性能 |
 | “支持反向” | “CUDA forward 的一阶梯度通过可追踪 absorbed reference recompute 获得” | custom-op autograd 注册及梯度对照测试 | 不是 fused native MLA backward |
 | “支持任意输入” | “高层 API 可 fallback；原生 MLA 当前限定同 dtype CUDA FP16/BF16/FP32、无显式 mask，并提供 paged latent-cache primitive” | 输入契约、paged 边界测试和 CUDA 对照 | 不支持 mixed dtype、任意 mask、完整 page allocator/continuous batching 或生产尺寸调优 |

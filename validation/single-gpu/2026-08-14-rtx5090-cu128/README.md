@@ -10,9 +10,9 @@ performance comparison or a sustained self-hosted CI result.
 - WSL2 Linux x86_64
 - Python 3.12.13
 - PyTorch 2.10.0 with CUDA 12.8
-- Native extension loaded with all 14 CUDA dispatcher kernels
+- Native extension loaded with all 16 CUDA dispatcher kernels
 
-The current CUDA-aware test suite passed with `493 passed`. Each paired latency JSON contains
+The current CUDA-aware test suite passed with `520 passed`. Each paired latency JSON contains
 the exact configuration, environment metadata, numerical verification, latency summary, and
 all 20 raw post-warmup samples. Native and baseline reports use identical inputs and shapes.
 
@@ -88,6 +88,31 @@ All eight outputs passed the alternate naive/absorbed MLA reference check, and t
 generated from a clean source tree. The native median was lower in all four runs, but these are
 small, unscaled-random-weight workloads on a desktop WSL session. The result is a correctness
 and profiler baseline, not a claim about production models, long contexts, or other hardware.
+
+## Paged MLA decode pairs
+
+[`operator-matrix-mla-paged.json`](operator-matrix-mla-paged.json) records two same-dtype decode
+pairs whose timed boundary contains one physical-slot projection write followed by absorbed
+attention directly through a block table. Both reports use `page_size=16`, five warmups, twenty
+samples, and a clean source tree.
+
+| Case | Dtype | Native median (ms) | PyTorch paged median (ms) | Native / baseline | Lower median |
+| --- | --- | ---: | ---: | ---: | --- |
+| `B=2,S=257,H=4,Rkv=32`, long tail page | BF16 | 0.336480 | 2.139152 | 0.157 | native |
+| `B=1,S=129,H=3,Rkv=19`, tail dimensions | FP16 | 0.524192 | 1.846000 | 0.284 | native |
+
+All four outputs passed the alternate naive/absorbed verification. The BF16 pair had zero observed
+absolute error for this generated input; the FP16 native result had maximum absolute error `0.0625`
+and tolerance ratio `0.428`. These two small cases validate the storage/compute path and provide
+profiling targets; they do not establish production serving throughput or a general performance
+ordering.
+
+[`torch-profiler-mla-paged.json`](torch-profiler-mla-paged.json) captures the BF16 native side with
+one output call, five warmups, and twenty timed calls. Across 26 paged-attention calls it records
+five `_local_scalar_dense` events and seventeen stream synchronizations; validation metadata is
+reused after the first successful identity/version check. The paged-attention kernel contributes
+`6.501 ms` aggregate self-device time and remains the primary CUDA optimization target. This is a
+Kineto aggregate, not an Nsight counter report; parent operator and child kernel rows are correlated.
 
 ## MLA profiler triage
 

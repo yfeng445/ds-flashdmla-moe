@@ -155,24 +155,24 @@ absorbed PyTorch reference，再用 `torch.autograd.grad` 求请求的输入梯�
 
 ## 第三轮：性能证据与诊断
 
-### Q7：你说 prefill 快约 1.21x，请完整描述实验；这个数字能证明什么？
+### Q7：paged BF16 case 的 native/baseline 比值是 0.157；你能把它说成 6.36× 吗？
 
 <details>
 <summary>参考回答</summary>
 
-这是单张 RTX 5090、PyTorch 2.10.0+cu128、CUDA 12.8 上的 FP32 smoke。shape 是
-`B1/S128/D128/H4/r_kv32`，5 次 warmup、20 次测量，native CUDA median 约 1.904 ms，项目
-absorbed PyTorch baseline 约 2.304 ms，所以这个特定 harness/shape 下约 1.21x。native 对
-absorbed reference 的最大 tolerance ratio 约 0.356，未超过 1。它只能说明首版 kernel 在该
-小 shape 上能正确运行并超过项目自身 baseline；不能外推到生产模型，也不能说超过官方
-FlashMLA。报告是 source-dirty 开发态，且 query projection、RoPE、`W_O` 等周边仍包含在
-测量路径里。
+不能脱离限定直接说 6.36×。这是单张 RTX 5090、PyTorch 2.10.0+cu128、CUDA 12.8 上的
+clean-source paired snapshot。shape 是 BF16 `B2/S257/H4/r_kv32`、page size 16，5 次 warmup、
+20 次测量；native median `0.336480 ms`，项目内同 dtype PyTorch paged baseline
+`2.139152 ms`，所以这个固定 harness/case 的 ratio 是 `0.157`。两边都通过 alternate
+naive/absorbed verification。它只能说明当前 native storage/compute path 在这个 case 的 median
+较低；baseline 不是 vLLM/FlashMLA，测试不含 page allocator、continuous batching 或并发请求，
+也没有 Nsight counter，因此不能外推为生产吞吐或通用 6.36×。
 
 </details>
 
 **追问**：为什么只报 median 不够？为什么不能和另一次进程里的数字随意相除？如何减少
-GPU boost、后台负载、Python cache mutation 的影响？如果 baseline 用 BF16 而你用 FP32，
-比较是否公平？
+GPU boost、后台负载、Python cache mutation 的影响？如果 baseline materialize 连续 K/V，
+而 native 直接读页表，这个算子边界是否仍然公平？
 
 ### Q8：没有 profiler 时，你认为当前 kernel 的三个潜在瓶颈是什么？怎么证伪？
 
