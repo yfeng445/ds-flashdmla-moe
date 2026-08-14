@@ -13,14 +13,17 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from .attention import scaled_dot_product_attention_reference
-from .ops import AttentionBackend, flash_attention_forward, native_extension_loaded
+from .ops import flash_attention_forward, native_extension_loaded
 from .version import __version__
+
+AttentionBenchmarkBackend = Literal["auto", "cuda", "reference", "sdpa"]
 
 
 @dataclass(frozen=True)
@@ -34,7 +37,7 @@ class AttentionBenchmarkConfig:
     dtype: str = "float32"
     device: str = "cpu"
     causal: bool = False
-    backend: AttentionBackend = "auto"
+    backend: AttentionBenchmarkBackend = "auto"
     warmup: int = 5
     iterations: int = 20
     seed: int = 0
@@ -60,8 +63,8 @@ class AttentionBenchmarkConfig:
             raise ValueError("causal benchmark requires query_length <= key_length")
         if self.dtype not in {"float16", "bfloat16", "float32", "float64"}:
             raise ValueError("dtype must be float16, bfloat16, float32, or float64")
-        if self.backend not in {"auto", "cuda", "reference"}:
-            raise ValueError("backend must be auto, cuda, or reference")
+        if self.backend not in {"auto", "cuda", "reference", "sdpa"}:
+            raise ValueError("backend must be auto, cuda, reference, or sdpa")
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -248,6 +251,32 @@ def _verify_output(
     }
 
 
+def _right_aligned_causal_mask(q: Tensor, k: Tensor) -> Tensor:
+    query_length = q.shape[-2]
+    key_length = k.shape[-2]
+    query_positions = torch.arange(query_length, device=q.device) + (key_length - query_length)
+    key_positions = torch.arange(key_length, device=q.device)
+    return key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+
+
+def _sdpa_attention_baseline(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    causal: bool,
+    attention_mask: Tensor | None,
+) -> Tensor:
+    return F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=causal and attention_mask is None,
+    )
+
+
 def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
     """Benchmark one attention configuration and return a JSON-serializable report."""
 
@@ -288,8 +317,21 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
         device=device,
         generator=generator,
     )
+    sdpa_attention_mask = (
+        _right_aligned_causal_mask(q, k)
+        if config.backend == "sdpa" and config.causal and config.query_length != config.key_length
+        else None
+    )
 
     def operation() -> Tensor:
+        if config.backend == "sdpa":
+            return _sdpa_attention_baseline(
+                q,
+                k,
+                v,
+                causal=config.causal,
+                attention_mask=sdpa_attention_mask,
+            )
         return flash_attention_forward(
             q,
             k,
@@ -340,6 +382,7 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
         "notes": [
             "matrix_flops counts QK^T and PV multiply-adds only",
             "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic",
+            "backend=sdpa delegates kernel selection to PyTorch scaled_dot_product_attention",
         ],
     }
 

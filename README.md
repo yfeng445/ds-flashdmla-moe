@@ -187,6 +187,11 @@ python benchmarks/attention.py --device cpu --backend reference \
   --query-length 128 --key-length 128 --iterations 20
 ```
 
+On CUDA, `--backend sdpa` records a PyTorch
+`scaled_dot_product_attention` baseline with the same tensors and numerical verification. For
+unequal causal query/key lengths, the benchmark precomputes the repository's right-aligned mask
+outside the timed region.
+
 MLA reports separate prefill/decode and attention-only/cache-update timing:
 
 ```bash

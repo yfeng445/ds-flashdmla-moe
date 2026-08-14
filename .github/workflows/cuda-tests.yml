@@ -27,12 +27,26 @@ jobs:
           --warmup 5 --iterations 20
           --output benchmark-results/cuda-gemm-smoke.json
       - run: >-
+          python benchmarks/gemm.py
+          --device cuda --dtype float32 --implementation torch
+          --m 127 --n 95 --k 63
+          --tile-m 16 --tile-n 16 --tile-k 16
+          --warmup 5 --iterations 20
+          --output benchmark-results/baseline-gemm-torch.json
+      - run: >-
           python benchmarks/attention.py
           --device cuda --backend cuda --dtype float32
           --batch 1 --heads 2 --query-length 128 --key-length 128
           --head-dim 64 --value-dim 64 --causal
           --warmup 5 --iterations 20
           --output benchmark-results/cuda-smoke.json
+      - run: >-
+          python benchmarks/attention.py
+          --device cuda --backend sdpa --dtype float32
+          --batch 1 --heads 2 --query-length 128 --key-length 128
+          --head-dim 64 --value-dim 64 --causal
+          --warmup 5 --iterations 20
+          --output benchmark-results/baseline-attention-sdpa.json
       - run: >-
           python benchmarks/mla.py
           --device cuda --dtype float32 --implementation cuda
@@ -44,6 +58,15 @@ jobs:
           --output benchmark-results/cuda-mla-prefill-smoke.json
       - run: >-
           python benchmarks/mla.py
+          --device cuda --dtype float32 --implementation absorbed
+          --workload prefill_attention --batch 1 --sequence-length 128
+          --model-dim 128 --n-heads 4 --q-lora-rank 32
+          --kv-lora-rank 32 --qk-nope-head-dim 32
+          --qk-rope-head-dim 16 --v-head-dim 32
+          --warmup 5 --iterations 20
+          --output benchmark-results/baseline-mla-prefill-absorbed.json
+      - run: >-
+          python benchmarks/mla.py
           --device cuda --dtype float32 --implementation cuda
           --workload decode_with_static_write --batch 1 --sequence-length 128
           --model-dim 128 --n-heads 4 --q-lora-rank 32
@@ -51,6 +74,15 @@ jobs:
           --qk-rope-head-dim 16 --v-head-dim 32
           --warmup 5 --iterations 20
           --output benchmark-results/cuda-mla-decode-smoke.json
+      - run: >-
+          python benchmarks/mla.py
+          --device cuda --dtype float32 --implementation absorbed
+          --workload decode_with_static_write --batch 1 --sequence-length 128
+          --model-dim 128 --n-heads 4 --q-lora-rank 32
+          --kv-lora-rank 32 --qk-nope-head-dim 32
+          --qk-rope-head-dim 16 --v-head-dim 32
+          --warmup 5 --iterations 20
+          --output benchmark-results/baseline-mla-decode-absorbed.json
       - run: >-
           python benchmarks/experts.py
           --device cuda --backend cuda --dtype float32
@@ -60,11 +92,25 @@ jobs:
           --output benchmark-results/cuda-experts-smoke.json
       - run: >-
           python benchmarks/experts.py
+          --device cuda --backend reference --dtype float32
+          --expert-counts 17,0,5,31
+          --model-dim 64 --hidden-dim 128
+          --warmup 5 --iterations 20 --backward
+          --output benchmark-results/baseline-experts-fp32-reference.json
+      - run: >-
+          python benchmarks/experts.py
           --device cuda --backend cuda --dtype float16
           --expert-counts 17,0,5,31
           --model-dim 33 --hidden-dim 65
           --warmup 5 --iterations 20 --backward
           --output benchmark-results/cuda-experts-wmma-smoke.json
+      - run: >-
+          python benchmarks/experts.py
+          --device cuda --backend reference --dtype float16
+          --expert-counts 17,0,5,31
+          --model-dim 33 --hidden-dim 65
+          --warmup 5 --iterations 20 --backward
+          --output benchmark-results/baseline-experts-fp16-reference.json
       - name: Validate native expert execution contracts
         run: |
           python - <<'PY'
@@ -96,6 +142,13 @@ jobs:
           --n-groups 4 --topk-groups 2 --hot-expert-bias 0.4
           --warmup 5 --iterations 20 --backward
           --output benchmark-results/cuda-router-smoke.json
+      - run: >-
+          python benchmarks/router.py
+          --device cuda --backend reference --dtype float32
+          --tokens 256 --model-dim 64 --experts 8 --topk 3
+          --n-groups 4 --topk-groups 2 --hot-expert-bias 0.4
+          --warmup 5 --iterations 20 --backward
+          --output benchmark-results/baseline-router-reference.json
       - uses: actions/upload-artifact@v4
         with:
           name: cuda-smoke-report

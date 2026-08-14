@@ -99,6 +99,29 @@ def test_benchmark_can_explicitly_skip_verification() -> None:
     assert report["verification"] == {"performed": False}
 
 
+def test_sdpa_baseline_matches_right_aligned_causal_reference() -> None:
+    report = benchmark_attention(
+        AttentionBenchmarkConfig(
+            batch=1,
+            heads=2,
+            query_length=2,
+            key_length=5,
+            head_dim=4,
+            value_dim=3,
+            device="cpu",
+            dtype="float64",
+            causal=True,
+            backend="sdpa",
+            warmup=0,
+            iterations=1,
+        )
+    )
+
+    assert report["configuration"]["backend"] == "sdpa"
+    assert report["verification"]["performed"] is True
+    assert report["verification"]["max_absolute_error"] < 1e-9
+
+
 def test_report_writer_emits_valid_json(tmp_path) -> None:
     destination = tmp_path / "nested" / "report.json"
     report = {"schema_version": 1, "value": "测试"}
@@ -117,6 +140,7 @@ def test_report_writer_emits_valid_json(tmp_path) -> None:
         AttentionBenchmarkConfig(warmup=-1),
         AttentionBenchmarkConfig(query_length=5, key_length=4, causal=True),
         AttentionBenchmarkConfig(dtype="int8"),  # type: ignore[arg-type]
+        AttentionBenchmarkConfig(backend="unsupported"),  # type: ignore[arg-type]
     ],
 )
 def test_invalid_benchmark_configuration_is_rejected(config: AttentionBenchmarkConfig) -> None:
