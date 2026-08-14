@@ -12,6 +12,8 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,7 +25,13 @@ from .attention import scaled_dot_product_attention_reference
 from .ops import flash_attention_forward, native_extension_loaded
 from .version import __version__
 
-AttentionBenchmarkBackend = Literal["auto", "cuda", "reference", "sdpa"]
+AttentionBenchmarkBackend = Literal[
+    "auto",
+    "cuda",
+    "reference",
+    "sdpa",
+    "flash-attn-4",
+]
 
 
 @dataclass(frozen=True)
@@ -63,8 +71,17 @@ class AttentionBenchmarkConfig:
             raise ValueError("causal benchmark requires query_length <= key_length")
         if self.dtype not in {"float16", "bfloat16", "float32", "float64"}:
             raise ValueError("dtype must be float16, bfloat16, float32, or float64")
-        if self.backend not in {"auto", "cuda", "reference", "sdpa"}:
-            raise ValueError("backend must be auto, cuda, reference, or sdpa")
+        if self.backend not in {"auto", "cuda", "reference", "sdpa", "flash-attn-4"}:
+            raise ValueError("backend must be auto, cuda, reference, sdpa, or flash-attn-4")
+        if self.backend == "flash-attn-4":
+            try:
+                device_type = torch.device(self.device).type
+            except RuntimeError as error:
+                raise ValueError("device must be a valid torch device") from error
+            if device_type != "cuda":
+                raise ValueError("flash-attn-4 benchmark requires a CUDA device")
+            if self.dtype not in {"float16", "bfloat16"}:
+                raise ValueError("flash-attn-4 benchmark requires float16 or bfloat16")
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -277,6 +294,46 @@ def _sdpa_attention_baseline(
     )
 
 
+def _load_flash_attn_4() -> Callable[..., Any]:
+    try:
+        module = import_module("flash_attn.cute")
+        implementation = module.flash_attn_func
+    except (AttributeError, ImportError, OSError) as error:
+        raise RuntimeError(
+            "backend=flash-attn-4 requires a working optional flash-attn-4 installation "
+            "compatible with the active PyTorch, CUDA toolkit, and GPU"
+        ) from error
+    return implementation
+
+
+def _flash_attn_4_version() -> str | None:
+    try:
+        return version("flash-attn-4")
+    except PackageNotFoundError:
+        return None
+
+
+def _flash_attn_4_attention_baseline(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    causal: bool,
+    implementation: Callable[..., Any] | None = None,
+) -> Tensor:
+    flash_attn_func = _load_flash_attn_4() if implementation is None else implementation
+    result = flash_attn_func(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        causal=causal,
+    )
+    output = result[0] if isinstance(result, tuple) else result
+    if not isinstance(output, Tensor):
+        raise TypeError("flash-attn-4 returned an unsupported output type")
+    return output.transpose(1, 2).contiguous()
+
+
 def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
     """Benchmark one attention configuration and return a JSON-serializable report."""
 
@@ -322,6 +379,7 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
         if config.backend == "sdpa" and config.causal and config.query_length != config.key_length
         else None
     )
+    flash_attn_4_implementation = _load_flash_attn_4() if config.backend == "flash-attn-4" else None
 
     def operation() -> Tensor:
         if config.backend == "sdpa":
@@ -331,6 +389,16 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
                 v,
                 causal=config.causal,
                 attention_mask=sdpa_attention_mask,
+            )
+        if config.backend == "flash-attn-4":
+            if flash_attn_4_implementation is None:
+                raise RuntimeError("flash-attn-4 implementation was not initialized")
+            return _flash_attn_4_attention_baseline(
+                q,
+                k,
+                v,
+                causal=config.causal,
+                implementation=flash_attn_4_implementation,
             )
         return flash_attention_forward(
             q,
@@ -365,7 +433,32 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
             work["compulsory_tensor_bytes_lower_bound"] / median_seconds / 1e9
         ),
     }
-    return {
+    backend_metadata = (
+        {
+            "provider": "Dao-AILab/flash-attention",
+            "distribution": "flash-attn-4",
+            "version": _flash_attn_4_version(),
+        }
+        if config.backend == "flash-attn-4"
+        else None
+    )
+    notes = [
+        "matrix_flops counts QK^T and PV multiply-adds only",
+        "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic",
+    ]
+    if config.backend == "sdpa":
+        notes.append(
+            "backend=sdpa delegates kernel selection to PyTorch scaled_dot_product_attention"
+        )
+    elif config.backend == "flash-attn-4":
+        notes.append(
+            "backend=flash-attn-4 uses the optional CuTeDSL implementation and supports "
+            "float16/bfloat16 CUDA inputs only"
+        )
+        notes.append(
+            "latency includes the BHSD-to-BSHD layout adapter and contiguous BHSD output copy"
+        )
+    report = {
         "schema_version": 1,
         "configuration": asdict(config),
         "environment": _environment_metadata(device),
@@ -379,12 +472,11 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
         "latency": latency,
         "derived": derived,
         "raw_samples_ms": samples,
-        "notes": [
-            "matrix_flops counts QK^T and PV multiply-adds only",
-            "compulsory bytes are a tensor-I/O lower bound, not measured DRAM traffic",
-            "backend=sdpa delegates kernel selection to PyTorch scaled_dot_product_attention",
-        ],
+        "notes": notes,
     }
+    if backend_metadata is not None:
+        report["external_backend"] = backend_metadata
+    return report
 
 
 def write_benchmark_report(report: dict[str, Any], path: str | Path | None) -> None:

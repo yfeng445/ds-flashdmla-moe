@@ -3,7 +3,8 @@
 更新时间：2026-08-14
 
 当前基线：`main`，已包含 staged end-to-end MLA CUDA、小维度 absorbed-attention warp-partition
-调度、稳定输出布局契约、单 GPU 成对基线快照，以及可复现的单 case Kineto/NVTX profiling 入口。
+调度、稳定输出布局契约、单 GPU 成对基线快照、可复现的单 case Kineto/NVTX profiling 入口，
+以及可选的 FlashAttention-4 低精度独立基线。
 
 远端：<https://github.com/yfeng445/ds-flashdmla-moe>
 
@@ -27,8 +28,8 @@ correctness-first 的 DeepSeek MLA + MoE 学习与实现项目。核心原则是
 CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并注册 14 个 native
 算子；RTX 5090 本地环境也已跑通完整 CUDA 测试、固定 shape smoke benchmark、20-case
 代表性 shape matrix、MLA PyTorch/Kineto profiler triage 和首轮 CUDA kernel 专项优化。
-尚未完成持续 self-hosted GPU CI、双 GPU NCCL、原生 Nsight 取证和主流第三方实现对照，
-因此仍不具备生产性能结论。
+尚未完成持续 self-hosted GPU CI、双 GPU NCCL、原生 Nsight 取证和同 dtype 的原生/第三方
+成对对照，因此仍不具备生产性能结论。
 
 粗略进度约为 **87%**。这里的百分比衡量的是学习/研究仓库的完成度，不代表生产可用性。
 
@@ -42,7 +43,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 | NCCL Expert Parallel | 代码已实现，待双 GPU 验证 | 包括可微 All-to-All 和异步 chunk pipeline |
 | MLA CUDA | end-to-end correctness + 首轮 kernel specialization 已进入 `main` | direct/LoRA query、KV projection/static write、absorbed attention、output projection 均有 FP32 native op；小维度 attention 使用四 warp key partition，低精度、paged cache 与生产级调优仍未实现 |
 | One-sided/NVSHMEM | 未实现 | 当前只有 symmetric-buffer 成本与布局模型 |
-| 性能结论 | 尚不可下结论 | 已有单卡固定 shape、20-case matrix 和 Kineto 聚合，但仍缺持续 runner、Nsight trace 和 CUTLASS/主流 FlashAttention 对照 |
+| 性能结论 | 尚不可下结论 | 已有单卡固定 shape、20-case matrix、Kineto 聚合和可选 FA4 独立基线，但仍缺持续 runner、Nsight trace、CUTLASS 与同 dtype 的原生/FA4 成对对照 |
 
 ## 3. 代码地图
 
@@ -59,7 +60,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 - `src/ds_flash_mla_moe/profiling.py`：精确 matrix side 的 Kineto 聚合与 NVTX 包装。
 - `csrc/`：supported CUDA/C++ extension 源码。
 - `csrc/experimental/`：未验证的课程时期原型，不属于 supported API。
-- `benchmarks/`：GEMM、Attention、MLA、router、experts、成对 matrix、profile 和 Expert Parallel CLI。
+- `benchmarks/`：GEMM、Attention、MLA、router、experts、成对 matrix、operator profiler 和 Expert Parallel CLI。
 - `tests/`：数值、梯度、dispatcher、benchmark schema 和 distributed contract 测试。
 - `validation/`：带环境、误差和原始 latency 的硬件验证快照。
 - `docs/`：讲义、练习、阅读顺序和参考资料。
@@ -73,7 +74,7 @@ CPU/reference 路线持续通过 Python 3.10/3.12 CI，CUDA wheel 能编译并�
 
 ```text
 pytest -ra --strict-markers -W error::UserWarning
-311 passed, 79 skipped in 9.66s
+317 passed, 79 skipped in 9.62s
 ```
 
 另已完成：
@@ -124,7 +125,7 @@ experts 4 组、router 3 组，共覆盖 5 个 regular、8 个 tail、4 个 deco
 
 ### 4.3 MLA profiler-driven 同步与 kernel 优化
 
-新增 `benchmarks/profile.py`，可对 20-case matrix 中任意一个 `native`/`baseline` side 运行
+新增 `benchmarks/operator_profile.py`，可对 20-case matrix 中任意一个 `native`/`baseline` side 运行
 PyTorch/Kineto 聚合或 NVTX 标记。runner 在 capture 外先完整预热一次，再捕获 fresh setup、
 一次输出调用、配置的 warmup 和正式迭代；JSON 分开保存 custom operator、self-device 热点和
 常见同步事件。`--mode nvtx` 已在本机 smoke 通过，但本机没有 `nsys`/`ncu`，因此它只是为
@@ -142,6 +143,19 @@ specialized 边界、tail、causal/non-causal、非连续 stride 和三种 gener
 回归测试。相同 26-call Kineto 口径下，absorbed kernel self-device 总时间从 prefill/decode 的
 2.632/2.699 ms 降至 0.429/0.491 ms，当前占 custom-op self-device 时间的 41.8%/44.3%。这是
 本机 profiler 观察，不是端到端或跨硬件加速结论；结构化报告保存在单 GPU validation 目录。
+
+### 4.4 可选 FlashAttention-4 baseline smoke
+
+`benchmarks/attention.py` 现支持 `--backend flash-attn-4`。实现只在被选择时导入可选
+CuTeDSL 包，要求 CUDA FP16/BF16，记录 provider/distribution/version，并将 BHSD/BSHD
+adapter 纳入计时边界。RTX 5090 上使用 `flash-attn-4==4.0.0b22` 已验证 FP16/BF16、
+prefill/decode、tail、右对齐 causal 和不同 QK/V 宽度，均与 FP32 materialized reference
+在低精度容差内一致。
+
+这不是成对性能结论：FA4 不接受 FP32，而当前 native Attention 只接受 FP32。临时 smoke
+样本受桌面 WSL 调度噪声影响，未固化为 validation 排名；仓库也不把 beta 包列为默认依赖，
+避免解析器替换现有 PyTorch/CUDA 栈。后续应先补 native FP16/BF16，再把完全同 dtype/config
+的 FA4 side 纳入 matrix。
 
 ## 5. 当前阻塞与已知缺口
 
@@ -167,8 +181,9 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
 - staged MLA 已覆盖 FP32 correctness pipeline，Python 重复同步和常见小维度 absorbed-attention
   已按 Kineto 结果优化；但 prefill/decode 仍共享同一算子入口和维度调度，尚无 FP16/BF16、
   paged/per-slot cache、长上下文分块、异步拷贝或 profiler-driven fusion；
-- 代表性单 GPU shape matrix 已覆盖 regular/tail/decode/skew，但尚未接入 CUTLASS 或主流
-  FlashAttention，也没有长上下文与更多低精度矩阵；
+- 代表性单 GPU shape matrix 已覆盖 regular/tail/decode/skew；主流 FA4 已有可选独立
+  FP16/BF16 smoke，但尚无同 dtype 的 native/FA4 paired case、CUTLASS、长上下文与更多
+  低精度矩阵；
 - chunk pipeline 只证明了软件异步协议，尚无 profiler 证据证明物理 overlap；
 - one-sided symmetric memory 只有分析模型，没有 NVSHMEM/PGAS backend。
 
@@ -181,10 +196,10 @@ forward/backward 正确性，也无法用 profiler 证明通信计算发生了�
 3. 在已有 Kineto/NVTX 入口上用 Nsight Systems/Compute 检查 Attention、MLA、router、experts
    的 kernel bottleneck；MLA 先验证 warp-partition kernel 的 occupancy/访存，再分析 projection
    与 launch 边界，并在双卡上验证 NCCL chunk pipeline 是否真正 overlap。
-4. 在现有 20-case matrix 中加入可用的 CUTLASS 或主流 FlashAttention baseline，并按
-   profiler 结果补充长上下文与低精度 case，而不是继续堆叠任意 shape。
-5. 根据原生 profiler 把当前维度 specialization 继续扩展为专用 prefill/decode、FP16/BF16 和
-   paged/per-slot cache，再考虑 FA2/FA3、TMA/WGMMA、router 优化和 one-sided EP。
+4. 先为 native Attention 补齐 FP16/BF16 contract，再把可选 FA4 作为完全同 dtype/config 的
+   paired matrix side；有合适工具链时加入 CUTLASS，并按 profiler 结果补充长上下文 case。
+5. 根据原生 profiler 把当前 MLA 维度 specialization 继续扩展为专用 prefill/decode、
+   FP16/BF16 和 paged/per-slot cache，再考虑 TMA/WGMMA、router 优化和 one-sided EP。
 
 前三步完成前，不应在 README 中加入“高性能”“快于某实现”等未经证实的结论。
 
@@ -218,7 +233,7 @@ python benchmarks/matrix.py --device cuda --profile representative \
 单 case Kineto 聚合：
 
 ```bash
-python benchmarks/profile.py --case mla_prefill_regular \
+python benchmarks/operator_profile.py --case mla_prefill_regular \
   --side native --mode torch --warmup 5 --iterations 20 --seed 20260814 \
   --output benchmark-results/torch-profiler-mla-prefill.json
 ```
@@ -226,7 +241,7 @@ python benchmarks/profile.py --case mla_prefill_regular \
 为 Nsight 标记同一 workload：
 
 ```bash
-python benchmarks/profile.py --case mla_prefill_regular \
+python benchmarks/operator_profile.py --case mla_prefill_regular \
   --side native --mode nvtx --warmup 5 --iterations 20 --seed 20260814
 ```
 

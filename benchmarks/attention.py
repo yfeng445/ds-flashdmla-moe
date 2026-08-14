@@ -26,7 +26,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--causal", action="store_true")
-    parser.add_argument("--backend", choices=("auto", "cuda", "reference", "sdpa"), default="auto")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "cuda", "reference", "sdpa", "flash-attn-4"),
+        default="auto",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)

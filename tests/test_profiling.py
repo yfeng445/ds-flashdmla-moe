@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -55,6 +57,28 @@ def _benchmark_report() -> dict:
         "environment": {"device": "cuda", "device_name": "test GPU"},
         "latency": {"median_ms": 1.25},
     }
+
+
+def test_benchmark_script_directory_does_not_shadow_stdlib_profile() -> None:
+    benchmark_directory = Path(__file__).resolve().parents[1] / "benchmarks"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib, profile; "
+                "assert hasattr(profile, 'run'); "
+                "print(pathlib.Path(profile.__file__).resolve())"
+            ),
+        ],
+        cwd=benchmark_directory,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()).parent != benchmark_directory
 
 
 @pytest.mark.parametrize(

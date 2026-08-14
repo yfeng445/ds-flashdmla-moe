@@ -197,6 +197,24 @@ On CUDA, `--backend sdpa` records a PyTorch
 unequal causal query/key lengths, the benchmark precomputes the repository's right-aligned mask
 outside the timed region.
 
+An optional standalone [FlashAttention-4](https://github.com/Dao-AILab/flash-attention) baseline
+is also available for Linux/CUDA FP16 or BF16 inputs:
+
+```bash
+python benchmarks/attention.py --device cuda --backend flash-attn-4 \
+  --dtype bfloat16 --batch 1 --heads 4 \
+  --query-length 128 --key-length 128 --head-dim 64 --value-dim 64 \
+  --causal --warmup 20 --iterations 100 \
+  --output benchmark-results/fa4-attention.json
+```
+
+The adapter is imported only when selected, records the installed `flash-attn-4` distribution
+version, and includes the repository-BHSD/FA4-BSHD layout adapter in the timed boundary. It is not
+a default dependency because compatible beta versions depend on the active PyTorch, CUDA, and GPU
+stack. It is intentionally absent from the paired FP32 matrix: the native Attention kernel does
+not yet support the same FP16/BF16 contract, so comparing those different dtypes would not be a
+fair speed claim.
+
 MLA reports separate prefill/decode and attention-only/cache-update timing:
 
 ```bash
@@ -274,7 +292,7 @@ One exact side of that matrix can be captured with PyTorch/Kineto before moving
 to Nsight:
 
 ```bash
-python benchmarks/profile.py \
+python benchmarks/operator_profile.py \
   --case mla_prefill_regular --side native --mode torch \
   --warmup 5 --iterations 20 --seed 20260814 \
   --output benchmark-results/torch-profiler-mla-prefill.json
@@ -293,7 +311,7 @@ matrix case and side. For example:
 ```bash
 nsys profile --trace=cuda,nvtx,osrt \
   --output benchmark-results/mla-prefill \
-  python benchmarks/profile.py \
+  python benchmarks/operator_profile.py \
     --case mla_prefill_regular --side native --mode nvtx \
     --warmup 5 --iterations 20 --seed 20260814
 ```

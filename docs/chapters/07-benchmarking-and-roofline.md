@@ -167,14 +167,37 @@ python benchmarks/matrix.py \
 geometric mean 和 maximum 是未加权描述统计，不是总体 speedup；不应把 GEMM/cuBLAS、
 Attention/SDPA 和 MoE/reference 的比值混成一个性能结论。
 
+### 7.7.1 可选 FlashAttention-4 基线
+
+`benchmarks/attention.py --backend flash-attn-4` 提供独立的
+[Dao-AILab FlashAttention-4](https://github.com/Dao-AILab/flash-attention) CuTeDSL 基线。它只在
+被选择时动态导入可选包，要求 CUDA 上的 FP16/BF16 输入，并把 distribution 名称、版本和
+provider 写入 JSON。仓库张量使用 BHSD，FA4 接口使用 BSHD；报告的 latency 包含输入 view
+转换与 contiguous BHSD 输出复制，因而测量的是从仓库接口调用外部实现的完整 adapter 边界。
+
+```bash
+python benchmarks/attention.py \
+  --device cuda --backend flash-attn-4 --dtype bfloat16 \
+  --batch 1 --heads 4 --query-length 128 --key-length 128 \
+  --head-dim 64 --value-dim 64 --causal \
+  --warmup 20 --iterations 100 \
+  --output benchmark-results/fa4-attention.json
+```
+
+SM120 本地 smoke 已覆盖 FP16/BF16、prefill/decode、tail、右对齐 causal 以及不同 QK/V
+宽度，但这只证明当前环境中的兼容性和数值语义。FA4 拒绝 FP32，而仓库 native Attention
+目前只支持 FP32，因此它尚未加入成对 matrix，也不应与 FP32 native 数据直接排名。下一步
+应先补齐 native 低精度 contract，再用完全相同的 dtype、shape、输入和计时边界形成 paired
+case；不同环境必须自行安装与其 PyTorch/CUDA/GPU 匹配的可选 FA4 版本。
+
 ## 7.8 从 Kineto 定位到 Nsight 取证
 
 shape matrix 回答“哪些固定 workload 能正确运行、延迟分布如何”，但不能解释时间消耗在
 Python 校验、dispatcher、哪个 custom operator 或哪个 CUDA kernel。仓库用
-`benchmarks/profile.py` 对 matrix 中一个精确 case 的单侧实现做第一轮归因：
+`benchmarks/operator_profile.py` 对 matrix 中一个精确 case 的单侧实现做第一轮归因：
 
 ```bash
-python benchmarks/profile.py \
+python benchmarks/operator_profile.py \
   --case mla_decode_regular --side native --mode torch \
   --warmup 5 --iterations 20 --seed 20260814 \
   --output benchmark-results/torch-profiler-mla-decode.json
@@ -199,7 +222,7 @@ runner 先在 capture 外完整执行一次 workload，使扩展加载、kernel 
 ```bash
 nsys profile --trace=cuda,nvtx,osrt \
   --output benchmark-results/mla-decode \
-  python benchmarks/profile.py \
+  python benchmarks/operator_profile.py \
     --case mla_decode_regular --side native --mode nvtx \
     --warmup 5 --iterations 20 --seed 20260814
 ```

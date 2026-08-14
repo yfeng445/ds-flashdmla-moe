@@ -1,7 +1,9 @@
 import json
 
 import pytest
+import torch
 
+from ds_flash_mla_moe import benchmarking
 from ds_flash_mla_moe.benchmarking import (
     AttentionBenchmarkConfig,
     attention_work_estimate,
@@ -122,6 +124,57 @@ def test_sdpa_baseline_matches_right_aligned_causal_reference() -> None:
     assert report["verification"]["max_absolute_error"] < 1e-9
 
 
+def test_flash_attn_4_configuration_is_validated_without_importing_package() -> None:
+    AttentionBenchmarkConfig(
+        backend="flash-attn-4",
+        device="cuda",
+        dtype="bfloat16",
+    ).validate()
+
+
+def test_flash_attn_4_adapter_translates_layout_and_tuple_output(monkeypatch) -> None:
+    batch, heads, query_length, key_length, head_dim, value_dim = 2, 3, 5, 7, 4, 2
+    q = torch.randn(batch, heads, query_length, head_dim)
+    k = torch.randn(batch, heads, key_length, head_dim)
+    v = torch.randn(batch, heads, key_length, value_dim)
+
+    def fake_flash_attn_4(q_bshd, k_bshd, v_bshd, *, causal):
+        assert q_bshd.shape == (batch, query_length, heads, head_dim)
+        assert k_bshd.shape == (batch, key_length, heads, head_dim)
+        assert v_bshd.shape == (batch, key_length, heads, value_dim)
+        assert causal is True
+        return v_bshd[:, :query_length], None
+
+    monkeypatch.setattr(
+        benchmarking,
+        "_load_flash_attn_4",
+        lambda: pytest.fail("the injected implementation should avoid a timed import"),
+    )
+
+    actual = benchmarking._flash_attn_4_attention_baseline(
+        q,
+        k,
+        v,
+        causal=True,
+        implementation=fake_flash_attn_4,
+    )
+
+    torch.testing.assert_close(actual, v[:, :, :query_length])
+    assert actual.is_contiguous()
+
+
+def test_flash_attn_4_loader_fails_loudly_when_optional_package_is_missing(
+    monkeypatch,
+) -> None:
+    def missing_module(_name: str):
+        raise ModuleNotFoundError("flash_attn")
+
+    monkeypatch.setattr(benchmarking, "import_module", missing_module)
+
+    with pytest.raises(RuntimeError, match="requires a working optional flash-attn-4"):
+        benchmarking._load_flash_attn_4()
+
+
 def test_report_writer_emits_valid_json(tmp_path) -> None:
     destination = tmp_path / "nested" / "report.json"
     report = {"schema_version": 1, "value": "测试"}
@@ -141,6 +194,16 @@ def test_report_writer_emits_valid_json(tmp_path) -> None:
         AttentionBenchmarkConfig(query_length=5, key_length=4, causal=True),
         AttentionBenchmarkConfig(dtype="int8"),  # type: ignore[arg-type]
         AttentionBenchmarkConfig(backend="unsupported"),  # type: ignore[arg-type]
+        AttentionBenchmarkConfig(
+            backend="flash-attn-4",
+            device="cpu",
+            dtype="float16",
+        ),
+        AttentionBenchmarkConfig(
+            backend="flash-attn-4",
+            device="cuda",
+            dtype="float32",
+        ),
     ],
 )
 def test_invalid_benchmark_configuration_is_rejected(config: AttentionBenchmarkConfig) -> None:
