@@ -1,7 +1,6 @@
-# DeepSeek MLA 与 MoE 高性能实现讲义
+# AI Infra 高性能计算知识库
 
-这组讲义从可以逐行验证的数学定义出发，推导 CUDA 与多 GPU 实现。每章围绕一个
-算子，依次回答四个问题：
+这组资料从可以逐行验证的数学定义出发，连接 Python reference、CUDA kernel、分布式执行与性能分析。每章围绕一个算子或系统问题，依次回答四个问题：
 
 1. 算子在数学上计算什么？
 2. 朴素实现为什么慢？
@@ -10,10 +9,9 @@
 
 ## 课程背景
 
-本仓库源自 INFO 7375 *High Performance Computing for AI* 的课程实践。整理后的
-[INFO 7375 课程大纲](course/info-7375-syllabus.md)记录原课程的目标、先修要求、周计划与
-作业组织方式；下面的讲义则围绕本仓库当前支持的 API 和已经验证的实现重新组织这些内容，
-并不照搬课程作业目录。
+资料参考 INFO 7375 *High Performance Computing for AI* 的课程实践。整理后的
+[INFO 7375 课程大纲](course/info-7375-syllabus.md)记录课程目标、先修要求、周计划与作业组织方式；
+[HPC for AI 十一周课程笔记](course/hpc-for-ai.md)按公开 Notion 系列保留原主题顺序；下面的专题讲义则围绕数学定义、reference、CUDA 接口和验证边界重新组织相关知识。
 
 ## 阅读顺序
 
@@ -30,9 +28,8 @@
 | [8. 对称内存与 One-sided MoE](chapters/08-one-sided-symmetric-memory.md) | PGAS、data/flag 协议、时间缓冲与内存代价 | `symmetric_memory.py` |
 | [练习](exercises.md) | 从公式、reference 到 kernel 的递进任务 | 全仓库 |
 
-面试准备可先阅读[AI Infra 面试整理](infra-interview-guide.md)，再使用
-[AI Infra 高压模拟面试](infra-mock-interview.md)限时作答。两者基于根目录 notebook 和当前
-仓库事实，把已验证结果、个人贡献与设计目标分开。
+系统复习可先阅读[AI Infra 知识与面试准备指南](infra-interview-guide.md)，再使用
+[AI Infra 高压模拟面试](infra-mock-interview.md)限时作答。两者把根目录 notebook 中的问题与通用原理、实现约束和性能证据方法连接起来，不要求把这份知识库作为面试经历。
 
 第零章只要求线性代数和基本并发概念；第一、二章在此基础上进入在线 Softmax 与 tiled
 Attention。第三至七章还需要了解 Transformer、MPI/NCCL 集合通信、PyTorch autograd
