@@ -86,4 +86,3 @@ C \leftarrow \alpha\,op(A)op(B) + \beta C,
 - *Programming Massively Parallel Processors*：第 5 章 Memory Architecture and Data Locality；
 - [CUDA C++ Programming Guide：Introduction](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#introduction)；
 - [CUDA C++ Programming Guide：Programming Model](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programming-model)。
-

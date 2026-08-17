@@ -81,4 +81,3 @@ file 则只有数百 KB。具体容量随架构和配置变化，优化前必须
 - [CUDA Matmul Optimization Worklog](https://siboehm.com/articles/22/CUDA-MMM)；
 - [第 0 章：GPU Tiling](../../chapters/00-gpu-execution-and-tiling.md)；
 - [第 7 章：Benchmark 与 Roofline](../../chapters/07-benchmarking-and-roofline.md)。
-

@@ -89,4 +89,3 @@ advanced tensor-core kernel.
 - [*CuTe Layout Representation and Algebra*](https://arxiv.org/pdf/2603.02298);
 - [CuTe Documentation](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/index.html),
   especially Sections 0-4.
-

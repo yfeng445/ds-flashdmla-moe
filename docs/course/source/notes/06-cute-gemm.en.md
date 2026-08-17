@@ -97,4 +97,3 @@ GEMM structure for different tensor-core instructions, dtypes, and pipelines.
 - [*FlashAttention-3*](https://arxiv.org/pdf/2407.08608);
 - [NVIDIA Tensor Core Evolution](https://newsletter.semianalysis.com/p/nvidia-tensor-core-evolution-from-volta-to-blackwell);
 - [GTC 2025 CuTe Session](https://www.nvidia.com/en-us/on-demand/session/gtc25-s72720/).
-

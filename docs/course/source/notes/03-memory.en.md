@@ -75,4 +75,3 @@ kernel.
 - [CUDA Matmul Optimization Worklog](https://siboehm.com/articles/22/CUDA-MMM);
 - [GPU Execution and Tiling](../../../chapters/00-gpu-execution-and-tiling.md);
 - [Benchmarking and Roofline](../../../chapters/07-benchmarking-and-roofline.md).
-

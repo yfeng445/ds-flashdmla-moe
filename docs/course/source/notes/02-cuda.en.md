@@ -87,4 +87,3 @@ coverage, not low-level optimization.
 - *Programming Massively Parallel Processors*, Chapter 5;
 - [CUDA C++ Programming Guide: Introduction](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#introduction);
 - [CUDA C++ Programming Guide: Programming Model](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programming-model).
-
