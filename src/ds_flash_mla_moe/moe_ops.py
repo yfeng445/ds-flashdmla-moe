@@ -29,8 +29,8 @@ def _validate_moe_inputs(
     score_bias: Tensor | None,
     route_scale: float,
 ) -> int:
-    if x.ndim not in {2, 3}:
-        raise ValueError("x must be a rank-2 or rank-3 tensor ending in model_dim")
+    if x.ndim < 2:
+        raise ValueError("x must have rank at least 2 and end in model_dim")
     if gate_weight.ndim != 2:
         raise ValueError("gate_weight must have shape [experts, model_dim]")
     if expert_w1.ndim != 3 or expert_w2.ndim != 3 or expert_w3.ndim != 3:
@@ -38,6 +38,10 @@ def _validate_moe_inputs(
 
     experts, model_dim = gate_weight.shape
     routed_experts, hidden, expert_model_dim = expert_w1.shape
+    if model_dim <= 0:
+        raise ValueError("model_dim must be positive")
+    if hidden <= 0:
+        raise ValueError("hidden must be positive")
     if x.shape[-1] != model_dim:
         raise ValueError("x model dimension does not match gate_weight")
     if routed_experts != experts or expert_model_dim != model_dim:

@@ -29,7 +29,14 @@ def _moe_inputs(
     rank: int = 2,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     torch.manual_seed(421)
-    token_shape = (TOKENS,) if rank == 2 else (1, TOKENS)
+    if rank == 2:
+        token_shape = (TOKENS,)
+    elif rank == 3:
+        token_shape = (1, TOKENS)
+    elif rank == 4:
+        token_shape = (1, 1, TOKENS)
+    else:
+        raise ValueError("test inputs support rank 2, 3, or 4")
     return (
         torch.randn(*token_shape, MODEL_DIM, dtype=dtype, device=device),
         torch.randn(EXPERTS, MODEL_DIM, dtype=dtype, device=device),
@@ -127,6 +134,17 @@ def test_reference_facade_matches_fresh_direct_oracle_outputs_and_gradients(
     )
 
 
+def test_reference_facade_supports_rank_four_output_and_gradients() -> None:
+    _assert_reference_and_gradient_parity(
+        _moe_inputs(rank=4),
+        topk=TOPK,
+        n_groups=GROUPS,
+        topk_groups=TOPK_GROUPS,
+        score_func="sigmoid",
+        route_scale=1.25,
+    )
+
+
 def test_reference_facade_preserves_exact_tie_routing() -> None:
     inputs = list(_moe_inputs())
     inputs[1] = torch.zeros_like(inputs[1])
@@ -212,15 +230,39 @@ def test_invalid_backend_is_rejected() -> None:
 @pytest.mark.parametrize(
     "x",
     [
+        torch.tensor(1.0, dtype=torch.float64),
         torch.randn(MODEL_DIM, dtype=torch.float64),
-        torch.randn(1, 1, 1, MODEL_DIM, dtype=torch.float64),
     ],
 )
 def test_invalid_input_rank_is_rejected(x: Tensor) -> None:
     inputs = list(_moe_inputs())
     inputs[0] = x
-    with pytest.raises(ValueError, match="rank-2 or rank-3"):
+    with pytest.raises(ValueError, match="rank at least 2"):
         deepseek_moe_forward(*inputs, topk=TOPK)
+
+
+@pytest.mark.parametrize(
+    ("model_dim", "hidden", "message"),
+    [
+        (0, HIDDEN, "model_dim must be positive"),
+        (MODEL_DIM, 0, "hidden must be positive"),
+    ],
+)
+def test_zero_model_or_hidden_dimension_is_rejected(
+    model_dim: int,
+    hidden: int,
+    message: str,
+) -> None:
+    inputs = (
+        torch.empty(TOKENS, model_dim, dtype=torch.float64),
+        torch.empty(EXPERTS, model_dim, dtype=torch.float64),
+        torch.empty(EXPERTS, hidden, model_dim, dtype=torch.float64),
+        torch.empty(EXPERTS, model_dim, hidden, dtype=torch.float64),
+        torch.empty(EXPERTS, hidden, model_dim, dtype=torch.float64),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        deepseek_moe_forward(*inputs, topk=TOPK, backend="reference")
 
 
 @pytest.mark.parametrize(
