@@ -316,8 +316,10 @@ def test_quantized_matrix_rejects_forged_public_metadata(
     ("mutation", "message"),
     [
         ("requires_grad", "forward-only"),
-        ("non_finite_scale", "finite"),
-        ("non_positive_scale", "positive"),
+        ("non_finite_scale", "mutated"),
+        ("non_positive_scale", "mutated"),
+        ("value_content", "mutated"),
+        ("scale_content", "mutated"),
         ("value_dtype", "values dtype"),
         ("scale_dtype", "scales must use"),
         ("non_contiguous_values", "contiguous"),
@@ -334,6 +336,10 @@ def test_dequantize_revalidates_post_construction_tensor_mutation(
         quantized.scales.fill_(float("nan"))
     elif mutation == "non_positive_scale":
         quantized.scales.zero_()
+    elif mutation == "value_content":
+        quantized.values.add_(1)
+    elif mutation == "scale_content":
+        quantized.scales.mul_(2.0)
     elif mutation == "value_dtype":
         quantized.values.data = quantized.values.to(torch.float32)
     elif mutation == "scale_dtype":
@@ -345,6 +351,33 @@ def test_dequantize_revalidates_post_construction_tensor_mutation(
 
     with pytest.raises((RuntimeError, ValueError), match=message):
         dequantize_matrix(quantized)
+
+
+def test_valid_consumers_do_not_read_host_scalars_after_construction(monkeypatch) -> None:
+    activations = quantize_activations(torch.randn(2, 3), format="int8", backend="reference")
+    weight = quantize_weights(torch.randn(4, 3), format="int8", backend="reference")
+
+    def forbidden_item(_tensor: torch.Tensor) -> object:
+        raise AssertionError("public consumption must not call Tensor.item()")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", forbidden_item)
+        dequantized = dequantize_matrix(activations)
+        output = dequantized_linear(activations, weight, backend="reference")
+
+    assert dequantized.shape == (2, 3)
+    assert output.shape == (2, 4)
+
+
+def test_quantization_constructed_in_inference_mode_uses_versioned_payloads() -> None:
+    with torch.inference_mode():
+        quantized = quantize_activations(torch.randn(2, 3), format="int8", backend="reference")
+
+    assert not torch.is_inference(quantized.values)
+    assert not torch.is_inference(quantized.scales)
+    assert quantized._values_version == quantized.values._version
+    assert quantized._scales_version == quantized.scales._version
+    assert dequantize_matrix(quantized).shape == (2, 3)
 
 
 def test_linear_revalidates_mutated_weight_before_backend_selection() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
@@ -57,14 +57,34 @@ class QuantizedMatrixMetadata:
 
 @dataclass(frozen=True, eq=False)
 class QuantizedMatrix:
-    """Quantized payload and FP32 scales carrying immutable explicit metadata."""
+    """Quantized payload and FP32 scales carrying immutable explicit metadata.
+
+    Payload contents are validated once at construction.  Ordinary in-place
+    mutation is detected later through PyTorch tensor version counters.
+    """
 
     values: Tensor
     scales: Tensor
     metadata: QuantizedMatrixMetadata
+    _values_version: int = field(init=False, repr=False, compare=False)
+    _scales_version: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        _validate_quantized_matrix(self)
+        _validate_quantized_matrix_structure(self)
+
+        # Inference tensors intentionally have no version counter.  Keep the
+        # public API useful under inference_mode while retaining the mutation
+        # detection contract needed by graph-capturable consumers.
+        if torch.is_inference(self.values) or torch.is_inference(self.scales):
+            with torch.inference_mode(False):
+                values = self.values.clone() if torch.is_inference(self.values) else self.values
+                scales = self.scales.clone() if torch.is_inference(self.scales) else self.scales
+            object.__setattr__(self, "values", values)
+            object.__setattr__(self, "scales", scales)
+
+        _validate_quantized_matrix_contents(self)
+        object.__setattr__(self, "_values_version", self.values._version)
+        object.__setattr__(self, "_scales_version", self.scales._version)
 
 
 def _format_spec(format: QuantizationFormat) -> tuple[torch.dtype, float]:
@@ -73,7 +93,7 @@ def _format_spec(format: QuantizationFormat) -> tuple[torch.dtype, float]:
     return _FORMATS[format]
 
 
-def _validate_quantized_matrix(matrix: QuantizedMatrix) -> None:
+def _validate_quantized_matrix_structure(matrix: QuantizedMatrix) -> None:
     metadata = matrix.metadata
     expected_dtype, bound = _format_spec(metadata.format)
     if metadata.scale_granularity not in _FORMAT_GRANULARITIES[metadata.format]:
@@ -109,6 +129,10 @@ def _validate_quantized_matrix(matrix: QuantizedMatrix) -> None:
         raise ValueError("quantized values and scales must be contiguous")
     if matrix.values.requires_grad or matrix.scales.requires_grad:
         raise RuntimeError("quantized matrices are forward-only")
+
+
+def _validate_quantized_matrix_contents(matrix: QuantizedMatrix) -> None:
+    metadata = matrix.metadata
     if not bool(torch.isfinite(matrix.scales).all().item()) or not bool(
         (matrix.scales > 0).all().item()
     ):
@@ -119,6 +143,14 @@ def _validate_quantized_matrix(matrix: QuantizedMatrix) -> None:
             raise ValueError("FP8 E4M3FN payload must not contain NaN encodings")
     elif not bool((matrix.values >= -127).all().item()):
         raise ValueError("symmetric INT8 payload must stay within [-127, 127]")
+
+
+def _validate_quantized_matrix(matrix: QuantizedMatrix) -> None:
+    _validate_quantized_matrix_structure(matrix)
+    if matrix.values._version != matrix._values_version:
+        raise RuntimeError("quantized values were mutated after construction")
+    if matrix.scales._version != matrix._scales_version:
+        raise RuntimeError("quantized scales were mutated after construction")
 
 
 def _validate_backend(backend: QuantizationBackend) -> None:

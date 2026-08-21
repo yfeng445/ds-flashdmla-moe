@@ -71,6 +71,13 @@ y = dequantized_linear(qx, qw, backend="reference")
 reference。原生 quantize 为了拒绝 NaN/Inf，会在 eager 阶段检查有限性；已经量化的 linear raw op
 不做 host round-trip，因此可以单独 capture/replay。二者都不接受 `requires_grad`。
 
+`QuantizedMatrix` 采用 sealed snapshot 契约：构造时一次性检查 scale 和 payload 内容，并保存两个
+张量的 PyTorch version counter；之后的 `dequantize_matrix` 与 `dequantized_linear` 只复核
+shape、dtype、device、连续性、`requires_grad` 和 version，不再扫描张量内容或读取 host scalar。
+因此应在 CUDA Graph capture 之前完成量化与对象构造，capture/replay 只消费已封装对象。常规
+in-place 修改会改变 version 并被拒绝，`requires_grad_` 则由独立检查拒绝。直接通过 `.data`
+修改内容是绕过 PyTorch version 机制的不安全逃生口，不属于受支持的调用方式。
+
 ## 9.4 可复核 benchmark
 
 benchmark 把一次性的激活/权重量化放在计时区间外，只测 dequantized linear，并同时保存两类误差：
