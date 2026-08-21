@@ -20,6 +20,8 @@ TORCH_LIBRARY(ds_flash_mla_moe, m) {
   m.def(
       "attention_fa2_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor");
   m.def(
+      "attention_fa3_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor");
+  m.def(
       "attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v, bool causal, float scale) -> (Tensor, Tensor, Tensor)");
   m.def(
       "route_pack(Tensor x, Tensor route_weights, Tensor expert_indices, Tensor expert_owner, int world_size) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
@@ -36,6 +38,10 @@ TORCH_LIBRARY(ds_flash_mla_moe, m) {
   m.def(
       "deepseek_moe_forward(Tensor x, Tensor gate_weight, Tensor expert_w1, Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, int topk_groups, Tensor? score_bias, float route_scale) -> Tensor");
   m.def(
+      "deepseek_moe_forward_fused(Tensor x, Tensor gate_weight, Tensor expert_w1, Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, int topk_groups, Tensor? score_bias, float route_scale) -> Tensor");
+  m.def(
+      "deepseek_moe_forward_persistent(Tensor x, Tensor gate_weight, Tensor expert_w1, Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, int topk_groups, Tensor? score_bias, float route_scale) -> Tensor");
+  m.def(
       "mla_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv, Tensor pe, Tensor key_up, Tensor value_up, Tensor query_positions, Tensor key_positions, bool causal, float scale) -> Tensor");
   m.def(
       "mla_query_projection(Tensor x, Tensor wq, Tensor positions, int n_heads, int qk_nope_head_dim, int qk_rope_head_dim, float rope_theta) -> (Tensor, Tensor)");
@@ -50,4 +56,10 @@ TORCH_LIBRARY(ds_flash_mla_moe, m) {
   m.def(
       "mla_paged_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv_storage, Tensor pe_storage, Tensor position_storage, Tensor block_table, Tensor sequence_lengths, Tensor key_up, Tensor value_up, Tensor query_positions, bool metadata_validated, bool causal, float scale) -> Tensor");
   m.def("mla_output_projection(Tensor heads, Tensor wo) -> Tensor");
+  m.def("quantize_int8_per_row(Tensor input) -> (Tensor values, Tensor scales)");
+  m.def("quantize_fp8_e4m3fn_per_row(Tensor input) -> (Tensor values, Tensor scales)");
+  m.def(
+      "dequantized_linear_int8(Tensor activation_values, Tensor activation_scales, Tensor weight_values, Tensor weight_scales) -> Tensor");
+  m.def(
+      "dequantized_linear_fp8_e4m3fn(Tensor activation_values, Tensor activation_scales, Tensor weight_values, Tensor weight_scales) -> Tensor");
 }

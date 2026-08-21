@@ -52,6 +52,13 @@ Static batching 先凑齐固定 batch，再一起执行到所有请求结束。�
 
 Continuous batching 在 decode iteration 边界重组 active batch：请求结束后马上释放 slot，让排队请求进入。它显著提高 GPU 利用率，但 scheduler 需要处理到达时间、优先级、KV block 分配、prefill chunking，以及吞吐与尾延迟的权衡。
 
+本仓库把这条系统语义缩成两个可执行实验。`ContinuousBatchingScheduler` 使用固定页、FIFO
+admission 和事务化 `schedule/complete/abort`；prefill/decode batch 不混合，decode 每个请求每轮
+至多推进一个 token，新请求只在 iteration 边界补位。`MLAPagedDecodeGraphRunner` 则为固定
+batch/model/page-table shape 建立 CUDA Graph bucket，在复制 replay metadata 前完成校验。二者
+没有优先级、chunked prefill、eviction、prefix sharing 或模型执行线程，因此用于解释控制面与
+kernel 静态地址合同，而不是复刻 vLLM/SGLang 的生产 serving engine。
+
 ## 推理优化的系统视角
 
 - **continuous batching** 减少空闲 slot；

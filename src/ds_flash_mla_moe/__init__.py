@@ -5,6 +5,12 @@ from .attention import (
     scaled_dot_product_attention_backward_reference,
     scaled_dot_product_attention_reference,
 )
+from .cuda_graph import (
+    MLAPagedDecodeGraphBucket,
+    MLAPagedDecodeGraphRunner,
+    SingleOutputCUDAGraphRunner,
+    StaticTensorSpec,
+)
 from .expert_ops import (
     cuda_expert_ops_available,
     expert_major_pack,
@@ -14,6 +20,14 @@ from .expert_parallel import (
     ExpertComputeBackend,
     ExpertParallelTrace,
     deepseek_moe_expert_parallel_reference,
+)
+from .fake_distributed import (
+    FakeDistributedMoE,
+    LogicalRoute,
+    ReturnedRoute,
+    SimulationError,
+    SimulationReport,
+    SimulationResult,
 )
 from .gemm import gemm_reference, tiled_gemm_reference
 from .mla import (
@@ -50,6 +64,16 @@ from .moe import (
     to_expert_major_reference,
 )
 from .moe_ops import MoEBackend, MoEScoreFunction, cuda_moe_available, deepseek_moe_forward
+from .one_sided_protocol import (
+    CellKey,
+    CellSnapshot,
+    CellState,
+    OneSidedCell,
+    OneSidedProtocol,
+    PayloadRow,
+    ProtocolError,
+    RouteIdentity,
+)
 from .ops import (
     cuda_attention_backend_available,
     cuda_gemm_available,
@@ -60,33 +84,84 @@ from .ops import (
     native_extension_loaded,
     tiled_gemm,
 )
+from .parallel_topology import ExpertPlacement, ParallelCoordinate, ParallelMesh
+from .quantization import (
+    QuantizationBackend,
+    QuantizationFormat,
+    QuantizedMatrix,
+    QuantizedMatrixMetadata,
+    cuda_quantization_available,
+    dequantize_matrix,
+    dequantized_linear,
+    quantize_activations,
+    quantize_weights,
+)
 from .route_ops import RoutePackResult, cuda_route_ops_available, route_combine, route_pack
 from .router_ops import RouterBackend, cuda_router_available, grouped_topk
+from .scheduler import (
+    ContinuousBatchingScheduler,
+    FixedPageAllocator,
+    ScheduledBatch,
+    SequenceState,
+    SequenceStatus,
+)
 from .symmetric_memory import (
     SymmetricMoEBufferLayout,
     symmetric_moe_buffer_estimate,
     symmetric_moe_buffer_model_from_routes,
     symmetric_moe_buffer_offset,
 )
+from .tensor_parallel import TensorParallelReport, tensor_parallel_swiglu_forward
 from .version import __version__
 
 __all__ = [
+    "CellKey",
+    "CellSnapshot",
+    "CellState",
+    "ContinuousBatchingScheduler",
     "ExpertComputeBackend",
     "ExpertMajorLayout",
     "ExpertParallelTrace",
+    "ExpertPlacement",
+    "FakeDistributedMoE",
+    "FixedPageAllocator",
+    "LogicalRoute",
     "MLAConfig",
     "MLALatentCache",
     "MLAPagedCache",
     "MLAPagedCacheView",
+    "MLAPagedDecodeGraphBucket",
+    "MLAPagedDecodeGraphRunner",
     "MLAStaticCache",
     "MLAWeights",
     "MoEBackend",
     "MoEScoreFunction",
+    "OneSidedCell",
+    "OneSidedProtocol",
     "PackedRoutes",
+    "ParallelCoordinate",
+    "ParallelMesh",
+    "PayloadRow",
+    "ProtocolError",
+    "QuantizationBackend",
+    "QuantizationFormat",
+    "QuantizedMatrix",
+    "QuantizedMatrixMetadata",
+    "ReturnedRoute",
+    "RouteIdentity",
     "RoutePackResult",
     "RouterBackend",
     "RoutingResult",
+    "ScheduledBatch",
+    "SequenceState",
+    "SequenceStatus",
+    "SimulationError",
+    "SimulationReport",
+    "SimulationResult",
+    "SingleOutputCUDAGraphRunner",
+    "StaticTensorSpec",
     "SymmetricMoEBufferLayout",
+    "TensorParallelReport",
     "__version__",
     "allocate_mla_paged_cache",
     "allocate_mla_static_cache",
@@ -101,6 +176,7 @@ __all__ = [
     "cuda_mla_available",
     "cuda_moe_available",
     "cuda_paged_mla_available",
+    "cuda_quantization_available",
     "cuda_route_ops_available",
     "cuda_router_available",
     "deepseek_grouped_topk",
@@ -108,6 +184,8 @@ __all__ = [
     "deepseek_moe_forward",
     "deepseek_moe_packed_reference",
     "deepseek_moe_reference",
+    "dequantize_matrix",
+    "dequantized_linear",
     "expert_major_pack",
     "flash_attention_forward",
     "gemm_reference",
@@ -119,6 +197,8 @@ __all__ = [
     "mla_paged_attention",
     "native_extension_loaded",
     "pack_routes_reference",
+    "quantize_activations",
+    "quantize_weights",
     "route_combine",
     "route_pack",
     "scaled_dot_product_attention_backward_reference",
@@ -130,6 +210,7 @@ __all__ = [
     "symmetric_moe_buffer_estimate",
     "symmetric_moe_buffer_model_from_routes",
     "symmetric_moe_buffer_offset",
+    "tensor_parallel_swiglu_forward",
     "tiled_gemm",
     "tiled_gemm_reference",
     "to_expert_major_reference",

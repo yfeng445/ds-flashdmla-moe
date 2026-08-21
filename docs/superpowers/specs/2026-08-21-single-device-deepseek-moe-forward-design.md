@@ -81,6 +81,7 @@ from typing import Literal
 MoEBackend = Literal["auto", "cuda", "reference"]
 MoEScoreFunction = Literal["sigmoid", "softmax"]
 
+
 def deepseek_moe_forward(
     x: Tensor,
     gate_weight: Tensor,
@@ -95,8 +96,7 @@ def deepseek_moe_forward(
     score_bias: Tensor | None = None,
     route_scale: float = 1.0,
     backend: MoEBackend = "auto",
-) -> Tensor:
-    ...
+) -> Tensor: ...
 ```
 
 The name is `deepseek_moe_forward`, not `flashdmoe_forward`. The latter would

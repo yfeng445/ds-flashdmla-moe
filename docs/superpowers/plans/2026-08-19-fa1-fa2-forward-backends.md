@@ -200,11 +200,15 @@ def _attention_backend_ineligibility_reason(
         return f"{backend} is forward-only and does not accept requires_grad tensors"
     if q.ndim != 4:
         return "the CUDA kernel requires [batch, heads, sequence, dimension] tensors"
-    supported = {torch.float16} if backend in {"fa1", "fa2"} else {
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-    }
+    supported = (
+        {torch.float16}
+        if backend in {"fa1", "fa2"}
+        else {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        }
+    )
     if q.dtype not in supported:
         rendered = "float16" if backend in {"fa1", "fa2"} else "float16, bfloat16, or float32"
         return f"{backend} supports {rendered}"
@@ -562,10 +566,7 @@ Add a direct cross-backend test so both kernels see byte-identical tensors:
 
 ```python
 @pytest.mark.skipif(
-    not (
-        cuda_attention_backend_available("fa1")
-        and cuda_attention_backend_available("fa2")
-    ),
+    not (cuda_attention_backend_available("fa1") and cuda_attention_backend_available("fa2")),
     reason="requires built FA1 and FA2 CUDA kernels",
 )
 @pytest.mark.cuda
@@ -776,9 +777,7 @@ def test_paired_benchmark_uses_the_same_configuration(monkeypatch) -> None:
         return {"configuration": {"backend": config.backend}, "raw_samples_ms": [1.0]}
 
     monkeypatch.setattr(benchmarking, "benchmark_attention", fake_benchmark)
-    base = AttentionBenchmarkConfig(
-        backend="fa1", device="cuda", dtype="float16", seed=17
-    )
+    base = AttentionBenchmarkConfig(backend="fa1", device="cuda", dtype="float16", seed=17)
     report = benchmarking.benchmark_attention_backends(base, ("fa1", "fa2"))
 
     assert [config.backend for config in seen] == ["fa1", "fa2"]
@@ -827,8 +826,7 @@ def benchmark_attention_backends(
     if not backends or len(set(backends)) != len(backends):
         raise ValueError("comparison backends must be non-empty and unique")
     reports = {
-        backend: benchmark_attention(replace(config, backend=backend))
-        for backend in backends
+        backend: benchmark_attention(replace(config, backend=backend)) for backend in backends
     }
     return {
         "schema_version": 1,

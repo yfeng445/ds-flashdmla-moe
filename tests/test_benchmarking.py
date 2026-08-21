@@ -26,6 +26,7 @@ def test_attention_benchmark_backend_names_cover_facade_and_baselines() -> None:
         "blockwise",
         "fa1",
         "fa2",
+        "fa3",
         "sdpa",
         "flash-attn-4",
     )
@@ -36,6 +37,8 @@ def test_formal_fa_benchmark_requires_cuda_float16() -> None:
         AttentionBenchmarkConfig(backend="fa1", device="cpu", dtype="float16").validate()
     with pytest.raises(ValueError, match="CUDA float16"):
         AttentionBenchmarkConfig(backend="fa2", device="cuda", dtype="float32").validate()
+    with pytest.raises(ValueError, match="CUDA float16"):
+        AttentionBenchmarkConfig(backend="fa3", device="cpu", dtype="float16").validate()
 
 
 def test_paired_benchmark_uses_the_same_configuration(monkeypatch) -> None:
@@ -87,8 +90,8 @@ def test_paired_benchmark_requires_nonempty_unique_backends(backends) -> None:
 
 
 def test_cli_parses_fa_backends_and_comparison_flag(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["attention.py", "--backend", "fa2"])
-    assert attention_cli.parse_args().backend == "fa2"
+    monkeypatch.setattr(sys, "argv", ["attention.py", "--backend", "fa3"])
+    assert attention_cli.parse_args().backend == "fa3"
 
     monkeypatch.setattr(sys, "argv", ["attention.py", "--compare-fa1-fa2"])
     arguments = attention_cli.parse_args()

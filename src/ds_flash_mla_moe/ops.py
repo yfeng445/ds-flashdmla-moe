@@ -30,8 +30,9 @@ AttentionBackend = Literal[
     "blockwise",
     "fa1",
     "fa2",
+    "fa3",
 ]
-NativeAttentionBackend = Literal["cuda_rowwise", "fa1", "fa2"]
+NativeAttentionBackend = Literal["cuda_rowwise", "fa1", "fa2", "fa3"]
 GEMMBackend = Literal["auto", "cuda", "reference"]
 MLABackend = Literal["auto", "cuda", "reference"]
 
@@ -94,6 +95,9 @@ _FA1_FORWARD_SCHEMA = (
 _FA2_FORWARD_SCHEMA = (
     "attention_fa2_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor"
 )
+_FA3_FORWARD_SCHEMA = (
+    "attention_fa3_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor"
+)
 _BACKWARD_SCHEMA = (
     "attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v, "
     "bool causal, float scale) -> (Tensor, Tensor, Tensor)"
@@ -122,6 +126,16 @@ _GROUPED_TOPK_SCHEMA = (
 )
 _DEEPSEEK_MOE_FORWARD_SCHEMA = (
     "deepseek_moe_forward(Tensor x, Tensor gate_weight, Tensor expert_w1, "
+    "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
+    "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
+)
+_DEEPSEEK_MOE_FORWARD_FUSED_SCHEMA = (
+    "deepseek_moe_forward_fused(Tensor x, Tensor gate_weight, Tensor expert_w1, "
+    "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
+    "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
+)
+_DEEPSEEK_MOE_FORWARD_PERSISTENT_SCHEMA = (
+    "deepseek_moe_forward_persistent(Tensor x, Tensor gate_weight, Tensor expert_w1, "
     "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
     "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
 )
@@ -162,10 +176,25 @@ _MLA_PAGED_ABSORBED_ATTENTION_SCHEMA = (
     "bool causal, float scale) -> Tensor"
 )
 _MLA_OUTPUT_PROJECTION_SCHEMA = "mla_output_projection(Tensor heads, Tensor wo) -> Tensor"
+_QUANTIZE_INT8_PER_ROW_SCHEMA = (
+    "quantize_int8_per_row(Tensor input) -> (Tensor values, Tensor scales)"
+)
+_QUANTIZE_FP8_E4M3FN_PER_ROW_SCHEMA = (
+    "quantize_fp8_e4m3fn_per_row(Tensor input) -> (Tensor values, Tensor scales)"
+)
+_DEQUANTIZED_LINEAR_INT8_SCHEMA = (
+    "dequantized_linear_int8(Tensor activation_values, Tensor activation_scales, "
+    "Tensor weight_values, Tensor weight_scales) -> Tensor"
+)
+_DEQUANTIZED_LINEAR_FP8_E4M3FN_SCHEMA = (
+    "dequantized_linear_fp8_e4m3fn(Tensor activation_values, Tensor activation_scales, "
+    "Tensor weight_values, Tensor weight_scales) -> Tensor"
+)
 _SCHEMAS = {
     "attention_forward": _FORWARD_SCHEMA,
     "attention_fa1_forward": _FA1_FORWARD_SCHEMA,
     "attention_fa2_forward": _FA2_FORWARD_SCHEMA,
+    "attention_fa3_forward": _FA3_FORWARD_SCHEMA,
     "attention_backward": _BACKWARD_SCHEMA,
     "route_pack": _ROUTE_PACK_SCHEMA,
     "route_combine": _ROUTE_COMBINE_SCHEMA,
@@ -174,6 +203,8 @@ _SCHEMAS = {
     "expert_major_pack": _EXPERT_MAJOR_PACK_SCHEMA,
     "grouped_topk": _GROUPED_TOPK_SCHEMA,
     "deepseek_moe_forward": _DEEPSEEK_MOE_FORWARD_SCHEMA,
+    "deepseek_moe_forward_fused": _DEEPSEEK_MOE_FORWARD_FUSED_SCHEMA,
+    "deepseek_moe_forward_persistent": _DEEPSEEK_MOE_FORWARD_PERSISTENT_SCHEMA,
     "mla_absorbed_attention": _MLA_ABSORBED_ATTENTION_SCHEMA,
     "mla_query_projection": _MLA_QUERY_PROJECTION_SCHEMA,
     "mla_query_lora_projection": _MLA_QUERY_LORA_PROJECTION_SCHEMA,
@@ -182,6 +213,10 @@ _SCHEMAS = {
     "mla_cache_projection_write_slots": _MLA_CACHE_PROJECTION_WRITE_SLOTS_SCHEMA,
     "mla_paged_absorbed_attention": _MLA_PAGED_ABSORBED_ATTENTION_SCHEMA,
     "mla_output_projection": _MLA_OUTPUT_PROJECTION_SCHEMA,
+    "quantize_int8_per_row": _QUANTIZE_INT8_PER_ROW_SCHEMA,
+    "quantize_fp8_e4m3fn_per_row": _QUANTIZE_FP8_E4M3FN_PER_ROW_SCHEMA,
+    "dequantized_linear_int8": _DEQUANTIZED_LINEAR_INT8_SCHEMA,
+    "dequantized_linear_fp8_e4m3fn": _DEQUANTIZED_LINEAR_FP8_E4M3FN_SCHEMA,
 }
 _missing_schemas = {
     operator: schema for operator, schema in _SCHEMAS.items() if not _operator_is_defined(operator)
@@ -238,15 +273,20 @@ def _fake_formal_attention_forward(
     torch._check(
         not any(tensor.requires_grad for tensor in (q, k, v)),
         lambda: (
-            "formal FA1/FA2 forward kernels are forward-only and do not accept "
+            "teaching FA1/FA2/FA3 forward kernels are forward-only and do not accept "
             "requires_grad tensors"
         ),
     )
     torch._check(q.ndim == 4 and k.ndim == 4 and v.ndim == 4)
     torch._check(q.dtype == torch.float16)
     torch._check(k.dtype == q.dtype and v.dtype == q.dtype)
+    torch._check(
+        all(tensor.is_contiguous() for tensor in (q, k, v)),
+        lambda: "teaching FA1/FA2/FA3 forward kernels require contiguous tensors",
+    )
     torch._check(q.shape[-1] <= 128 and v.shape[-1] <= 128)
     torch._check(k.shape[-2] > 0)
+    torch._check(math.isfinite(scale), lambda: "scale must be finite")
     return output
 
 
@@ -778,6 +818,105 @@ def _fake_tiled_gemm(
     return a.new_empty((a.shape[0], b.shape[1]))
 
 
+def _fake_quantize_per_row(input: Tensor, value_dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+    torch._check(input.ndim == 2)
+    torch._check(input.shape[0] > 0 and input.shape[1] > 0)
+    torch._check(input.device.type == "cuda")
+    torch._check(input.dtype == torch.float32)
+    torch._check(input.is_contiguous())
+    torch._check(
+        not input.requires_grad,
+        lambda: "native quantization operators are forward-only",
+    )
+    return (
+        input.new_empty(input.shape, dtype=value_dtype),
+        input.new_empty((input.shape[0],), dtype=torch.float32),
+    )
+
+
+def _fake_quantize_int8_per_row(input: Tensor) -> tuple[Tensor, Tensor]:
+    return _fake_quantize_per_row(input, torch.int8)
+
+
+def _fake_quantize_fp8_e4m3fn_per_row(input: Tensor) -> tuple[Tensor, Tensor]:
+    return _fake_quantize_per_row(input, torch.uint8)
+
+
+def _fake_dequantized_linear(
+    activation_values: Tensor,
+    activation_scales: Tensor,
+    weight_values: Tensor,
+    weight_scales: Tensor,
+    value_dtype: torch.dtype,
+) -> Tensor:
+    torch._check(activation_values.ndim == 2 and weight_values.ndim == 2)
+    torch._check(activation_values.shape[0] > 0 and activation_values.shape[1] > 0)
+    torch._check(weight_values.shape[0] > 0)
+    torch._check(activation_values.shape[1] == weight_values.shape[1])
+    torch._check(activation_scales.shape == (activation_values.shape[0],))
+    torch._check(weight_scales.shape == (weight_values.shape[0],))
+    torch._check(activation_values.dtype == value_dtype)
+    torch._check(weight_values.dtype == value_dtype)
+    torch._check(activation_scales.dtype == torch.float32)
+    torch._check(weight_scales.dtype == torch.float32)
+    torch._check(
+        activation_values.device
+        == activation_scales.device
+        == weight_values.device
+        == weight_scales.device
+    )
+    torch._check(activation_values.device.type == "cuda")
+    torch._check(
+        all(
+            tensor.is_contiguous()
+            for tensor in (
+                activation_values,
+                activation_scales,
+                weight_values,
+                weight_scales,
+            )
+        )
+    )
+    torch._check(
+        not activation_scales.requires_grad and not weight_scales.requires_grad,
+        lambda: "native dequantized linear operators are forward-only",
+    )
+    return activation_scales.new_empty(
+        (activation_values.shape[0], weight_values.shape[0]),
+        dtype=torch.float32,
+    )
+
+
+def _fake_dequantized_linear_int8(
+    activation_values: Tensor,
+    activation_scales: Tensor,
+    weight_values: Tensor,
+    weight_scales: Tensor,
+) -> Tensor:
+    return _fake_dequantized_linear(
+        activation_values,
+        activation_scales,
+        weight_values,
+        weight_scales,
+        torch.int8,
+    )
+
+
+def _fake_dequantized_linear_fp8_e4m3fn(
+    activation_values: Tensor,
+    activation_scales: Tensor,
+    weight_values: Tensor,
+    weight_scales: Tensor,
+) -> Tensor:
+    return _fake_dequantized_linear(
+        activation_values,
+        activation_scales,
+        weight_values,
+        weight_scales,
+        torch.uint8,
+    )
+
+
 def _fake_swiglu_experts(
     activations: Tensor,
     expert_offsets: Tensor,
@@ -882,6 +1021,10 @@ def _fake_deepseek_moe_forward(
     torch._check(expert_w2.shape == (experts, model_dim, hidden))
     torch._check(expert_w3.shape == (experts, hidden, model_dim))
 
+    torch._check(
+        x.dtype == torch.float32,
+        lambda: "the native DeepSeek MoE forward operators require float32 tensors",
+    )
     torch._check(all(tensor.is_floating_point() for tensor in floating_tensors))
     torch._check(all(tensor.dtype == x.dtype for tensor in floating_tensors))
     torch._check(all(tensor.device == x.device for tensor in floating_tensors))
@@ -1224,6 +1367,9 @@ torch.library.register_fake(
 torch.library.register_fake(
     "ds_flash_mla_moe::attention_fa2_forward", _fake_formal_attention_forward
 )
+torch.library.register_fake(
+    "ds_flash_mla_moe::attention_fa3_forward", _fake_formal_attention_forward
+)
 torch.library.register_fake("ds_flash_mla_moe::route_pack", _fake_route_pack)
 torch.library.register_fake("ds_flash_mla_moe::route_combine", _fake_route_combine)
 torch.library.register_fake("ds_flash_mla_moe::tiled_gemm", _fake_tiled_gemm)
@@ -1231,6 +1377,12 @@ torch.library.register_fake("ds_flash_mla_moe::swiglu_experts", _fake_swiglu_exp
 torch.library.register_fake("ds_flash_mla_moe::expert_major_pack", _fake_expert_major_pack)
 torch.library.register_fake("ds_flash_mla_moe::grouped_topk", _fake_grouped_topk)
 torch.library.register_fake("ds_flash_mla_moe::deepseek_moe_forward", _fake_deepseek_moe_forward)
+torch.library.register_fake(
+    "ds_flash_mla_moe::deepseek_moe_forward_fused", _fake_deepseek_moe_forward
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::deepseek_moe_forward_persistent", _fake_deepseek_moe_forward
+)
 torch.library.register_fake(
     "ds_flash_mla_moe::mla_absorbed_attention", _fake_mla_absorbed_attention
 )
@@ -1251,6 +1403,18 @@ torch.library.register_fake(
     _fake_mla_paged_absorbed_attention,
 )
 torch.library.register_fake("ds_flash_mla_moe::mla_output_projection", _fake_mla_output_projection)
+torch.library.register_fake("ds_flash_mla_moe::quantize_int8_per_row", _fake_quantize_int8_per_row)
+torch.library.register_fake(
+    "ds_flash_mla_moe::quantize_fp8_e4m3fn_per_row",
+    _fake_quantize_fp8_e4m3fn_per_row,
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::dequantized_linear_int8", _fake_dequantized_linear_int8
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::dequantized_linear_fp8_e4m3fn",
+    _fake_dequantized_linear_fp8_e4m3fn,
+)
 
 
 def _attention_setup_context(ctx, inputs, output) -> None:
@@ -1740,6 +1904,7 @@ _ATTENTION_OPERATOR = {
     "cuda_rowwise": "attention_forward",
     "fa1": "attention_fa1_forward",
     "fa2": "attention_fa2_forward",
+    "fa3": "attention_fa3_forward",
 }
 
 
@@ -1749,7 +1914,7 @@ def cuda_attention_backend_available(
     """Return whether the selected native attention backend can execute."""
 
     if backend not in _ATTENTION_OPERATOR:
-        raise ValueError("native attention backend must be cuda_rowwise, fa1, or fa2")
+        raise ValueError("native attention backend must be cuda_rowwise, fa1, fa2, or fa3")
     return (
         _NATIVE_EXTENSION_LOADED
         and torch.cuda.is_available()
@@ -2344,17 +2509,19 @@ def _attention_backend_ineligibility_reason(
     *,
     attn_mask: Tensor | None,
 ) -> str | None:
-    if backend in {"fa1", "fa2"} and any(t.requires_grad for t in (q, k, v)):
+    if backend in {"fa1", "fa2", "fa3"} and any(t.requires_grad for t in (q, k, v)):
         return f"{backend} is forward-only and does not accept requires_grad tensors"
     if q.ndim != 4:
         return "the CUDA kernel requires [batch, heads, sequence, dimension] tensors"
     supported = (
         {torch.float16}
-        if backend in {"fa1", "fa2"}
+        if backend in {"fa1", "fa2", "fa3"}
         else {torch.float16, torch.bfloat16, torch.float32}
     )
     if q.dtype not in supported:
-        rendered = "float16" if backend in {"fa1", "fa2"} else "float16, bfloat16, or float32"
+        rendered = (
+            "float16" if backend in {"fa1", "fa2", "fa3"} else "float16, bfloat16, or float32"
+        )
         return f"{backend} supports {rendered}"
     if k.dtype != q.dtype or v.dtype != q.dtype:
         return "q, k, and v must have the same dtype"
@@ -2362,8 +2529,8 @@ def _attention_backend_ineligibility_reason(
         return "the CUDA kernel requires contiguous tensors"
     if attn_mask is not None:
         return "the CUDA kernel does not support an explicit attention mask"
-    if backend in {"fa1", "fa2"} and (q.shape[-1] > 128 or v.shape[-1] > 128):
-        return "formal FA1/FA2 currently require head_dim <= 128 and value_dim <= 128"
+    if backend in {"fa1", "fa2", "fa3"} and (q.shape[-1] > 128 or v.shape[-1] > 128):
+        return "teaching FA1/FA2/FA3 require head_dim <= 128 and value_dim <= 128"
     if not _NATIVE_EXTENSION_LOADED:
         return "the native extension is not installed"
     if any(t.device.type != "cuda" for t in (q, k, v)):
@@ -2400,9 +2567,20 @@ def flash_attention_forward(
     """Dispatch attention to a strict backend or the automatic row-wise fallback."""
 
     _validate_attention_inputs(q, k, v)
-    valid = {"auto", "cuda", "cuda_rowwise", "reference", "blockwise", "fa1", "fa2"}
+    valid = {
+        "auto",
+        "cuda",
+        "cuda_rowwise",
+        "reference",
+        "blockwise",
+        "fa1",
+        "fa2",
+        "fa3",
+    }
     if backend not in valid:
-        raise ValueError("backend must be auto, cuda_rowwise, reference, blockwise, fa1, or fa2")
+        raise ValueError(
+            "backend must be auto, cuda, cuda_rowwise, reference, blockwise, fa1, fa2, or fa3"
+        )
     if backend == "cuda":
         warnings.warn(
             "backend='cuda' is deprecated; use backend='cuda_rowwise'",

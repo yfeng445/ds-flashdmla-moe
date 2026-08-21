@@ -84,8 +84,14 @@ The central policy test should use module-level monkeypatching, not mock impleme
 def test_selected_cuda_failure_is_not_retried(monkeypatch) -> None:
     inputs = _moe_inputs(dtype=torch.float32)
     monkeypatch.setattr(moe_ops, "_cuda_moe_ineligibility_reason", lambda *a, **k: None)
-    monkeypatch.setattr(moe_ops, "_call_cuda_moe", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("launch failed")))
-    monkeypatch.setattr(moe_ops, "deepseek_moe_packed_reference", lambda *a, **k: pytest.fail("fallback"))
+    monkeypatch.setattr(
+        moe_ops,
+        "_call_cuda_moe",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("launch failed")),
+    )
+    monkeypatch.setattr(
+        moe_ops, "deepseek_moe_packed_reference", lambda *a, **k: pytest.fail("fallback")
+    )
     with pytest.raises(RuntimeError, match="launch failed"):
         deepseek_moe_forward(*inputs, topk=2, backend="auto")
 ```

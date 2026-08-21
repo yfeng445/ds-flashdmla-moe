@@ -26,10 +26,12 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Blockwise online attention | yes | CPU + CUDA | FP32-accumulating online-softmax kernel | no |
 | DeepSeek grouped Top-K gate | yes | CPU | FP32 sigmoid source | replicated in EP |
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
-| DeepSeek whole-layer MoE forward | packed PyTorch | CPU + CUDA | single-device, staged, correctness-first FP32 sigmoid forward | no |
+| DeepSeek whole-layer MoE forward | packed PyTorch | CPU + CUDA | single-device staged/fused/persistent, correctness-first FP32 sigmoid forwards | no |
 | MLA prefill/decode | naive + absorbed + paged | CPU + CUDA pipeline | staged FP16/BF16/FP32 storage, per-slot write, direct paged read | no |
+| Graph replay / request scheduling | stable-buffer graph runner + FIFO control plane | CPU contracts + CUDA replay | exact-shape buckets; fixed-page transactions | no |
+| FP8/INT8 forward experiments | explicit scales + dequantized FP32 oracle | CPU + CUDA contracts | scalar E4M3FN/INT8 quantize + linear source | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
-| One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
+| Logical EP/TP foundations | topology + protocol simulator + TP SwiGLU | CPU contract tests | no transport kernel | single-process evidence only |
 
 Files under `csrc/experimental/` are teaching prototypes. They are intentionally
 excluded from the importable wheel and supported API, and must not be treated as
@@ -49,12 +51,15 @@ materialized hidden state. Neither path has asynchronous copies, Hopper WGMMA/TM
 or profiler-driven tuning against cuBLAS/CUTLASS.
 
 `deepseek_moe_forward` completes route, pack, offsets, expert compute, and combine
-behind one public call. CUDA v1 is a single-device, staged, correctness-first
-whole-layer forward that makes multiple internal launches. It accepts contiguous
-CUDA FP32 tensors, sigmoid scoring, no `requires_grad`, and deterministic mode
-disabled. It is not the future FlashMoE target: persistent scheduling, full fusion,
-and one-sided multi-GPU communication remain future work; dedicated tile scheduling
-remains future work as well.
+behind one public call. `cuda_staged` preserves the original single-device, staged,
+correctness-first comparison path. `cuda_fused` uses a private single-device
+histogram/scan/scatter pack and weighted atomic down-projection epilogue, while
+`cuda_persistent` schedules expert tasks through an occupancy-bounded device queue
+and falls back to the fused scheduler for small route counts. All native paths accept
+contiguous CUDA FP32 tensors, sigmoid scoring, no `requires_grad`, and deterministic
+mode disabled. The persistent variant is a single-device expert core, not a
+distributed FlashMoE megakernel; one-sided multi-GPU communication remains future
+work, and no speed claim is made without hardware profiler evidence.
 
 ## Quick start
 
@@ -90,21 +95,25 @@ w1 = torch.randn(4, 128, 64, device=device)
 w2 = torch.randn(4, 64, 128, device=device)
 w3 = torch.randn(4, 128, 64, device=device)
 
+
 def run(backend: str) -> torch.Tensor:
-    return deepseek_moe_forward(
-        x, gate, w1, w2, w3, topk=2, n_groups=1, backend=backend
-    )
+    return deepseek_moe_forward(x, gate, w1, w2, w3, topk=2, n_groups=1, backend=backend)
+
 
 reference_out = run("reference")
 auto_out = run("auto")
-if cuda_moe_available():  # CUDA v1 requires contiguous FP32 CUDA tensors.
-    cuda_out = run("cuda")
+if cuda_moe_available():  # Native paths require contiguous FP32 CUDA tensors.
+    staged_out = run("cuda_staged")
+    fused_out = run("cuda_fused")
+    persistent_out = run("cuda_persistent")
+    cuda_alias_out = run("cuda")  # Compatibility alias for cuda_fused.
 ```
 
-`reference` always selects the packed PyTorch specification, `cuda` requires the
-strict CUDA v1 contract, and `auto` uses CUDA only when that contract is satisfied.
-The raw CUDA operator is output-only and forward-only; this milestone does not
-claim whole-layer training support.
+`reference` always selects the packed PyTorch specification. Explicit native
+backends select exactly one whole-layer raw operator and fail rather than falling
+back; `auto` prefers `cuda_fused`, may use `cuda_staged`, and never selects
+`cuda_persistent` without hardware evidence. The raw CUDA operators are output-only
+and forward-only; this milestone does not claim whole-layer training support.
 
 `flash_attention_forward(..., backend="auto")` selects the optional CUDA
 kernel only for its currently supported input contract and otherwise falls
@@ -116,6 +125,19 @@ python -m pip install '.[test,cuda-build]'
 DS_FLASH_BUILD_CUDA=1 python -m pip install --no-build-isolation .
 pytest -ra
 ```
+
+The explicit teaching backends keep their implementation differences visible:
+
+| Backend | CTA ownership | K/V movement | Online-softmax state |
+|---|---|---|---|
+| `fa1` | one CTA per batch/head, K/V-outer | synchronous FP32 shared tile | FP32 global workspace between K/V tiles |
+| `fa2` | one CTA per query tile | synchronous FP32 shared tile | FP32 registers until the final store |
+| `fa3` | one CTA per query tile | asynchronous double-buffered FP16 shared stages | FP32 registers until the final store |
+
+`fa3` is a forward-only pipeline teaching kernel, not production
+FlashAttention-3: it does not claim TMA/WGMMA, warp specialization, FP8, or a
+measured speedup. Explicit `fa1`/`fa2`/`fa3` requests fail on unsupported inputs
+or missing native operators; `auto` does not select these teaching paths.
 
 The attention kernel accepts contiguous FP16, BF16, or FP32 tensors with a
 shared dtype and shape `[B, H, S, D]`. It supports right-aligned causal attention
@@ -130,6 +152,16 @@ silently changing semantics.
 kernel: contiguous FP32 rank-2 matrices, fixed 16x16x16 tiles, arbitrary M/N/K
 tails, optional `alpha * A @ B + beta * C` epilogue, and an analytic PyTorch
 backward. It is a correctness milestone rather than a cuBLAS competitor.
+
+The quantization experiment keeps its storage contract visible. Activations use
+per-row FP32 scales; `[out_features, in_features]` weights use per-output-channel
+FP32 scales. Symmetric INT8 saturates to `[-127, 127]`, while FP8 E4M3FN stores
+finite `[-448, 448]` encodings as explicit `uint8` payload bits. Both
+`quantize_activations` / `quantize_weights` and `dequantized_linear` are
+forward-only. Explicit `backend="cuda"` requests fail when the format, device,
+shape, dtype, or native operator is unavailable; only `auto` may fall back. The
+native scalar kernels accumulate/output FP32 and make no Tensor Core or speedup
+claim. See [the quantization chapter](docs/chapters/09-fp8-int8-quantization.md).
 
 `swiglu_experts_expert_major(..., backend="cuda")` accepts contiguous FP16 or FP32
 expert-major rows, an int64 offsets vector, and local `[E_l,D_h,D]`/
@@ -172,6 +204,40 @@ are reused only while tensor identity and version remain unchanged. Paged mutati
 is inference-only, and the current one-CTA-per-query/head implementation remains a
 correctness-oriented kernel rather than an FA2/FA3-class serving backend.
 
+`SingleOutputCUDAGraphRunner` captures a forward-only tensor operation into one
+exact shape/dtype/device bucket. Replay validates every caller tensor before
+copying it into runner-owned static buffers; caller addresses may change, while
+the captured input and output addresses remain fixed. The returned output is the
+same buffer on every replay and is overwritten by the next replay. Closed-over
+weights and other tensors are the caller's responsibility and must retain their
+captured addresses.
+
+`MLAPagedDecodeGraphRunner` applies that contract to one-token native paged MLA.
+Its bucket fixes batch size, model width, and block-table width. Cache and weight
+addresses are checked on every replay, and block tables, sequence lengths, cache
+slots, and absolute query positions are validated before any static input copy.
+The captured body calls the already-prevalidated raw query projection, paged
+attention, and output projection operators. It is inference-only; changing batch
+size or page-table width requires a separate runner, and cache writes remain
+outside this decode graph.
+
+`ContinuousBatchingScheduler` supplies a deliberately small CPU control plane:
+FIFO admission, whole-prompt homogeneous prefill batches, one token per active
+request in homogeneous decode batches, and fixed pages. `schedule()` reserves
+all pages and lengths atomically, `complete()` commits them, and `abort()` restores
+the prior allocator/order/state exactly. Requests can enter or leave only between
+iterations; cancelling in-flight work requires completing or aborting its batch.
+There is no priority, chunked prefill, eviction, prefix sharing, speculative
+decoding, networking, or model executor, so this is not a production serving
+engine.
+
+```bash
+python benchmarks/cuda_graph.py --batch 32 --width 256
+python benchmarks/continuous_batching.py --requests 8 --max-batch-size 4
+```
+
+Both reports retain raw timing/trace facts and make no speedup claim.
+
 ## Repository layout
 
 ```text
@@ -180,7 +246,8 @@ correctness-oriented kernel rather than an FA2/FA3-class serving backend.
 │   ├── attention/                # native CUDA operator source
 │   ├── gemm/                     # fixed-tile CUDA teaching kernel
 │   ├── mla/                      # staged projection/cache/absorbed MLA kernels
-│   ├── moe/                      # route and active-row SwiGLU kernels
+│   ├── moe/                      # staged/fused/persistent single-GPU MoE forwards
+│   ├── quantization/             # scalar FP8/INT8 forward experiments
 │   └── experimental/attention/   # unverified course-era CUDA prototypes
 ├── benchmarks/                   # structured latency and environment reports
 ├── docs/                         # textbook-style notes and reading guide
@@ -216,16 +283,41 @@ correctness-oriented kernel rather than an FA2/FA3-class serving backend.
   `[peer, round, buffer, local_expert, capacity, feature]` layout and its
   route-cell overflow/storage cost. It does not allocate NVSHMEM memory or
   imply that a one-sided backend has been implemented.
+- `ParallelMesh` fixes TP-fastest rank mapping, while `OneSidedCell` makes
+  payload-before-signal and consumed-generation acknowledgement executable.
+  `FakeDistributedMoE` restores shuffled dispatch/return rows by explicit route
+  identity. Its reports always mark the run as simulated and explicitly deny
+  remote-visibility, transport, and multi-GPU evidence.
+- `tensor_parallel_swiglu_forward` is a forward-only logical TP oracle for TP
+  sizes 1/2/4: W1/W3 shard hidden rows, W2 shards the matching columns, and
+  partials sum locally in FP32 or FP64. It performs no cross-device reduction.
 
-## Development order
+```bash
+python benchmarks/logical_distributed.py --pes 2 --experts 4 --tp-size 2
+```
 
-1. Lock down mathematical references and adversarial shape tests.
-2. Replace the attention prototypes with a verified forward kernel, followed by
-   backward.
-3. Implement MLA prefill and compressed-cache decode.
-4. Implement the unfused MoE route/dispatch/expert/combine pipeline.
-5. Migrate the verified Gloo Expert Parallel protocol to NCCL, then explore
-   fusion and overlap without changing its route-identity contract.
+## Current boundary and next development order
+
+The repository now has executable references and explicit forward backends for
+FA1/FA2/FA3, staged/fused/persistent single-device MoE, paged MLA graph replay,
+FP8/INT8 experiments, and a minimal continuous-batching control plane. The next
+implementation order is:
+
+1. Re-run fixed-shape Kineto baselines after each kernel change and collect
+   Nsight Systems/Compute evidence when those tools are available.
+2. Reduce the remaining router/expert scheduling launches and tune the persistent
+   single-device path without changing its explicit route-identity contract.
+3. Move the FA3 teaching path toward hardware-specific TMA/WGMMA and add
+   Tensor-Core quantized kernels only when their numerical contracts remain
+   visible through the same Python facade.
+4. Connect graph replay and the continuous-batching scheduler to a real decode
+   executor while preserving exact-shape/address and transactional page rules.
+5. Only after the single-device path is stable, implement and validate real
+   one-sided EP/TP transport on two or four GPUs.
+
+Supported development remains forward-only for these new paths. Historical
+backward experiments stay under `csrc/experimental/` and are not part of this
+milestone.
 
 Performance claims will be added only with reproducible benchmark inputs,
 hardware/software metadata, and raw results.
@@ -237,6 +329,15 @@ teaching reference can run as a normal Python process:
 python benchmarks/gemm.py --device cpu --dtype float64 \
   --implementation tiled --m 37 --n 29 --k 23 \
   --tile-m 16 --tile-n 8 --tile-k 7 --iterations 5
+```
+
+The standalone quantized-linear benchmark keeps quantization outside the timed
+region and records both a paired dequantized oracle and the error relative to
+the original FP32 linear:
+
+```bash
+python benchmarks/quantized_gemm.py --device cpu --backend reference \
+  --format int8 --m 127 --n 95 --k 63 --warmup 2 --iterations 20
 ```
 
 Attention uses the same report conventions:
@@ -447,6 +548,26 @@ the optional FlashAttention-4 backend, four staged MLA FP16/BF16 native/PyTorch 
 paged MLA decode pairs. It is
 a local diagnostic snapshot, not a general performance claim, an Nsight report, or a replacement
 for self-hosted GPU CI.
+
+The [2026-08-22 next-phase snapshot](validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)
+adds installed-wheel correctness results for FA3, graph replay, FP8/INT8, and the
+three whole-layer MoE backends. Its MoE Kineto capture used one RTX 5090 workload
+with 128 tokens, 8 experts, top-2 routing, two warmups, and three timed iterations:
+
+| Backend | Observed aggregate custom-kernel activities | Observed device activities | Analytical intermediate bytes | Analytical metadata bytes |
+| --- | ---: | ---: | ---: | ---: |
+| `cuda_staged` | 66 | 676 | 281200 | 10864 |
+| `cuda_fused` | 42 | 586 | 211080 | 6280 |
+| `cuda_persistent` | 42 | 604 | 211088 | 6288 |
+
+These are Kineto aggregate activity occurrences for the complete profiling
+harness, not guaranteed physical launch counts. The byte totals are analytical
+materialization inventories, not measured DRAM traffic. No Nsight capture or
+stable speedup claim is attached to this table. The exact machine-readable
+summary and reproducible commands live beside the snapshot. The separate
+[logical EP/TP record](validation/logical/2026-08-22-ep-tp-reference.json) is a
+single-process simulation and explicitly reports that no transport, remote
+visibility, or multi-GPU behavior was verified.
 
 ## Learning material
 

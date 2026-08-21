@@ -25,12 +25,39 @@ route_pack_cuda_entry(
     const at::Tensor& expert_owner,
     int64_t world_size);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+single_device_route_pack_cuda_entry(
+    const at::Tensor& x,
+    const at::Tensor& route_weights,
+    const at::Tensor& expert_indices,
+    int64_t experts);
+
 at::Tensor swiglu_experts_cuda_entry(
     const at::Tensor& activations,
     const at::Tensor& expert_offsets,
     const at::Tensor& expert_w1,
     const at::Tensor& expert_w2,
     const at::Tensor& expert_w3);
+
+at::Tensor swiglu_experts_fused_cuda_entry(
+    const at::Tensor& activations,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& packed_weights,
+    const at::Tensor& token_indices,
+    const at::Tensor& expert_w1,
+    const at::Tensor& expert_w2,
+    const at::Tensor& expert_w3,
+    int64_t token_count);
+
+at::Tensor swiglu_experts_persistent_cuda_entry(
+    const at::Tensor& activations,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& packed_weights,
+    const at::Tensor& token_indices,
+    const at::Tensor& expert_w1,
+    const at::Tensor& expert_w2,
+    const at::Tensor& expert_w3,
+    int64_t token_count);
 
 at::Tensor route_combine_cuda_entry(
     const at::Tensor& contributions,

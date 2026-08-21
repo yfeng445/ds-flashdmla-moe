@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "single_gpu_correctness_and_profiler_summary",
+  "date": "2026-08-22",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "platform": "WSL2 Linux x86_64",
+    "python": "3.12.13",
+    "torch": "2.10.0+cu128",
+    "cuda_runtime": "12.8",
+    "native_extension_loaded": true
+  },
+  "validated_native_artifact": {
+    "github_head": "b6383068802bd2927c29fae191d3f3e30eb651c3",
+    "scope": "validated CUDA production source; this is not asserted to be the final branch head",
+    "cuda_build": {
+      "run_id": 32530555834,
+      "conclusion": "success",
+      "artifact": "cuda-wheel"
+    },
+    "reference_tests": {
+      "run_id": 32530556015,
+      "conclusion": "success"
+    },
+    "installed_without_local_rebuild": true,
+    "later_protocol_and_docs_only_commits_require_hosted_reference_and_cpu_suite_validation": true
+  },
+  "native_cuda_tests": {
+    "combined": {
+      "files": [
+        "tests/test_moe_backends.py",
+        "tests/test_attention_backends.py",
+        "tests/test_cuda_graph.py",
+        "tests/test_quantization.py",
+        "tests/test_quantized_benchmarking.py"
+      ],
+      "selection": "cuda marker",
+      "passed": 179,
+      "deselected": 291,
+      "duration_seconds": 35.92,
+      "source_head": "b6383068802bd2927c29fae191d3f3e30eb651c3"
+    },
+    "focused_runs": {
+      "attention_backends": {
+        "passed": 82,
+        "deselected": 46,
+        "duration_seconds": 15.51
+      },
+      "cuda_graph": {
+        "passed": 7,
+        "deselected": 6,
+        "duration_seconds": 15.39
+      },
+      "quantization": {
+        "passed": 6,
+        "deselected": 59,
+        "duration_seconds": 15.29,
+        "coverage": [
+          "paired_dequantized_linear_reference",
+          "k513_scale_broadcast_and_nonzero_lane_exactness",
+          "current_stream_and_cuda_graph_replay"
+        ]
+      },
+      "moe_backends": {
+        "result": "pass",
+        "complete_file_pass_rate_percent": 100,
+        "exact_test_count_retained": false
+      }
+    }
+  },
+  "moe_kineto": {
+    "implementation_commit": "a7b366e8",
+    "production_source_changed_after_capture": false,
+    "profile_scope": "fresh setup, route analysis, reference verification, two warmups, and three timed iterations",
+    "configuration": {
+      "tokens": 128,
+      "model_dim": 64,
+      "hidden_dim": 128,
+      "experts": 8,
+      "topk": 2,
+      "n_groups": 1,
+      "topk_groups": 1,
+      "dtype": "float32",
+      "device": "cuda",
+      "warmup": 2,
+      "iterations": 3
+    },
+    "count_semantics": "observed aggregate Kineto activity occurrences, not guaranteed physical kernel launch counts",
+    "backends": {
+      "cuda_staged": {
+        "observed_custom_kernel_activities": 66,
+        "observed_device_activities": 676,
+        "analytical_intermediate_bytes": 281200,
+        "analytical_metadata_bytes": 10864,
+        "observed_peak_allocated_delta_bytes": 1423360
+      },
+      "cuda_fused": {
+        "observed_custom_kernel_activities": 42,
+        "observed_device_activities": 586,
+        "analytical_intermediate_bytes": 211080,
+        "analytical_metadata_bytes": 6280,
+        "observed_peak_allocated_delta_bytes": 1423360
+      },
+      "cuda_persistent": {
+        "observed_custom_kernel_activities": 42,
+        "observed_device_activities": 604,
+        "analytical_intermediate_bytes": 211088,
+        "analytical_metadata_bytes": 6288,
+        "observed_peak_allocated_delta_bytes": 1423360
+      }
+    }
+  },
+  "graph_smoke": {
+    "configuration": {
+      "batch": 32,
+      "width": 256,
+      "dtype": "float32",
+      "warmup": 5,
+      "iterations": 20
+    },
+    "contract": {
+      "caller_inputs_are_copied": true,
+      "forward_only": true,
+      "input_addresses_may_change": true,
+      "input_shape_dtype_device_are_static": true,
+      "output_address_is_stable": true
+    },
+    "performance_claim": false
+  },
+  "continuous_batching_smoke": {
+    "configuration": {
+      "requests": 8,
+      "prompt_length": 8,
+      "max_new_tokens": 4,
+      "page_size": 4,
+      "num_pages": 64,
+      "max_batch_size": 4
+    },
+    "facts": {
+      "iterations": 10,
+      "all_pages_released": true,
+      "homogeneous_batches": true,
+      "gpu_execution_included": false,
+      "model_execution_included": false
+    },
+    "performance_claim": false
+  },
+  "quantized_smoke": {
+    "configuration": {
+      "backend": "cuda",
+      "m": 5,
+      "n": 7,
+      "k": 513,
+      "warmup": 1,
+      "iterations": 2
+    },
+    "formats": {
+      "int8": {
+        "paired_dequantized_reference_max_absolute_error": 0.0000171661376953125,
+        "paired_dequantized_reference_max_tolerance_ratio": 0.16004451299051473
+      },
+      "fp8_e4m3fn": {
+        "paired_dequantized_reference_max_absolute_error": 0.00002193450927734375,
+        "paired_dequantized_reference_max_tolerance_ratio": 0.1622789392032281
+      }
+    },
+    "performance_claim": false
+  },
+  "boundaries": {
+    "performance_claim": false,
+    "nsight_collected": false,
+    "physical_launch_count_verified": false,
+    "dram_traffic_verified": false,
+    "multi_gpu_verified": false,
+    "remote_visibility_verified": false,
+    "transport_performed": false
+  }
+}

@@ -24,9 +24,20 @@ TOPK = 2
 GROUPS = 2
 TOPK_GROUPS = 1
 REPO_ROOT = Path(__file__).resolve().parents[1]
+RAW_MOE_OPERATORS = (
+    "deepseek_moe_forward",
+    "deepseek_moe_forward_fused",
+    "deepseek_moe_forward_persistent",
+)
+EXPLICIT_NATIVE_BACKENDS = {
+    "cuda": "deepseek_moe_forward_fused",
+    "cuda_staged": "deepseek_moe_forward",
+    "cuda_fused": "deepseek_moe_forward_fused",
+    "cuda_persistent": "deepseek_moe_forward_persistent",
+}
 
 
-def test_reader_docs_describe_the_whole_layer_moe_milestone_honestly() -> None:
+def test_reader_docs_describe_the_whole_layer_moe_backends_honestly() -> None:
     reader_docs = (
         REPO_ROOT / "README.md",
         REPO_ROOT / "docs" / "chapters" / "04-deepseek-moe.md",
@@ -40,18 +51,38 @@ def test_reader_docs_describe_the_whole_layer_moe_milestone_honestly() -> None:
         assert "single-device" in source, document
         assert "staged" in source, document
         assert "correctness-first" in source, document
+        assert "cuda_fused" in source, document
+        assert "cuda_persistent" in source, document
 
-    future_work_statement = (
-        "persistent scheduling, full fusion, and one-sided multi-GPU "
-        "communication remain future work"
+    scope_statement = (
+        "The persistent variant is a single-device expert core, not a distributed "
+        "FlashMoE megakernel"
     )
-    future_work_docs = reader_docs[:2]
+    scope_docs = reader_docs[:2]
     missing_statement = [
         document
-        for document in future_work_docs
-        if future_work_statement not in " ".join(document.read_text(encoding="utf-8").split())
+        for document in scope_docs
+        if scope_statement not in " ".join(document.read_text(encoding="utf-8").split())
     ]
     assert not missing_statement, missing_statement
+
+
+def test_readme_status_table_lists_every_single_device_whole_layer_moe_path() -> None:
+    readme_lines = (REPO_ROOT / "README.md").read_text(encoding="utf-8").splitlines()
+    status_row = next(
+        line for line in readme_lines if line.startswith("| DeepSeek whole-layer MoE forward |")
+    )
+
+    for contract_term in (
+        "single-device",
+        "staged",
+        "fused",
+        "persistent",
+        "correctness-first",
+        "FP32",
+    ):
+        assert contract_term in status_row
+    assert "FlashMoE" not in status_row
 
 
 def test_cuda_build_gate_includes_formal_attention_and_whole_layer_moe_ops() -> None:
@@ -62,27 +93,36 @@ def test_cuda_build_gate_includes_formal_attention_and_whole_layer_moe_ops() -> 
     for operator in (
         "attention_fa1_forward",
         "attention_fa2_forward",
+        "attention_fa3_forward",
         "deepseek_moe_forward",
+        "deepseek_moe_forward_fused",
+        "deepseek_moe_forward_persistent",
     ):
         assert f'"{operator}"' in workflow_source
 
 
 def test_whole_layer_cuda_sources_are_packaged_and_registered() -> None:
-    cuda_source = REPO_ROOT / "csrc" / "moe" / "deepseek_moe_forward_cuda.cu"
+    cuda_sources = (
+        REPO_ROOT / "csrc" / "moe" / "deepseek_moe_forward_cuda.cu",
+        REPO_ROOT / "csrc" / "moe" / "deepseek_moe_forward_fused_cuda.cu",
+    )
     host_header = REPO_ROOT / "csrc" / "moe" / "moe_cuda_ops.h"
-    assert cuda_source.is_file()
+    assert all(cuda_source.is_file() for cuda_source in cuda_sources)
     assert host_header.is_file()
 
     setup_source = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
-    assert '"csrc/moe/deepseek_moe_forward_cuda.cu"' in setup_source
+    for cuda_source in cuda_sources:
+        relative = cuda_source.relative_to(REPO_ROOT).as_posix()
+        assert f'"{relative}"' in setup_source
 
-    operator_schema = (
-        "deepseek_moe_forward(Tensor x, Tensor gate_weight, Tensor expert_w1, "
-        "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
-        "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
-    )
     ops_source = (REPO_ROOT / "csrc" / "ops.cpp").read_text(encoding="utf-8")
-    assert operator_schema in ops_source
+    for operator in RAW_MOE_OPERATORS:
+        operator_schema = (
+            f"{operator}(Tensor x, Tensor gate_weight, Tensor expert_w1, "
+            "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
+            "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
+        )
+        assert operator_schema in ops_source
 
     manifest_lines = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
     csrc_patterns = {
@@ -92,6 +132,102 @@ def test_whole_layer_cuda_sources_are_packaged_and_registered() -> None:
         for pattern in line.split()[2:]
     }
     assert {"*.h", "*.cu", "*.cpp"} <= csrc_patterns
+
+
+def test_private_single_device_pack_contract_omits_distributed_route_metadata() -> None:
+    route_source = (REPO_ROOT / "csrc" / "moe" / "route_ops_cuda.cu").read_text(encoding="utf-8")
+    header_source = (REPO_ROOT / "csrc" / "moe" / "moe_cuda_ops.h").read_text(encoding="utf-8")
+
+    assert "single_device_route_pack_cuda_entry(" in header_source
+    implementation = route_source.split("single_device_route_pack_cuda(", 1)[1].split(
+        "at::Tensor route_combine_cuda(", 1
+    )[0]
+    for output in (
+        "packed_activations",
+        "packed_weights",
+        "token_indices",
+        "expert_offsets",
+    ):
+        assert output in implementation
+    for distributed_artifact in (
+        "expert_owner",
+        "rank_counts",
+        "packed_expert_indices",
+        "counts_per_expert",
+        "at::cat",
+        "at::cumsum",
+        "at::floor_divide",
+    ):
+        assert distributed_artifact not in implementation
+
+
+def test_private_generated_offsets_have_host_structure_guards_without_value_sync() -> None:
+    route_source = (REPO_ROOT / "csrc" / "moe" / "route_ops_cuda.cu").read_text(encoding="utf-8")
+    expert_source = (REPO_ROOT / "csrc" / "moe" / "swiglu_experts_cuda.cu").read_text(
+        encoding="utf-8"
+    )
+    private_pack = route_source.split("single_device_route_pack_cuda(", 1)[1].split(
+        "at::Tensor route_combine_cuda(", 1
+    )[0]
+    fused_experts = expert_source.split("at::Tensor swiglu_experts_fused_cuda(", 1)[1].split(
+        "at::Tensor swiglu_experts_cuda(", 1
+    )[0]
+
+    for implementation in (private_pack, fused_experts):
+        assert "TORCH_CHECK(experts < INT64_MAX" in implementation
+        assert "experts + 1 overflows int64" in implementation
+        assert "without device-to-host synchronization" in implementation
+        for host_sync in ("cudaMemcpy", ".cpu(", ".item("):
+            assert host_sync not in implementation
+
+
+def test_fused_expert_epilogue_and_persistent_scheduler_have_distinct_contracts() -> None:
+    expert_source = (REPO_ROOT / "csrc" / "moe" / "swiglu_experts_cuda.cu").read_text(
+        encoding="utf-8"
+    )
+    header_source = (REPO_ROOT / "csrc" / "moe" / "moe_cuda_ops.h").read_text(encoding="utf-8")
+
+    for entry in (
+        "swiglu_experts_fused_cuda_entry(",
+        "swiglu_experts_persistent_cuda_entry(",
+    ):
+        assert entry in header_source
+        assert entry in expert_source
+    assert "fused_down_atomic_float_kernel" in expert_source
+    assert "persistent_hidden_float_kernel" in expert_source
+    assert "persistent_down_atomic_float_kernel" in expert_source
+    assert "cudaOccupancyMaxActiveBlocksPerMultiprocessor" in expert_source
+    assert "persistent_task_queue" in expert_source
+    assert "atomicAdd" in expert_source
+    assert "kPersistentSmallWorkRoutes" in expert_source
+    normalized_expert_source = " ".join(expert_source.replace("//", "").split())
+    assert "single-device expert core" in normalized_expert_source
+    assert "not a distributed FlashMoE megakernel" in normalized_expert_source
+
+
+def test_fused_whole_layer_source_uses_only_private_single_device_entries() -> None:
+    fused_source = (REPO_ROOT / "csrc" / "moe" / "deepseek_moe_forward_fused_cuda.cu").read_text(
+        encoding="utf-8"
+    )
+
+    assert "grouped_topk_cuda_entry(" in fused_source
+    assert "single_device_route_pack_cuda_entry(" in fused_source
+    assert "swiglu_experts_fused_cuda_entry(" in fused_source
+    assert "swiglu_experts_persistent_cuda_entry(" in fused_source
+    fused_source_without_private_pack = fused_source.replace(
+        "single_device_route_pack_cuda_entry(", ""
+    )
+    for staged_artifact in (
+        "expert_owner",
+        "route_pack_cuda_entry(",
+        "route_combine_cuda_entry(",
+        "swiglu_experts_cuda_entry(",
+        "at::cat",
+        "at::cumsum",
+        "at::floor_divide",
+        "contributions",
+    ):
+        assert staged_artifact not in fused_source_without_private_pack
 
 
 def _raw_moe_inputs(
@@ -121,8 +257,9 @@ def _call_raw_moe(
     topk_groups: int = TOPK_GROUPS,
     score_bias: Tensor | None = None,
     route_scale: float = 1.0,
+    operator: str = "deepseek_moe_forward",
 ) -> Tensor:
-    return torch.ops.ds_flash_mla_moe.deepseek_moe_forward.default(
+    return getattr(torch.ops.ds_flash_mla_moe, operator).default(
         *inputs,
         topk,
         n_groups,
@@ -136,28 +273,33 @@ def _noncontiguous_view(tensor: Tensor) -> Tensor:
     return tensor.as_strided(tensor.shape, (0, *tensor.stride()[1:]))
 
 
-def test_raw_moe_operator_schema_is_always_defined() -> None:
-    assert moe_ops._operator_is_defined("deepseek_moe_forward")
+@pytest.mark.parametrize("operator", RAW_MOE_OPERATORS)
+def test_raw_moe_operator_schema_is_always_defined(operator: str) -> None:
+    assert moe_ops._operator_is_defined(operator)
 
 
 @pytest.mark.parametrize(
     "dispatch_key",
     ("CPU", "AutogradCUDA", "CompositeExplicitAutograd", "CompositeImplicitAutograd"),
 )
+@pytest.mark.parametrize("operator", RAW_MOE_OPERATORS)
 def test_raw_moe_operator_has_only_forward_native_dispatch_policy(
     dispatch_key: str,
+    operator: str,
 ) -> None:
     assert not torch._C._dispatch_has_kernel_for_dispatch_key(  # type: ignore[attr-defined]
-        "ds_flash_mla_moe::deepseek_moe_forward",
+        f"ds_flash_mla_moe::{operator}",
         dispatch_key,
     )
 
 
 @pytest.mark.parametrize("tokens", [0, TOKENS])
 @pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("operator", RAW_MOE_OPERATORS)
 def test_raw_moe_fake_propagates_flattened_output_metadata(
     tokens: int,
     with_bias: bool,
+    operator: str,
 ) -> None:
     with FakeTensorMode():
         inputs = _raw_moe_inputs(tokens=tokens)
@@ -167,7 +309,7 @@ def test_raw_moe_fake_propagates_flattened_output_metadata(
             else None
         )
 
-        output = _call_raw_moe(inputs, score_bias=score_bias)
+        output = _call_raw_moe(inputs, score_bias=score_bias, operator=operator)
 
         assert output.shape == (tokens, MODEL_DIM)
         assert output.dtype == inputs[0].dtype
@@ -251,6 +393,22 @@ def test_raw_moe_fake_rejects_nonfloating_inputs() -> None:
         _call_raw_moe(_raw_moe_inputs(dtype=torch.int64))
 
 
+@pytest.mark.parametrize("operator", RAW_MOE_OPERATORS)
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "bias"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
+def test_raw_moe_fake_rejects_uniform_unsupported_floating_dtypes(
+    dtype: torch.dtype,
+    with_bias: bool,
+    operator: str,
+) -> None:
+    with FakeTensorMode():
+        inputs = _raw_moe_inputs(dtype=dtype)
+        score_bias = torch.empty(EXPERTS, dtype=dtype) if with_bias else None
+
+        with pytest.raises(RuntimeError, match="float32"):
+            _call_raw_moe(inputs, score_bias=score_bias, operator=operator)
+
+
 @pytest.mark.parametrize("index", range(5))
 def test_raw_moe_fake_rejects_mismatched_input_dtypes(index: int) -> None:
     with FakeTensorMode():
@@ -322,7 +480,8 @@ def test_raw_moe_fake_rejects_invalid_routing_configuration(
 
 
 @pytest.mark.parametrize("index", range(6))
-def test_raw_moe_fake_rejects_requires_grad_inputs(index: int) -> None:
+@pytest.mark.parametrize("operator", RAW_MOE_OPERATORS)
+def test_raw_moe_fake_rejects_requires_grad_inputs(index: int, operator: str) -> None:
     with FakeTensorMode():
         inputs = list(_raw_moe_inputs())
         score_bias = torch.empty(EXPERTS, dtype=torch.float32)
@@ -332,7 +491,7 @@ def test_raw_moe_fake_rejects_requires_grad_inputs(index: int) -> None:
             score_bias.requires_grad_(True)
 
         with pytest.raises(RuntimeError, match="forward-only"):
-            _call_raw_moe(tuple(inputs), score_bias=score_bias)
+            _call_raw_moe(tuple(inputs), score_bias=score_bias, operator=operator)
 
 
 def _moe_inputs(
@@ -673,12 +832,13 @@ def test_score_bias_must_share_dtype_and_device(make_bias: Callable[[], Tensor])
         )
 
 
-def test_explicit_cuda_rejects_cpu_request_with_required_prefix() -> None:
+@pytest.mark.parametrize("backend", EXPLICIT_NATIVE_BACKENDS)
+def test_explicit_cuda_rejects_cpu_request_with_required_prefix(backend: str) -> None:
     with pytest.raises(RuntimeError, match=r"^CUDA DeepSeek MoE is unavailable:"):
         deepseek_moe_forward(
             *_moe_inputs(dtype=torch.float32),
             topk=TOPK,
-            backend="cuda",
+            backend=backend,  # type: ignore[arg-type]
         )
 
 
@@ -697,17 +857,56 @@ def test_cuda_moe_available_queries_whole_layer_operator(monkeypatch) -> None:
     monkeypatch.setattr(facade_ops, "_operator_has_cuda_kernel", has_cuda_kernel)
 
     assert not cuda_moe_available()
-    assert operators == ["deepseek_moe_forward"]
+    assert operators == ["deepseek_moe_forward_fused"]
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_operator"),
+    EXPLICIT_NATIVE_BACKENDS.items(),
+)
+def test_explicit_native_backend_selects_exactly_one_whole_layer_operator(
+    backend: str,
+    expected_operator: str,
+    monkeypatch,
+) -> None:
+    inputs = _moe_inputs(dtype=torch.float32)
+    expected = torch.full_like(inputs[0], 2.0)
+    eligibility_queries: list[str] = []
+    native_calls: list[str] = []
+
+    def eligible(*args: object, operator: str, **kwargs: object) -> None:
+        eligibility_queries.append(operator)
+
+    def call_native(*args: object, operator: str, **kwargs: object) -> Tensor:
+        native_calls.append(operator)
+        return expected
+
+    monkeypatch.setattr(facade_ops, "_cuda_moe_ineligibility_reason", eligible)
+    monkeypatch.setattr(facade_ops, "_call_cuda_moe", call_native)
+    monkeypatch.setattr(
+        facade_ops,
+        "deepseek_moe_packed_reference",
+        lambda *a, **k: pytest.fail("reference fallback"),
+    )
+
+    actual = deepseek_moe_forward(
+        *inputs,
+        topk=TOPK,
+        backend=backend,  # type: ignore[arg-type]
+    )
+
+    assert actual is expected
+    assert eligibility_queries == [expected_operator]
+    assert native_calls == [expected_operator]
 
 
 def test_eligible_auto_calls_native_once(monkeypatch) -> None:
     inputs = _moe_inputs(dtype=torch.float32)
     expected = torch.full_like(inputs[0], 3.0)
-    native_calls = 0
+    native_calls: list[str] = []
 
-    def call_native(*args: object, **kwargs: object) -> Tensor:
-        nonlocal native_calls
-        native_calls += 1
+    def call_native(*args: object, operator: str, **kwargs: object) -> Tensor:
+        native_calls.append(operator)
         return expected
 
     monkeypatch.setattr(facade_ops, "_cuda_moe_ineligibility_reason", lambda *a, **k: None)
@@ -721,7 +920,42 @@ def test_eligible_auto_calls_native_once(monkeypatch) -> None:
     actual = deepseek_moe_forward(*inputs, topk=TOPK, backend="auto")
 
     assert actual is expected
-    assert native_calls == 1
+    assert native_calls == ["deepseek_moe_forward_fused"]
+
+
+def test_auto_falls_back_to_staged_without_considering_persistent(monkeypatch) -> None:
+    inputs = _moe_inputs(dtype=torch.float32)
+    expected = torch.full_like(inputs[0], 4.0)
+    eligibility_queries: list[str] = []
+    native_calls: list[str] = []
+
+    def eligibility(*args: object, operator: str, **kwargs: object) -> str | None:
+        eligibility_queries.append(operator)
+        if operator == "deepseek_moe_forward_fused":
+            return "fused operator is unavailable"
+        return None
+
+    def call_native(*args: object, operator: str, **kwargs: object) -> Tensor:
+        native_calls.append(operator)
+        return expected
+
+    monkeypatch.setattr(facade_ops, "_cuda_moe_ineligibility_reason", eligibility)
+    monkeypatch.setattr(facade_ops, "_call_cuda_moe", call_native)
+    monkeypatch.setattr(
+        facade_ops,
+        "deepseek_moe_packed_reference",
+        lambda *a, **k: pytest.fail("reference fallback"),
+    )
+
+    actual = deepseek_moe_forward(*inputs, topk=TOPK, backend="auto")
+
+    assert actual is expected
+    assert eligibility_queries == [
+        "deepseek_moe_forward_fused",
+        "deepseek_moe_forward",
+    ]
+    assert "deepseek_moe_forward_persistent" not in eligibility_queries
+    assert native_calls == ["deepseek_moe_forward"]
 
 
 def test_ineligible_auto_calls_packed_reference_once(monkeypatch) -> None:
@@ -882,7 +1116,7 @@ def _assert_native_output(
     CUDA_MOE_SHAPES,
 )
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "bias"])
-@pytest.mark.parametrize("backend", ["cuda", "auto"])
+@pytest.mark.parametrize("backend", [*EXPLICIT_NATIVE_BACKENDS, "auto"])
 def test_native_cuda_matches_independent_reference_across_shape_matrix(
     tokens: int,
     model_dim: int,
@@ -926,7 +1160,7 @@ def test_native_cuda_matches_independent_reference_across_shape_matrix(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
-@pytest.mark.parametrize("backend", ["cuda", "auto"])
+@pytest.mark.parametrize("backend", [*EXPLICIT_NATIVE_BACKENDS, "auto"])
 def test_native_cuda_preserves_exact_ties(
     backend: str,
 ) -> None:
@@ -948,7 +1182,7 @@ def test_native_cuda_preserves_exact_ties(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
-@pytest.mark.parametrize("backend", ["cuda", "auto"])
+@pytest.mark.parametrize("backend", [*EXPLICIT_NATIVE_BACKENDS, "auto"])
 def test_native_cuda_handles_hot_and_inactive_experts(
     backend: str,
 ) -> None:
@@ -974,7 +1208,27 @@ def test_native_cuda_handles_hot_and_inactive_experts(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
-@pytest.mark.parametrize("backend", ["cuda", "auto"])
+def test_persistent_cuda_repeats_skewed_routes_without_queue_state_leakage() -> None:
+    inputs = list(_numerical_moe_inputs(17, 15, 17, 4, device="cuda"))
+    inputs[0] = torch.ones_like(inputs[0]).mul_(0.25)
+    inputs[1] = -torch.ones_like(inputs[1])
+    inputs[1][0].fill_(1.0)
+    typed_inputs = tuple(tensor.detach().contiguous() for tensor in inputs)
+    kwargs = {"topk": 1, "n_groups": 1, "topk_groups": 1}
+    expected = deepseek_moe_reference(*typed_inputs, **kwargs)
+
+    for _ in range(25):
+        actual = deepseek_moe_forward(
+            *typed_inputs,
+            backend="cuda_persistent",
+            **kwargs,
+        )
+        _assert_native_output(actual, expected, typed_inputs[0])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+@pytest.mark.parametrize("backend", [*EXPLICIT_NATIVE_BACKENDS, "auto"])
 def test_native_cuda_restores_rank_three_facade_output(
     backend: str,
 ) -> None:
@@ -1126,7 +1380,8 @@ def test_ineligible_auto_completes_reference_fallback(
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
-def test_native_cuda_uses_current_nondefault_stream() -> None:
+@pytest.mark.parametrize("backend", [*EXPLICIT_NATIVE_BACKENDS, "auto"])
+def test_native_cuda_uses_current_nondefault_stream(backend: str) -> None:
     inputs = list(_numerical_moe_inputs(7, 15, 17, 4, device="cuda"))
     score_bias = _numerical_score_bias(4, device="cuda")
     producer_stream = torch.cuda.current_stream()
@@ -1142,7 +1397,7 @@ def test_native_cuda_uses_current_nondefault_stream() -> None:
 
     with torch.cuda.stream(stream):
         inputs[0].add_(0.03125)
-        actual = deepseek_moe_forward(*inputs, backend="cuda", **kwargs)  # type: ignore[arg-type]
+        actual = deepseek_moe_forward(*inputs, backend=backend, **kwargs)  # type: ignore[arg-type]
         actual.record_stream(stream)
     stream.synchronize()
     expected = deepseek_moe_reference(*inputs, **kwargs)
@@ -1152,14 +1407,15 @@ def test_native_cuda_uses_current_nondefault_stream() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
-def test_raw_native_cuda_operator_passes_opcheck() -> None:
+@pytest.mark.parametrize("operator", RAW_MOE_OPERATORS)
+def test_raw_native_cuda_operator_passes_opcheck(operator: str) -> None:
     inputs = tuple(
         tensor.detach().contiguous()
         for tensor in _numerical_moe_inputs(7, 15, 17, 4, device="cuda")
     )
     score_bias = _numerical_score_bias(4, device="cuda").detach().contiguous()
     result = torch.library.opcheck(
-        torch.ops.ds_flash_mla_moe.deepseek_moe_forward.default,
+        getattr(torch.ops.ds_flash_mla_moe, operator).default,
         (*inputs, 2, 2, 1, score_bias, 0.75),
     )
 
@@ -1168,7 +1424,8 @@ def test_raw_native_cuda_operator_passes_opcheck() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
-def test_raw_native_cuda_operator_supports_fullgraph_compile() -> None:
+@pytest.mark.parametrize("operator", RAW_MOE_OPERATORS)
+def test_raw_native_cuda_operator_supports_fullgraph_compile(operator: str) -> None:
     inputs = tuple(
         tensor.detach().contiguous()
         for tensor in _numerical_moe_inputs(7, 15, 17, 4, device="cuda")
@@ -1184,7 +1441,7 @@ def test_raw_native_cuda_operator_supports_fullgraph_compile() -> None:
         expert_w3: Tensor,
         bias: Tensor,
     ) -> Tensor:
-        return torch.ops.ds_flash_mla_moe.deepseek_moe_forward.default(
+        return getattr(torch.ops.ds_flash_mla_moe, operator).default(
             x,
             gate_weight,
             expert_w1,
@@ -1213,8 +1470,10 @@ def test_raw_native_cuda_operator_supports_fullgraph_compile() -> None:
 @pytest.mark.cuda
 @pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
 @pytest.mark.parametrize("inside_no_grad", [False, True], ids=["normal", "no_grad"])
+@pytest.mark.parametrize("operator", RAW_MOE_OPERATORS)
 def test_raw_native_cuda_operator_rejects_requires_grad_even_in_no_grad(
     inside_no_grad: bool,
+    operator: str,
 ) -> None:
     inputs = [
         tensor.detach().contiguous()
@@ -1228,6 +1487,7 @@ def test_raw_native_cuda_operator_rejects_requires_grad_even_in_no_grad(
             topk=2,
             n_groups=2,
             topk_groups=1,
+            operator=operator,
         )
 
     with pytest.raises(RuntimeError, match="forward-only|requires_grad"):

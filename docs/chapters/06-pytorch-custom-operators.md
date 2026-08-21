@@ -49,7 +49,7 @@ key 注册实现。二者分开以后，同一算子可以拥有 CPU、CUDA、Me
 
 ### 6.1.1 Whole-layer MoE 的 output-only 边界
 
-single-device、staged、correctness-first 的 `deepseek_moe_forward` raw schema 是：
+single-device、staged、correctness-first 的比较 schema 保留为：
 
 ```text
 deepseek_moe_forward(Tensor x, Tensor gate_weight,
@@ -58,17 +58,23 @@ deepseek_moe_forward(Tensor x, Tensor gate_weight,
                      Tensor? score_bias, float route_scale) -> Tensor
 ```
 
+相同参数和 output-only 返回契约还定义了 `deepseek_moe_forward_fused` 与
+`deepseek_moe_forward_persistent`。前者使用 private pack 与 fused weighted-combine
+epilogue；后者只在 single-device expert core 内增加 bounded persistent task queue，并为
+小工作量保留 fused fallback。
+
 它只返回最终 `[T,D]` output，不把 route indices、weights、counts、offsets 或中间 expert
 contributions 暴露为 public outputs。Python 层只为这个 raw op 注册 FakeTensor metadata：
 Fake 实现检查 shape/device/dtype/layout 与 forward-only 条件，然后返回与 `x` 同 shape 的空
 FakeTensor；它不读取数据，也不运行 route 或 expert 数学。
 
-这个 raw operator 只有 Fake + CUDA dispatch，没有 CPU、backward、autograd registration、
+这三个 raw operators 都只有 Fake + CUDA dispatch，没有 CPU、backward、autograd registration、
 `CompositeExplicitAutograd` 或 `CompositeImplicitAutograd` 实现。CUDA v1 还要求 contiguous
 CUDA FP32、sigmoid scoring、所有浮点输入均无 `requires_grad`，并在 deterministic algorithms
 启用时拒绝 atomic routing。可移植 reference 与 fallback 属于公开 facade
-`deepseek_moe_forward(..., backend="reference"|"cuda"|"auto")`，不能误写成 raw op 的
-Composite 或 whole-layer 训练支持。
+`deepseek_moe_forward` facade：`cuda_staged`、`cuda_fused` 和 `cuda_persistent` 精确选择一个
+raw operator，`cuda` 是 fused 别名，`auto` 优先 fused、可退到 staged，但不自动选择
+persistent。不能把 Fake 注册误写成 Composite 或 whole-layer 训练支持。
 
 ## 6.2 加载顺序与纯 Python 安装
 
@@ -253,7 +259,7 @@ attention、MLA、router 与 expert wrapper 延续同一约定，并各自公开
 
 第二层通过不代表 kernel 数值正确，第三层通过也不替代不同 SM、dtype 和极限 shape 的
 覆盖。按 `csrc/ops.cpp` 与各 `TORCH_LIBRARY_IMPL(..., CUDA, ...)` 的源码清点，当前扩展注册
-19 个 formal CUDA operators。新增清单项是已存在的 `attention_fa1_forward`、
-`attention_fa2_forward` 与本次 `deepseek_moe_forward`；其中两个 paged MLA operator 仍分别负责
+21 个 formal CUDA operators。MoE 清单包含 staged `deepseek_moe_forward`、
+`deepseek_moe_forward_fused` 与 `deepseek_moe_forward_persistent`；其中两个 paged MLA operator 仍分别负责
 per-slot write 与直接页表 attention。把证据拆开记录，才能准确说清“源码可编译”和“算子已在
 GPU 验证”的区别。

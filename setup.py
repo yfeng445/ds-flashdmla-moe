@@ -24,6 +24,7 @@ def native_build_configuration() -> dict[str, object]:
             "csrc/attention/attention_backward_cuda.cu",
             "csrc/attention/fa1_forward_cuda.cu",
             "csrc/attention/fa2_forward_cuda.cu",
+            "csrc/attention/fa3_forward_cuda.cu",
             "csrc/attention/attention_forward_cuda.cu",
             "csrc/gemm/tiled_gemm_cuda.cu",
             "csrc/moe/route_ops_cuda.cu",
@@ -31,9 +32,11 @@ def native_build_configuration() -> dict[str, object]:
             "csrc/moe/grouped_topk_cuda.cu",
             "csrc/moe/swiglu_experts_cuda.cu",
             "csrc/moe/deepseek_moe_forward_cuda.cu",
+            "csrc/moe/deepseek_moe_forward_fused_cuda.cu",
             "csrc/mla/mla_absorbed_attention_cuda.cu",
             "csrc/mla/mla_paged_attention_cuda.cu",
             "csrc/mla/mla_projection_cuda.cu",
+            "csrc/quantization/quantized_linear_cuda.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args,
@@ -54,6 +57,7 @@ def assert_native_sources_present() -> None:
         Path("csrc/attention/attention_backward_cuda.cu"),
         Path("csrc/attention/fa1_forward_cuda.cu"),
         Path("csrc/attention/fa2_forward_cuda.cu"),
+        Path("csrc/attention/fa3_forward_cuda.cu"),
         Path("csrc/attention/attention_forward_cuda.cu"),
         Path("csrc/gemm/tiled_gemm_cuda.cu"),
         Path("csrc/moe/route_ops_cuda.cu"),
@@ -61,9 +65,11 @@ def assert_native_sources_present() -> None:
         Path("csrc/moe/grouped_topk_cuda.cu"),
         Path("csrc/moe/swiglu_experts_cuda.cu"),
         Path("csrc/moe/deepseek_moe_forward_cuda.cu"),
+        Path("csrc/moe/deepseek_moe_forward_fused_cuda.cu"),
         Path("csrc/mla/mla_absorbed_attention_cuda.cu"),
         Path("csrc/mla/mla_paged_attention_cuda.cu"),
         Path("csrc/mla/mla_projection_cuda.cu"),
+        Path("csrc/quantization/quantized_linear_cuda.cu"),
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:

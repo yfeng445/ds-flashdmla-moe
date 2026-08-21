@@ -41,14 +41,14 @@ inline void validate_formal_attention_forward_inputs(
   TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
               "q, k, and v must be CUDA tensors");
   TORCH_CHECK(!(q.requires_grad() || k.requires_grad() || v.requires_grad()),
-              "formal FA1/FA2 forward kernels are forward-only and do not accept "
+              "teaching FA1/FA2/FA3 forward kernels are forward-only and do not accept "
               "requires_grad tensors");
   TORCH_CHECK(q.device() == k.device() && k.device() == v.device(),
               "q, k, and v must be on the same CUDA device");
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
               "q, k, and v must have shape [batch, heads, sequence, dimension]");
   TORCH_CHECK(q.scalar_type() == at::kHalf,
-              "formal FA1/FA2 forward kernels support float16 only");
+              "teaching FA1/FA2/FA3 forward kernels support float16 only");
   TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
               "q, k, and v must have the same dtype");
   TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
@@ -61,9 +61,9 @@ inline void validate_formal_attention_forward_inputs(
   TORCH_CHECK(q.size(3) > 0, "attention head dimension must be positive");
   TORCH_CHECK(k.size(2) > 0, "key sequence length must be positive");
   TORCH_CHECK(q.size(3) <= kMaxHeadDim,
-              "formal FA1/FA2 require head_dim <= ", kMaxHeadDim);
+              "teaching FA1/FA2/FA3 require head_dim <= ", kMaxHeadDim);
   TORCH_CHECK(v.size(3) <= kMaxValueDim,
-              "formal FA1/FA2 require value_dim <= ", kMaxValueDim);
+              "teaching FA1/FA2/FA3 require value_dim <= ", kMaxValueDim);
   TORCH_CHECK(!causal || q.size(2) <= k.size(2),
               "right-aligned causal attention requires query_length <= key_length");
   TORCH_CHECK(std::isfinite(scale), "scale must be finite");

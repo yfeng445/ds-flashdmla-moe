@@ -50,15 +50,19 @@ k \le q + S_k - S_q.
 这类语义必须先在 reference 中锁定。若 kernel 只用 tile 内局部坐标做三角 mask，
 相同长度测试可能通过，decode 却会悄悄出错。
 
-## 2.4 从 FA1 到 FA2：工作划分而不是版本标签
+## 2.4 从 FA1 到 FA3：工作划分与流水线，而不是版本标签
 
 [FlashAttention-1 论文](https://arxiv.org/abs/2205.14135)建立了 IO-aware exact
 attention；[FlashAttention-2 论文](https://arxiv.org/abs/2307.08691)在相同目标上进一步
-调整循环、并行网格和 warp 分工。本仓库把两者实现为可执行的教学 kernel；直接对应的
-production 源码是共享约束与 causal 坐标的
+调整循环、并行网格和 warp 分工；
+[FlashAttention-3 论文](https://arxiv.org/abs/2407.08608)则把重点推进到异步数据移动、
+warp specialization、计算/搬运重叠以及低精度。本仓库把其中可在当前课程范围清楚解释的
+机制实现为教学 kernel；直接对应的源码是共享约束与 causal 坐标的
 [`attention_common.cuh`](../../csrc/attention/attention_common.cuh)、
 KV-outer 的 [`fa1_forward_cuda.cu`](../../csrc/attention/fa1_forward_cuda.cu) 和
-Q-tile-owned 的 [`fa2_forward_cuda.cu`](../../csrc/attention/fa2_forward_cuda.cu)。
+Q-tile-owned 的 [`fa2_forward_cuda.cu`](../../csrc/attention/fa2_forward_cuda.cu)，以及
+异步双缓冲 K/V staging 的
+[`fa3_forward_cuda.cu`](../../csrc/attention/fa3_forward_cuda.cu)。
 
 ### 2.4.1 循环次序
 
@@ -87,7 +91,21 @@ FA1 在每个 K/V tile 后把归一化的 `O`、行最大值 `m` 和分母 `l` �
 FA2 让每个 warp 将未归一化的 value 分子、`m` 和 `l` 保持在片上，遍历完所有 K/V
 tile 后只除以 `l` 一次并写出 FP16 结果。
 
-两者都可以在 causal 模式下跳过整个不可见的 K/V tile，也都在 tile 内用右下对齐坐标
+### 2.4.5 FA3 教学路径：搬运与计算重叠
+
+`fa3` 保留 FA2 的“一 CTA 拥有一个 Q tile”和 warp-per-query-row 结构，但把一个
+K/V shared-memory stage 扩展为 ping-pong 两级缓冲：消费 stage 0 时，使用 CUDA
+cooperative-groups asynchronous copy API 预取下一块到 stage 1；等待完成并同步后交换
+两级缓冲。对满足对齐条件的主体区域，编译器可使用 Ampere+ 的异步 global-to-shared
+路径；不对齐尾部仍以相同语义正确执行。因此这里展示的是流水线方向，而不是固定的
+`cp.async` 指令数量承诺。
+
+这个实现仍让每个 warp 在寄存器中维护 FP32 `m/l/O`，没有 TMA descriptor、专门的
+producer/consumer warp、WGMMA、matmul/softmax warp-group 交错或 FP8。它只能称为
+**FA3 teaching backend**，不能据此声称达到 Hopper/Blackwell production FA3，也不做
+任何速度保证。
+
+三个教学 backend 都可以在 causal 模式下跳过整个不可见的 K/V tile，也都在 tile 内用右下对齐坐标
 过滤单个 key。这是共同的 causal 优化，不是区分 FA1 与 FA2 的版本定义。课程原型中
 是否调用 WMMA 或 Tensor Core 同样不能单独决定版本；版本差异要落实到上述循环、grid、
 warp 所有权和递推状态。
@@ -102,16 +120,25 @@ backend 的支持范围。对于支持的输入，至少覆盖：
 - value dimension 与 head dimension 相等和不等；
 - causal 与 non-causal；
 - `reference`/`blockwise` 的浮点 dtype，`cuda_rowwise` 的 FP16/BF16/FP32，以及
-  `fa1`/`fa2` 的 FP16；
+  `fa1`/`fa2`/`fa3` 的 FP16；
 - 仅对 `reference`/`blockwise` 覆盖 boolean mask、additive mask 和全遮挡行。
 
 支持组合的比较对象不是另一个 CUDA 原型，而是 FP32/FP64 materialized reference。
 除了最大绝对误差，还应记录相对误差，并将 kernel 误差与低精度 PyTorch baseline 的
 误差比较。
 
-不支持的组合应单独做 strict rejection 测试：`cuda_rowwise`、`fa1`、`fa2` 必须拒绝
-任何显式 mask 和非连续 Q/K/V；`fa1`/`fa2` 还必须拒绝 BF16/FP32，以及超过其上限的
+不支持的组合应单独做 strict rejection 测试：`cuda_rowwise`、`fa1`、`fa2`、`fa3`
+必须拒绝任何显式 mask 和非连续 Q/K/V；`fa1`/`fa2`/`fa3` 还必须拒绝 BF16/FP32，
+以及超过其上限的
 `D` 或 `D_v`。这类测试验证的是 backend contract，而不是数值误差。
+
+2026-08-22 的 installed-wheel 单卡验证在 RTX 5090 / PyTorch 2.10.0+cu128
+上选中全部 82 个 CUDA attention-backend 用例，结果为 `82 passed, 46
+deselected`。该矩阵覆盖 FA3 的 causal/non-causal、decode、尾部 shape、raw/public
+路径和非默认 stream，同时覆盖 FA1/FA2/FA3 同输入对齐。它证明的是数值与
+stream contract，不是某个 asynchronous copy 必然降为特定指令，也不是性能结论。
+完整环境与复现命令见
+[单卡证据快照](../../validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)。
 
 ## 2.6 统一 facade、backend 矩阵与第一版正确性 kernel
 
@@ -124,8 +151,9 @@ backend 的支持范围。对于支持的输入，至少覆盖：
 | `cuda_rowwise` | one query row per CTA | FP16/BF16/FP32 CUDA | existing native/reference backward policy |
 | `fa1` | formal KV-outer teaching kernel | FP16 CUDA, `D,D_v <= 128` | forward-only |
 | `fa2` | formal Q-tile-owned teaching kernel | FP16 CUDA, `D,D_v <= 128` | forward-only |
+| `fa3` | Q-tile-owned async double-buffer teaching kernel | FP16 CUDA, `D,D_v <= 128` | forward-only |
 
-下面的脚本可直接运行；两次调用除 `backend` 外使用完全相同的 facade 参数：
+下面的脚本可直接运行；三次调用除 `backend` 外使用完全相同的 facade 参数：
 
 ```python
 import torch
@@ -136,22 +164,20 @@ q = torch.randn(1, 4, 256, 64, device="cuda", dtype=torch.float16)
 k = torch.randn(1, 4, 256, 64, device="cuda", dtype=torch.float16)
 v = torch.randn(1, 4, 256, 64, device="cuda", dtype=torch.float16)
 
-out_fa1 = flash_attention_forward(
-    q, k, v, causal=True, scale=None, attn_mask=None, backend="fa1"
-)
-out_fa2 = flash_attention_forward(
-    q, k, v, causal=True, scale=None, attn_mask=None, backend="fa2"
-)
+out_fa1 = flash_attention_forward(q, k, v, causal=True, scale=None, attn_mask=None, backend="fa1")
+out_fa2 = flash_attention_forward(q, k, v, causal=True, scale=None, attn_mask=None, backend="fa2")
+out_fa3 = flash_attention_forward(q, k, v, causal=True, scale=None, attn_mask=None, backend="fa3")
 torch.testing.assert_close(out_fa1, out_fa2, atol=2e-2, rtol=2e-2)
+torch.testing.assert_close(out_fa2, out_fa3, atol=2e-2, rtol=2e-2)
 ```
 
-三个原生 backend 都要求 contiguous `[B,H,S,D]` 张量、Q/K/V 相同 dtype、Q/K 的
+四个原生 backend 都要求 contiguous `[B,H,S,D]` 张量、Q/K/V 相同 dtype、Q/K 的
 `D` 相同、K/V 的序列长度相同，且不接受显式 `attn_mask`；右下对齐 causal 还要求
-`S_q <= S_k`。此外，`fa1`/`fa2` 只接受 FP16 CUDA、`D > 0`、非空 key、
+`S_q <= S_k`。此外，`fa1`/`fa2`/`fa3` 只接受 FP16 CUDA、`D > 0`、非空 key、
 `D,D_v <= 128`，并拒绝任何 `requires_grad=True` 的 Q/K/V。它们是严格的显式选项：
 条件不满足就报错，不会静默回退。
 
-`backend="auto"` **不会**选择 `fa1` 或 `fa2`。它只在满足约束时选择
+`backend="auto"` **不会**选择 `fa1`、`fa2` 或 `fa3`。它只在满足约束时选择
 `cuda_rowwise`，否则回退到可微的 `blockwise` specification。旧名 `backend="cuda"`
 只是 `cuda_rowwise` 的 deprecated alias，不应出现在新的调用中。
 
@@ -184,10 +210,10 @@ deterministic 模式与高阶梯度仍使用解析 reference。显式 `cuda_roww
 
 ## 2.7 Backward 的核心恒等式
 
-本节的 production CUDA backward 只属于 `cuda_rowwise`，不属于新的 formal `fa1`/`fa2`
-backend；后两者是 forward-only，并在 facade 边界拒绝需要梯度的输入。仓库
+本节的 production CUDA backward 只属于 `cuda_rowwise`，不属于教学版 `fa1`/`fa2`/`fa3`
+backend；后三者是 forward-only，并在 facade 边界拒绝需要梯度的输入。仓库
 `csrc/experimental/attention/` 下的 backward/WMMA 文件是未注册的课程实验，也不能当作
-`fa1` 或 `fa2` 的可用 backward。
+`fa1`、`fa2` 或 `fa3` 的可用 backward。
 
 令 `dO` 为上游梯度，`P = softmax(S)`，则：
 

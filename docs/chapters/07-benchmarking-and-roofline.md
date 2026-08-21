@@ -377,13 +377,14 @@ CUDA 验证还必须要求 indices 与稳定 tie-break reference 完全一致；
 
 ### 7.9.1 Whole-layer MoE forward evidence
 
-`benchmarks/moe.py` 对公开 `deepseek_moe_forward` 调用计时。CUDA v1 是 single-device、
-staged、correctness-first 的 whole-layer forward，因此性能实验应显式选择 strict CUDA
-backend，避免 `auto` fallback 把 reference latency 混入结果：
+`benchmarks/moe.py` 对公开 `deepseek_moe_forward` 调用计时。`cuda_staged`、`cuda_fused`
+与 `cuda_persistent` 都是 single-device、correctness-first whole-layer forwards；staged 保留
+原比较路径，fused 去掉分布式 pack metadata 和独立 combine，persistent 在 expert core 中
+增加 bounded device queue。性能实验应显式选择 backend，避免 `auto` fallback 混入结果：
 
 ```bash
 python benchmarks/moe.py \
-  --device cuda --backend cuda --dtype float32 \
+  --device cuda --backend cuda_fused --dtype float32 \
   --tokens 128 --model-dim 64 --hidden-dim 128 \
   --experts 8 --topk 2 --n-groups 1 --topk-groups 1 \
   --warmup 5 --iterations 50 \
@@ -392,15 +393,57 @@ python benchmarks/moe.py \
 
 报告的 `raw_samples_ms`/`latency` 覆盖整个 facade call，而 input creation、独立 route 分析和
 reference verification 都在计时区间外。`route_distribution.values` 保存实际负载；
-`intermediate_bytes` 则按 dense scores、packed activations/weights/indices、expert hidden state
-与 contributions 分项记录 materialized-buffer 大小。该字段带 `analytical_only=true`，不是
-allocator 峰值、DRAM traffic 或 profiler counter。
+`intermediate_bytes.inventories` 分别记录 `cuda_staged`、`cuda_fused` 与
+`cuda_persistent`。fused inventory 包含实际 private-pack cursor scratch，但不包含 rank metadata、
+duplicate offsets、expert task offsets 或 contributions；persistent 只在超过 small-work fallback
+阈值时增加一个 device queue。该字段带 `analytical_only=true`，不是 allocator 峰值、DRAM
+traffic 或 profiler counter。
 
-一个 `ds_flash_mla_moe::deepseek_moe_forward` dispatcher event 也不是单 launch 证据：当前
-编排内部仍会启动 route、pack、offset scan/cat、expert 与 combine 等多个工作项。若要报告
+一个 whole-layer dispatcher event 也不是单 launch 证据：staged 内部仍有 scan/cat/combine，
+fused/persistent 也分别启动 route、private pack、hidden 和 down epilogue 等工作项。若要报告
 launch 数、重叠或 kernel 时间，必须另存 Kineto/Nsight timeline，并把它和上述 whole-call
-event samples 区分。报告固定写入 `implementation=single_device_staged` 与
+event samples 区分。报告写入实际 `executed_backend`/`implementation` 和
 `performance_claim=false`；在真实 shape、基线和 profiler 证据齐全前，不据此作 speed claim。
+
+### 7.9.2 2026-08-22 单卡 MoE 观测
+
+以下数据来自 RTX 5090、PyTorch 2.10.0+cu128 上的同一个 FP32 workload：
+`T=128, D=64, D_h=128, E=8, K=2`，每个 backend 都执行两次 warmup 和三次
+timed iteration。Kineto capture 包含完整 profiling harness，包括新建 setup、route
+analysis、reference verification、warmup 和 timed call：
+
+| Backend | Kineto 观测的 aggregate custom-kernel activities | 观测的 device activities | 分析中间张量 bytes | 其中 metadata bytes | allocator peak delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `cuda_staged` | 66 | 676 | 281200 | 10864 | 1423360 |
+| `cuda_fused` | 42 | 586 | 211080 | 6280 | 1423360 |
+| `cuda_persistent` | 42 | 604 | 211088 | 6288 | 1423360 |
+
+相对 staged，fused 的分析中间张量减少 70120 bytes（约 24.94%），其中
+metadata 减少 4584 bytes（约 42.19%）；persistent 因 device queue 比 fused 多 8
+bytes。这些差值和源码中删除 rank/owner metadata、重复 offset、`cat/cumsum/floor_divide`
+产物、materialized contributions 以及独立 combine 的方向一致。但三者本次观测的
+allocator peak delta 相同，所以不应把分析字节差值转写为已观测的 peak-memory 降幅。
+
+`observed_custom_kernel_count` 是 Kineto key averages 中识别到的 activity occurrence
+聚合值，不是物理 launch count；parent operator 和 child kernel 也不可相加。本轮
+未采集 Nsight Systems/Compute，因此不声称 launch 数、occupancy、DRAM traffic、
+overlap 或稳定 speedup。
+
+可用下列命令逐 backend 复现同一 capture 边界：
+
+```bash
+for backend in cuda_staged cuda_fused cuda_persistent; do
+  python benchmarks/moe.py \
+    --mode kineto --device cuda --backend "$backend" --dtype float32 \
+    --tokens 128 --model-dim 64 --hidden-dim 128 \
+    --experts 8 --topk 2 --n-groups 1 --topk-groups 1 \
+    --warmup 2 --iterations 3 \
+    --output "benchmark-results/moe-${backend}-kineto.json"
+done
+```
+
+机器可读摘要、hosted build 与 installed-wheel 命令见
+[2026-08-22 单卡快照](../../validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)。
 
 ## 7.10 阶段分解不是端到端求和
 

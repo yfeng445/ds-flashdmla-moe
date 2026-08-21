@@ -1,0 +1,84 @@
+{
+  "benchmark": "logical_ep_tp_single_process",
+  "claims": {
+    "communication_overlap": false,
+    "performance_speedup": false,
+    "real_transport": false
+  },
+  "config": {
+    "cell_capacity": 4,
+    "experts": 4,
+    "hidden": 16,
+    "model_dim": 8,
+    "pes": 2,
+    "routes_per_pe": 4,
+    "seed": 0,
+    "tp_size": 2
+  },
+  "facts": {
+    "restored_checksum": -3.408586975187063,
+    "restored_route_identities": [
+      {
+        "generation": 0,
+        "route_id": 0,
+        "source_pe": 0
+      },
+      {
+        "generation": 0,
+        "route_id": 1,
+        "source_pe": 0
+      },
+      {
+        "generation": 0,
+        "route_id": 2,
+        "source_pe": 0
+      },
+      {
+        "generation": 0,
+        "route_id": 3,
+        "source_pe": 0
+      },
+      {
+        "generation": 0,
+        "route_id": 0,
+        "source_pe": 1
+      },
+      {
+        "generation": 0,
+        "route_id": 1,
+        "source_pe": 1
+      },
+      {
+        "generation": 0,
+        "route_id": 2,
+        "source_pe": 1
+      },
+      {
+        "generation": 0,
+        "route_id": 3,
+        "source_pe": 1
+      }
+    ],
+    "tp_output_checksum": 73.51009786128998
+  },
+  "protocol": {
+    "dispatch_cell_count": 8,
+    "multi_gpu_verified": false,
+    "remote_visibility_verified": false,
+    "return_cell_count": 8,
+    "route_count": 8,
+    "simulated": true,
+    "transport_performed": false
+  },
+  "schema_version": 1,
+  "tensor_parallel": {
+    "accumulation_dtype": "float32",
+    "hidden_size": 16,
+    "multi_gpu_verified": false,
+    "remote_visibility_verified": false,
+    "shard_hidden_size": 8,
+    "simulated": true,
+    "tp_size": 2,
+    "transport_performed": false
+  }
+}

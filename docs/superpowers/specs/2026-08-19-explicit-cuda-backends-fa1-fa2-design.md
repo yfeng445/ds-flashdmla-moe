@@ -100,8 +100,7 @@ def flash_attention_forward(
     causal=False,
     scale=None,
     backend="auto",
-):
-    ...
+): ...
 ```
 
 The first formal FA1/FA2 milestone supports:

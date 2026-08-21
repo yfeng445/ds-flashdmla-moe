@@ -158,8 +158,8 @@ B(R_{kv}+D_{rope})e + 8\quad\text{bytes}.
 
 这把 cache 搬运从随 `S` 增长的 `O(S)` 降为 `O(1)`；attention 读取历史 cache 的成本仍然
 是 `O(S)`。当前 reference 为整个 batch 维护一个共享 cursor，适合等长 batch 和实验验证。
-生产 continuous batching 还需为每个 batch slot 分别维护有效长度、请求生命周期和 page
-映射。静态写入会修改 storage，因此 API 明确限定在 `torch.no_grad()` 或
+多请求 continuous batching 需要为每个 batch slot 分别维护有效长度、请求生命周期和 page
+映射；本章 3.14 节给出最小实验控制面，但生产系统还需要更完整的执行层。静态写入会修改 storage，因此 API 明确限定在 `torch.no_grad()` 或
 `torch.inference_mode()` 下使用，而不伪装成可微操作。
 
 `MLAPagedCache` 进一步把 latent payload 拆成固定大小的物理页，并用 per-row length 与
@@ -306,5 +306,49 @@ CUDA kernel 直接在 key loop 中把 logical token 映射到 `(physical_page,pa
 dtype。测试覆盖 ragged batch、非连续物理页、重复/越界 slot、覆盖语义、未写入和非单调位置，
 以及 `S=257,page_size=16` 的尾页。Python 公共 API 校验后，native op 可跳过重复的 host-side
 防御检查；校验缓存只在 tensor identity/version 未变化时有效，直接原地修改会触发重新检查。
-当前尚未实现 page allocator、请求回收、eviction、prefix-sharing scheduler 或多请求 continuous
-batching，因此这是 paged storage/compute primitive，不是完整 serving runtime。
+## 3.14 CUDA Graph bucket 与最小 continuous batching 控制面
+
+`SingleOutputCUDAGraphRunner` 不直接捕获调用者的临时 tensor。capture 时它为每个输入建立
+runner-owned static buffer；replay 先核对 shape、dtype、device，再把新值复制进固定地址，最后
+重放 graph。输出也是固定地址，下一次 replay 会覆盖其内容。也就是说，一个 bucket 的静态
+合同是“地址由 runner 固定、值可变、shape/dtype/device 不变”，而不是要求调用者永久持有同一
+个输入 tensor。
+
+`MLAPagedDecodeGraphRunner` 把 bucket 进一步限定为固定的 batch size、`model_dim` 和
+`max_logical_pages`，且 query length 恒为 1。cache 与 weights 必须维持 capture 时的地址；每次
+replay 的 `block_table`、`sequence_lengths`、已写入 slot 和 absolute query positions 都会在
+copy 前校验。graph 内只运行已经预校验的 raw query projection、paged absorbed attention 和
+output projection，cache projection/write 不在本 graph 内。新的 batch shape 或 block-table
+宽度需要另建 bucket。
+
+CPU 侧的 `ContinuousBatchingScheduler` 提供 `FixedPageAllocator` 及
+`submit/schedule/complete/abort/cancel`：
+
+- FIFO 请求只在 iteration 边界进入 active set；
+- prefill batch 与 decode batch 保持同质，当前 prefill 一次处理完整 prompt；
+- 每个 decode iteration 对每个 active request 最多预留一个 token；
+- `schedule` 先计算整个 batch 的页需求，再一次性预留；失败不改变任何请求或 allocator 状态；
+- `complete` 提交长度并回收完成请求，`abort` 精确恢复页顺序、请求状态与 FIFO admission；
+- in-flight 请求必须先 complete/abort，才能 cancel。
+
+这条路径补上了固定页分配、请求回收和最小多请求 continuous batching，但仍没有 eviction、
+prefix sharing、chunked prefill、优先级、speculative decoding、网络层或模型执行器。它把
+storage/compute primitive 与可测试控制面接起来，仍不是完整 serving runtime。
+
+聚焦验证中，CPU scheduler 契约测试为 `20 passed`；RTX 5090 installed-wheel
+的 CUDA graph 子集为 `7 passed, 6 deselected`，覆盖 stable output address、bucket
+不兼容时 copy 前拒绝、paged-MLA raw replay、host reentrancy、cross-stream event
+串行化和 canonical int64 positions。以下命令分别复现原生 graph 和最小调度器
+lifecycle：
+
+```bash
+python -m pytest -o addopts= -ra -m cuda tests/test_cuda_graph.py
+python benchmarks/cuda_graph.py --batch 32 --width 256 --warmup 5 --iterations 20
+python benchmarks/continuous_batching.py \
+  --requests 8 --prompt-length 8 --max-new-tokens 4 \
+  --page-size 4 --num-pages 64 --max-batch-size 4
+```
+
+Graph benchmark 保留 eager/replay 原始样本但不做 speedup claim；scheduler benchmark
+不启动模型 kernel，只记录请求/页状态迁移。完整环境见
+[单卡证据快照](../../validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)。
