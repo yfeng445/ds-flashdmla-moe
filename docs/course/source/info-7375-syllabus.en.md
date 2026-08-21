@@ -1,13 +1,16 @@
 # INFO 7375: High Performance Computing for AI
 
-- Original page: [Notion syllabus](https://distinct-capricorn-c04.notion.site/Syllabus-High-Performance-Computing-for-AI-1f788315b6b48050946ede67ec5c086f)
-- Snapshot prepared: 2026-08-17
+- Official syllabus: [PDF](http://newton.neu.edu:8080/syllabusrepo/37287.pdf?t=1770744869205)
+- Supplemental Notion page: [Syllabus page](https://distinct-capricorn-c04.notion.site/Syllabus-High-Performance-Computing-for-AI-1f788315b6b48050946ede67ec5c086f)
+- Notion snapshot prepared: 2026-08-17
+- Official PDF checked: 2026-08-21
 - Chinese version: [INFO 7375 course syllabus](../info-7375-syllabus.md)
 
-> This document is an English-only structured snapshot of the public syllabus.
-> Its grading, lateness, and submission rules describe the source course at the
-> time of the snapshot. They are not current requirements for this repository or
-> a statement of current Northeastern University policy.
+> Textbook entries and the 14-week schedule follow the official PDF. The public
+> Notion page and eleven-week notes are supplemental; their week numbers and
+> topics do not map one-to-one to the official schedule. Grading, lateness, and
+> submission rules describe the source course and are not current repository
+> requirements or current Northeastern University policy.
 
 ## Course Description
 
@@ -51,16 +54,18 @@ By the end of the course, students should be able to:
 
 ## Textbooks
 
+- Jesper Larsson Träff, *Lectures on Parallel Computing*.
 - Hwu, Kirk, and El Hajj,
   [*Programming Massively Parallel Processors: A Hands-On Approach*](https://www.amazon.com/Programming-Massively-Parallel-Processors-Hands/dp/0323912311/).
-- Optional: Jason Sanders and Edward Kandrot,
+- The supplemental Notion page also lists Jason Sanders and Edward Kandrot,
   [*CUDA by Example*](https://edoras.sdsu.edu/~mthomas/docs/cuda/cuda_by_example.book.pdf#page=43.00).
 
 ## Course Approach
 
 - Learn by constructing systems from scratch in weekly projects.
 - Use live coding in lectures to work through concepts needed by those projects.
-- Read and implement recent high-performance-computing research, including:
+- The supplemental Notion page also recommends recent high-performance-computing
+  research, including:
   - [*FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision*](https://arxiv.org/pdf/2407.08608);
   - [*FlashMoE: Fast Distributed MoE in a Single Kernel*](https://arxiv.org/pdf/2506.04667).
 
@@ -68,7 +73,7 @@ By the end of the course, students should be able to:
 
 - The final grade is the average of eight to ten weekly programming projects.
 - Each late day reduces the affected project grade by ten percent.
-- The source syllabus describes the intended overall distribution as follows:
+- The supplemental Notion page describes the intended overall distribution as follows:
   - 20% A: consistently near-perfect work;
   - 30% A-: every project submitted, with code working in roughly 70% of cases;
   - 30% B+: every project submitted, with code working in roughly 50% of cases;
@@ -85,11 +90,11 @@ By the end of the course, students should be able to:
 - Week 4: FlashAttention 1, 2, and 3;
 - Week 5: warp-level programming, intrinsics, and asynchronous execution with streams;
 - Week 6: tensor cores and mixed-precision FP16, BF16, and FP8 computation;
-- Week 7: collective communication with NCCL.
+- Week 7: collective communication with NCCL and CUDA Graphs.
 
 ### Part 2: HPC for Inference
 
-- Week 8: inference server architecture;
+- Week 8: INT8/FP8 quantization and graph compilers;
 - Week 9: continuous batching and large-scale serving.
 
 ### Part 3: HPC for Training
@@ -98,6 +103,7 @@ By the end of the course, students should be able to:
 - Week 11: PyTorch FSDP and Megatron;
 - Week 12: gradient compression, communication overlap, and scaling efficiency;
 - Week 13: SLURM resource management, checkpointing, fault tolerance, and recovery.
+- Week 14: I/O bottlenecks and topology-aware communication.
 
 ## Assignment Submission
 

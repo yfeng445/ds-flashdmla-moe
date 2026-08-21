@@ -5,10 +5,10 @@
 - Course syllabus: [INFO 7375: High Performance Computing for AI](info-7375-syllabus.en.md)
 - Chinese collection: [HPC for AI course notes](../hpc-for-ai.md)
 
-This directory preserves an English-only structured version of the eleven
-public weekly pages. It retains topic hierarchy, equations, system data flows,
-assignment directions, and stable references without copying Notion interface
-artifacts, attachments, or temporary download links.
+This directory preserves an English-only structured version of eleven public
+supplemental Notion weekly pages. It retains topic hierarchy, equations, system
+data flows, assignment directions, and stable references without copying Notion
+interface artifacts, attachments, or temporary download links.
 
 > This is a snapshot prepared on August 17, 2026. Course organization, project
 > status, tool versions, and job links may change; consult the original pages
@@ -38,6 +38,8 @@ artifacts, attachments, or temporary download links.
 - after any technical path, use Week 11 to convert knowledge into reproduction,
   open-source participation, and a continuing study plan.
 
-The weekly pages preserve the course organization. The topic chapters elsewhere
-in the documentation reorganize material around mathematical definitions,
-references, CUDA interfaces, and verification boundaries.
+These weekly pages preserve the organization of the supplemental Notion
+collection; they are neither a replacement for nor a week-by-week expansion of
+the official PDF's 14-week schedule. The topic chapters elsewhere in the
+documentation reorganize material around mathematical definitions, references,
+CUDA interfaces, and verification boundaries.

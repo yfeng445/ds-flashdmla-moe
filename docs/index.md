@@ -9,9 +9,9 @@
 
 ## 课程背景
 
-资料参考 INFO 7375 *High Performance Computing for AI* 的课程实践。整理后的
-[INFO 7375 课程大纲](course/info-7375-syllabus.md)记录课程目标、先修要求、周计划与作业组织方式；
-[HPC for AI 十一周课程笔记](course/hpc-for-ai.md)按公开 Notion 系列保留原主题顺序；下面的专题讲义则围绕数学定义、reference、CUDA 接口和验证边界重新组织相关知识。
+资料参考 INFO 7375 *High Performance Computing for AI* 的课程实践。
+[INFO 7375 课程大纲](course/info-7375-syllabus.md)以官方 PDF 为准，记录课程目标、先修要求、教材、14 周计划与作业组织方式；
+[HPC for AI 十一周补充笔记](course/hpc-for-ai.md)来自公开 Notion 系列，保留其页面顺序，与官方 PDF 周次不一一对应；下面的专题讲义则围绕数学定义、reference、CUDA 接口和验证边界重新组织相关知识。
 
 ## 阅读顺序
 
