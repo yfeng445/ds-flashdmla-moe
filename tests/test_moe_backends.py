@@ -49,16 +49,15 @@ def test_reader_docs_describe_the_whole_layer_moe_milestone_honestly() -> None:
     missing_statement = [
         document
         for document in future_work_docs
-        if future_work_statement
-        not in " ".join(document.read_text(encoding="utf-8").split())
+        if future_work_statement not in " ".join(document.read_text(encoding="utf-8").split())
     ]
     assert not missing_statement, missing_statement
 
 
 def test_cuda_build_gate_includes_formal_attention_and_whole_layer_moe_ops() -> None:
-    workflow_source = (
-        REPO_ROOT / ".github" / "workflows" / "cuda-build.yml"
-    ).read_text(encoding="utf-8")
+    workflow_source = (REPO_ROOT / ".github" / "workflows" / "cuda-build.yml").read_text(
+        encoding="utf-8"
+    )
 
     for operator in (
         "attention_fa1_forward",
@@ -906,9 +905,7 @@ def test_native_cuda_matches_independent_reference_across_shape_matrix(
         experts,
         device="cuda",
     )
-    score_bias = (
-        _numerical_score_bias(experts, device="cuda") if with_bias else None
-    )
+    score_bias = _numerical_score_bias(experts, device="cuda") if with_bias else None
     kwargs = {
         "topk": topk,
         "n_groups": n_groups,

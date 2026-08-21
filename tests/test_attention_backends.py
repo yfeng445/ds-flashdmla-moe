@@ -21,8 +21,7 @@ def _require_formal_cuda_kernels() -> None:
     ]
     if unavailable:
         pytest.skip(
-            "requires built formal FA1 and FA2 CUDA kernels; unavailable: "
-            + ", ".join(unavailable)
+            "requires built formal FA1 and FA2 CUDA kernels; unavailable: " + ", ".join(unavailable)
         )
 
 
@@ -90,9 +89,7 @@ def test_formal_operator_schemas_exist_without_native_extension() -> None:
     assert attention_ops._operator_is_defined("attention_fa2_forward")
 
 
-@pytest.mark.parametrize(
-    "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
-)
+@pytest.mark.parametrize("operator_name", ["attention_fa1_forward", "attention_fa2_forward"])
 @pytest.mark.parametrize(
     "dispatch_key",
     ["AutogradCUDA", "CompositeExplicitAutograd", "CompositeImplicitAutograd"],
@@ -105,9 +102,7 @@ def test_formal_operators_have_no_autograd_registration(
     )
 
 
-@pytest.mark.parametrize(
-    "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
-)
+@pytest.mark.parametrize("operator_name", ["attention_fa1_forward", "attention_fa2_forward"])
 def test_formal_operator_fake_rejects_zero_key_length(operator_name: str) -> None:
     with FakeTensorMode():
         q = torch.randn(1, 2, 3, 5, dtype=torch.float16)
@@ -119,9 +114,7 @@ def test_formal_operator_fake_rejects_zero_key_length(operator_name: str) -> Non
             operator(q, k, v, False, 0.5)
 
 
-@pytest.mark.parametrize(
-    "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
-)
+@pytest.mark.parametrize("operator_name", ["attention_fa1_forward", "attention_fa2_forward"])
 @pytest.mark.parametrize("grad_enabled", [True, False])
 def test_formal_operator_fake_rejects_requires_grad_inputs(
     operator_name: str, grad_enabled: bool
@@ -133,8 +126,9 @@ def test_formal_operator_fake_rejects_requires_grad_inputs(
         operator = getattr(torch.ops.ds_flash_mla_moe, operator_name).default
         grad_context = torch.enable_grad() if grad_enabled else torch.no_grad()
 
-        with grad_context, pytest.raises(
-            RuntimeError, match="formal FA1/FA2.*forward-only.*requires_grad"
+        with (
+            grad_context,
+            pytest.raises(RuntimeError, match="formal FA1/FA2.*forward-only.*requires_grad"),
         ):
             operator(q, k, v, False, 0.5)
 
@@ -174,9 +168,7 @@ def _fa_tolerances() -> tuple[float, float]:
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_formal_backends_reject_unsupported_cuda_dtype(
-    backend: str, dtype: torch.dtype
-) -> None:
+def test_formal_backends_reject_unsupported_cuda_dtype(backend: str, dtype: torch.dtype) -> None:
     q = torch.randn(1, 2, 7, 65, device="cuda", dtype=dtype)
     k = torch.randn(1, 2, 11, 65, device="cuda", dtype=dtype)
     v = torch.randn(1, 2, 11, 33, device="cuda", dtype=dtype)
@@ -245,9 +237,7 @@ def test_formal_backends_reject_explicit_boolean_mask(backend: str) -> None:
     v = torch.randn(1, 2, 11, 33, device="cuda", dtype=torch.float16)
     attn_mask = torch.ones(7, 11, device="cuda", dtype=torch.bool)
 
-    with pytest.raises(
-        RuntimeError, match=rf"{backend} attention.*explicit attention mask"
-    ):
+    with pytest.raises(RuntimeError, match=rf"{backend} attention.*explicit attention mask"):
         flash_attention_forward(  # type: ignore[arg-type]
             q, k, v, attn_mask=attn_mask, backend=backend
         )
@@ -257,45 +247,30 @@ def test_formal_backends_reject_explicit_boolean_mask(backend: str) -> None:
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_reject_cuda_requires_grad(backend: str) -> None:
-    q = torch.randn(
-        1, 2, 7, 65, device="cuda", dtype=torch.float16, requires_grad=True
-    )
-    k = torch.randn(
-        1, 2, 11, 65, device="cuda", dtype=torch.float16, requires_grad=True
-    )
-    v = torch.randn(
-        1, 2, 11, 33, device="cuda", dtype=torch.float16, requires_grad=True
-    )
+    q = torch.randn(1, 2, 7, 65, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(1, 2, 11, 65, device="cuda", dtype=torch.float16, requires_grad=True)
+    v = torch.randn(1, 2, 11, 33, device="cuda", dtype=torch.float16, requires_grad=True)
 
-    with pytest.raises(
-        RuntimeError, match=rf"{backend} attention.*forward-only.*requires_grad"
-    ):
+    with pytest.raises(RuntimeError, match=rf"{backend} attention.*forward-only.*requires_grad"):
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
 @_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
-@pytest.mark.parametrize(
-    "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
-)
+@pytest.mark.parametrize("operator_name", ["attention_fa1_forward", "attention_fa2_forward"])
 @pytest.mark.parametrize("grad_enabled", [True, False])
 def test_formal_cuda_operator_rejects_requires_grad_inputs_directly(
     operator_name: str, grad_enabled: bool
 ) -> None:
-    q = torch.randn(
-        1, 2, 7, 65, device="cuda", dtype=torch.float16, requires_grad=True
-    )
-    k = torch.randn(
-        1, 2, 11, 65, device="cuda", dtype=torch.float16, requires_grad=True
-    )
-    v = torch.randn(
-        1, 2, 11, 33, device="cuda", dtype=torch.float16, requires_grad=True
-    )
+    q = torch.randn(1, 2, 7, 65, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(1, 2, 11, 65, device="cuda", dtype=torch.float16, requires_grad=True)
+    v = torch.randn(1, 2, 11, 33, device="cuda", dtype=torch.float16, requires_grad=True)
     operator = getattr(torch.ops.ds_flash_mla_moe, operator_name).default
     grad_context = torch.enable_grad() if grad_enabled else torch.no_grad()
 
-    with grad_context, pytest.raises(
-        RuntimeError, match="formal FA1/FA2.*forward-only.*requires_grad"
+    with (
+        grad_context,
+        pytest.raises(RuntimeError, match="formal FA1/FA2.*forward-only.*requires_grad"),
     ):
         operator(q, k, v, False, 0.5)
 
@@ -314,9 +289,7 @@ def test_formal_backends_return_exact_empty_output(
     query_length: int,
     value_dim: int,
 ) -> None:
-    q = torch.empty(
-        batch, heads, query_length, 65, device="cuda", dtype=torch.float16
-    )
+    q = torch.empty(batch, heads, query_length, 65, device="cuda", dtype=torch.float16)
     k = torch.empty(batch, heads, 11, 65, device="cuda", dtype=torch.float16)
     v = torch.empty(batch, heads, 11, value_dim, device="cuda", dtype=torch.float16)
 

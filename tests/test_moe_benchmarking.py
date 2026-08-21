@@ -108,8 +108,7 @@ def test_intermediate_bytes_are_hand_counted_from_staged_route_rows() -> None:
         "packed_indices": 2 * 14 * 8,
         "expert_hidden_state": 14 * 9 * 8,
         "contributions": 14 * 5 * 8,
-        "total_major_intermediates": (7 * 4 + 14 * 5 + 14 + 2 * 14 + 14 * 9 + 14 * 5)
-        * 8,
+        "total_major_intermediates": (7 * 4 + 14 * 5 + 14 + 2 * 14 + 14 * 9 + 14 * 5) * 8,
     }
 
 

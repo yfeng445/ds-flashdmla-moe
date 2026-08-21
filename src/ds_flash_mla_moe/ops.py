@@ -1230,9 +1230,7 @@ torch.library.register_fake("ds_flash_mla_moe::tiled_gemm", _fake_tiled_gemm)
 torch.library.register_fake("ds_flash_mla_moe::swiglu_experts", _fake_swiglu_experts)
 torch.library.register_fake("ds_flash_mla_moe::expert_major_pack", _fake_expert_major_pack)
 torch.library.register_fake("ds_flash_mla_moe::grouped_topk", _fake_grouped_topk)
-torch.library.register_fake(
-    "ds_flash_mla_moe::deepseek_moe_forward", _fake_deepseek_moe_forward
-)
+torch.library.register_fake("ds_flash_mla_moe::deepseek_moe_forward", _fake_deepseek_moe_forward)
 torch.library.register_fake(
     "ds_flash_mla_moe::mla_absorbed_attention", _fake_mla_absorbed_attention
 )
@@ -2356,9 +2354,7 @@ def _attention_backend_ineligibility_reason(
         else {torch.float16, torch.bfloat16, torch.float32}
     )
     if q.dtype not in supported:
-        rendered = (
-            "float16" if backend in {"fa1", "fa2"} else "float16, bfloat16, or float32"
-        )
+        rendered = "float16" if backend in {"fa1", "fa2"} else "float16, bfloat16, or float32"
         return f"{backend} supports {rendered}"
     if k.dtype != q.dtype or v.dtype != q.dtype:
         return "q, k, and v must have the same dtype"
@@ -2443,9 +2439,7 @@ def flash_attention_forward(
         )
 
     selected = "cuda_rowwise" if backend == "auto" else backend
-    reason = _attention_backend_ineligibility_reason(
-        selected, q, k, v, attn_mask=attn_mask
-    )
+    reason = _attention_backend_ineligibility_reason(selected, q, k, v, attn_mask=attn_mask)
     if reason is None:
         operator = getattr(torch.ops.ds_flash_mla_moe, _ATTENTION_OPERATOR[selected]).default
         return operator(q, k, v, causal, effective_scale)

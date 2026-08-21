@@ -55,9 +55,7 @@ class MoEForwardBenchmarkConfig:
             raise ValueError("MoE dimensions and routing counts must be positive")
         if self.experts % self.n_groups:
             raise ValueError("experts must be divisible by n_groups")
-        effective_topk_groups = (
-            self.n_groups if self.topk_groups is None else self.topk_groups
-        )
+        effective_topk_groups = self.n_groups if self.topk_groups is None else self.topk_groups
         if not 1 <= effective_topk_groups <= self.n_groups:
             raise ValueError("topk_groups must be in [1, n_groups]")
         retained_experts = effective_topk_groups * (self.experts // self.n_groups)

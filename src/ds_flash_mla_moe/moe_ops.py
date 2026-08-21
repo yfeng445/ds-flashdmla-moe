@@ -228,6 +228,4 @@ def deepseek_moe_forward(
 def cuda_moe_available() -> bool:
     """Return whether the native whole-layer CUDA operator is available."""
 
-    return bool(
-        torch.cuda.is_available() and _operator_has_cuda_kernel("deepseek_moe_forward")
-    )
+    return bool(torch.cuda.is_available() and _operator_has_cuda_kernel("deepseek_moe_forward"))
