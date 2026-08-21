@@ -5,6 +5,12 @@ from .attention import (
     scaled_dot_product_attention_backward_reference,
     scaled_dot_product_attention_reference,
 )
+from .cuda_graph import (
+    MLAPagedDecodeGraphBucket,
+    MLAPagedDecodeGraphRunner,
+    SingleOutputCUDAGraphRunner,
+    StaticTensorSpec,
+)
 from .expert_ops import (
     cuda_expert_ops_available,
     expert_major_pack,
@@ -62,6 +68,13 @@ from .ops import (
 )
 from .route_ops import RoutePackResult, cuda_route_ops_available, route_combine, route_pack
 from .router_ops import RouterBackend, cuda_router_available, grouped_topk
+from .scheduler import (
+    ContinuousBatchingScheduler,
+    FixedPageAllocator,
+    ScheduledBatch,
+    SequenceState,
+    SequenceStatus,
+)
 from .symmetric_memory import (
     SymmetricMoEBufferLayout,
     symmetric_moe_buffer_estimate,
@@ -71,13 +84,17 @@ from .symmetric_memory import (
 from .version import __version__
 
 __all__ = [
+    "ContinuousBatchingScheduler",
     "ExpertComputeBackend",
     "ExpertMajorLayout",
     "ExpertParallelTrace",
+    "FixedPageAllocator",
     "MLAConfig",
     "MLALatentCache",
     "MLAPagedCache",
     "MLAPagedCacheView",
+    "MLAPagedDecodeGraphBucket",
+    "MLAPagedDecodeGraphRunner",
     "MLAStaticCache",
     "MLAWeights",
     "MoEBackend",
@@ -86,6 +103,11 @@ __all__ = [
     "RoutePackResult",
     "RouterBackend",
     "RoutingResult",
+    "ScheduledBatch",
+    "SequenceState",
+    "SequenceStatus",
+    "SingleOutputCUDAGraphRunner",
+    "StaticTensorSpec",
     "SymmetricMoEBufferLayout",
     "__version__",
     "allocate_mla_paged_cache",

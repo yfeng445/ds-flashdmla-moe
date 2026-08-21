@@ -28,6 +28,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
 | DeepSeek whole-layer MoE forward | packed PyTorch | CPU + CUDA | single-device staged/fused/persistent, correctness-first FP32 sigmoid forwards | no |
 | MLA prefill/decode | naive + absorbed + paged | CPU + CUDA pipeline | staged FP16/BF16/FP32 storage, per-slot write, direct paged read | no |
+| Graph replay / request scheduling | stable-buffer graph runner + FIFO control plane | CPU contracts + CUDA replay | exact-shape buckets; fixed-page transactions | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
 | One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
 
@@ -191,6 +192,40 @@ unwritten slots, and non-increasing logical positions. Successful metadata check
 are reused only while tensor identity and version remain unchanged. Paged mutation
 is inference-only, and the current one-CTA-per-query/head implementation remains a
 correctness-oriented kernel rather than an FA2/FA3-class serving backend.
+
+`SingleOutputCUDAGraphRunner` captures a forward-only tensor operation into one
+exact shape/dtype/device bucket. Replay validates every caller tensor before
+copying it into runner-owned static buffers; caller addresses may change, while
+the captured input and output addresses remain fixed. The returned output is the
+same buffer on every replay and is overwritten by the next replay. Closed-over
+weights and other tensors are the caller's responsibility and must retain their
+captured addresses.
+
+`MLAPagedDecodeGraphRunner` applies that contract to one-token native paged MLA.
+Its bucket fixes batch size, model width, and block-table width. Cache and weight
+addresses are checked on every replay, and block tables, sequence lengths, cache
+slots, and absolute query positions are validated before any static input copy.
+The captured body calls the already-prevalidated raw query projection, paged
+attention, and output projection operators. It is inference-only; changing batch
+size or page-table width requires a separate runner, and cache writes remain
+outside this decode graph.
+
+`ContinuousBatchingScheduler` supplies a deliberately small CPU control plane:
+FIFO admission, whole-prompt homogeneous prefill batches, one token per active
+request in homogeneous decode batches, and fixed pages. `schedule()` reserves
+all pages and lengths atomically, `complete()` commits them, and `abort()` restores
+the prior allocator/order/state exactly. Requests can enter or leave only between
+iterations; cancelling in-flight work requires completing or aborting its batch.
+There is no priority, chunked prefill, eviction, prefix sharing, speculative
+decoding, networking, or model executor, so this is not a production serving
+engine.
+
+```bash
+python benchmarks/cuda_graph.py --batch 32 --width 256
+python benchmarks/continuous_batching.py --requests 8 --max-batch-size 4
+```
+
+Both reports retain raw timing/trace facts and make no speedup claim.
 
 ## Repository layout
 
