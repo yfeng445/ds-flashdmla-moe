@@ -22,6 +22,7 @@ def native_build_configuration() -> dict[str, object]:
         sources=[
             "csrc/ops.cpp",
             "csrc/attention/attention_backward_cuda.cu",
+            "csrc/attention/fa1_forward_cuda.cu",
             "csrc/attention/attention_forward_cuda.cu",
             "csrc/gemm/tiled_gemm_cuda.cu",
             "csrc/moe/route_ops_cuda.cu",
@@ -49,6 +50,7 @@ def assert_native_sources_present() -> None:
     required = (
         Path("csrc/ops.cpp"),
         Path("csrc/attention/attention_backward_cuda.cu"),
+        Path("csrc/attention/fa1_forward_cuda.cu"),
         Path("csrc/attention/attention_forward_cuda.cu"),
         Path("csrc/gemm/tiled_gemm_cuda.cu"),
         Path("csrc/moe/route_ops_cuda.cu"),
