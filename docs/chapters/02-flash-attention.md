@@ -94,18 +94,24 @@ warp 所有权和递推状态。
 
 ## 2.5 Forward 的验证矩阵
 
-每个 CUDA forward 至少应覆盖以下组合：
+Forward 验证必须按 facade 中各 backend 的能力边界分组，不能把所有组合都当作每个
+backend 的支持范围。对于支持的输入，至少覆盖：
 
 - `S_q/S_k`：相等、cross-attention、单 token decode；
 - `D`：16/32 的倍数和非倍数尾部；
 - value dimension 与 head dimension 相等和不等；
 - causal 与 non-causal；
-- boolean mask、additive mask、全遮挡行；
-- FP16、BF16、FP32；
-- 非连续张量或明确拒绝非连续张量。
+- `reference`/`blockwise` 的浮点 dtype，`cuda_rowwise` 的 FP16/BF16/FP32，以及
+  `fa1`/`fa2` 的 FP16；
+- 仅对 `reference`/`blockwise` 覆盖 boolean mask、additive mask 和全遮挡行。
 
-比较对象不是另一个 CUDA 原型，而是 FP32/FP64 materialized reference。除了最大绝对
-误差，还应记录相对误差，并将 kernel 误差与低精度 PyTorch baseline 的误差比较。
+支持组合的比较对象不是另一个 CUDA 原型，而是 FP32/FP64 materialized reference。
+除了最大绝对误差，还应记录相对误差，并将 kernel 误差与低精度 PyTorch baseline 的
+误差比较。
+
+不支持的组合应单独做 strict rejection 测试：`cuda_rowwise`、`fa1`、`fa2` 必须拒绝
+任何显式 mask 和非连续 Q/K/V；`fa1`/`fa2` 还必须拒绝 BF16/FP32，以及超过其上限的
+`D` 或 `D_v`。这类测试验证的是 backend contract，而不是数值误差。
 
 ## 2.6 统一 facade、backend 矩阵与第一版正确性 kernel
 
