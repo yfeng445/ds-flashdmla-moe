@@ -1,0 +1,138 @@
+{
+  "benchmark": "deepseek_moe_forward",
+  "configuration": {
+    "backend": "cuda",
+    "device": "cuda",
+    "dtype": "float32",
+    "experts": 9,
+    "hidden_dim": 33,
+    "iterations": 10,
+    "model_dim": 65,
+    "n_groups": 3,
+    "route_scale": 1.0,
+    "score_bias": false,
+    "seed": 0,
+    "tokens": 31,
+    "topk": 4,
+    "topk_groups": 2,
+    "verify": true,
+    "warmup": 3
+  },
+  "environment": {
+    "gpu": {
+      "compute_capability": [
+        12,
+        0
+      ],
+      "index": 0,
+      "multiprocessors": 170,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_memory_bytes": 34190458880
+    },
+    "machine": "x86_64",
+    "native_extension_loaded": true,
+    "package": "0.1.0.dev0",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "python": "3.12.13",
+    "source_dirty": false,
+    "source_revision": "e0d148eea31ac1eb31d454b033275f38269b429d",
+    "torch": "2.10.0+cu128",
+    "torch_cuda_version": "12.8",
+    "torch_git_version": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0"
+  },
+  "implementation": "single_device_staged",
+  "initialization": {
+    "activation_standard_deviation": 1.0,
+    "distribution": "normal",
+    "expert_down_weight_standard_deviation": 0.17407765595569785,
+    "expert_gate_up_weight_standard_deviation": 0.12403473458920847,
+    "gate_weight_standard_deviation": 0.12403473458920847,
+    "score_bias_standard_deviation": null
+  },
+  "intermediate_bytes": {
+    "analytical_only": true,
+    "contributions": 32240,
+    "dense_scores": 1116,
+    "expert_hidden_state": 16368,
+    "floating_dtype": "float32",
+    "floating_element_size": 4,
+    "index_dtype": "int64",
+    "index_element_size": 8,
+    "packed_activations": 32240,
+    "packed_indices": 1984,
+    "packed_weights": 496,
+    "route_rows": 124,
+    "total_major_intermediates": 84444
+  },
+  "latency": {
+    "count": 10,
+    "max_ms": 0.2138880044221878,
+    "mean_ms": 0.17121919840574265,
+    "median_ms": 0.16363199800252914,
+    "min_ms": 0.1480640023946762,
+    "p90_ms": 0.19260479658842083,
+    "p99_ms": 0.21175968363881112
+  },
+  "notes": [
+    "latency samples time deepseek_moe_forward only",
+    "input creation, route analysis, and independent reference verification are untimed",
+    "intermediate bytes are analytical materialized-buffer sizes, not memory traffic",
+    "packed indices count packed route and expert int64 arrays",
+    "this staged implementation report makes no performance claim"
+  ],
+  "output": {
+    "contiguous": true,
+    "device": "cuda:0",
+    "dtype": "float32",
+    "shape": [
+      31,
+      65
+    ]
+  },
+  "performance_claim": false,
+  "raw_samples_ms": [
+    0.1637759953737259,
+    0.2138880044221878,
+    0.1634880006313324,
+    0.17215999960899353,
+    0.19023999571800232,
+    0.1541759967803955,
+    0.1480640023946762,
+    0.1629759967327118,
+    0.18985599279403687,
+    0.15356799960136414
+  ],
+  "route_distribution": {
+    "active_experts": 9,
+    "coefficient_of_variation": 0.23896019983917827,
+    "empty_experts": 0,
+    "maximum": 18,
+    "mean": 13.777777777777779,
+    "minimum": 9,
+    "peak_to_mean": 1.3064516129032258,
+    "total": 124,
+    "values": [
+      15,
+      16,
+      9,
+      18,
+      9,
+      13,
+      18,
+      15,
+      11
+    ]
+  },
+  "schema_version": 1,
+  "verification": {
+    "atol": 0.001,
+    "output": {
+      "max_absolute_error": 4.172325134277344e-07,
+      "max_relative_error": 0.00037421030619208,
+      "max_tolerance_ratio": 0.0003504178382303058
+    },
+    "performed": true,
+    "reference": "deepseek_moe_reference",
+    "rtol": 0.001
+  }
+}

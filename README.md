@@ -24,6 +24,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Blockwise online attention | yes | CPU + CUDA | FP32-accumulating online-softmax kernel | no |
 | DeepSeek grouped Top-K gate | yes | CPU | FP32 sigmoid source | replicated in EP |
 | DeepSeek SwiGLU MoE | token-loop + packed | CPU | FP32 CUDA-core + FP16 WMMA active-row experts | 2-rank Gloo reference |
+| DeepSeek whole-layer MoE forward | packed PyTorch | CPU + CUDA | single-device, staged, correctness-first FP32 sigmoid forward | no |
 | MLA prefill/decode | naive + absorbed + paged | CPU + CUDA pipeline | staged FP16/BF16/FP32 storage, per-slot write, direct paged read | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
 | One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
@@ -45,6 +46,14 @@ FP16 uses one converged WMMA warp per output tile, FP32 accumulators, and an FP1
 materialized hidden state. Neither path has asynchronous copies, Hopper WGMMA/TMA,
 or profiler-driven tuning against cuBLAS/CUTLASS.
 
+`deepseek_moe_forward` completes route, pack, offsets, expert compute, and combine
+behind one public call. CUDA v1 is a single-device, staged, correctness-first
+whole-layer forward that makes multiple internal launches. It accepts contiguous
+CUDA FP32 tensors, sigmoid scoring, no `requires_grad`, and deterministic mode
+disabled. It is not the future FlashMoE target: persistent scheduling, full fusion,
+and one-sided multi-GPU communication remain future work; dedicated tile scheduling
+remains future work as well.
+
 ## Quick start
 
 The current supported layer is pure PyTorch and works on CPU or CUDA tensors.
@@ -65,6 +74,35 @@ v = torch.randn(2, 4, 128, 64)
 
 out = blockwise_attention(q, k, v, causal=True, block_size=32)
 ```
+
+The whole-layer MoE facade exposes the same explicit backend policy:
+
+```python
+import torch
+from ds_flash_mla_moe import cuda_moe_available, deepseek_moe_forward
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+x = torch.randn(8, 64, device=device)
+gate = torch.randn(4, 64, device=device)
+w1 = torch.randn(4, 128, 64, device=device)
+w2 = torch.randn(4, 64, 128, device=device)
+w3 = torch.randn(4, 128, 64, device=device)
+
+def run(backend: str) -> torch.Tensor:
+    return deepseek_moe_forward(
+        x, gate, w1, w2, w3, topk=2, n_groups=1, backend=backend
+    )
+
+reference_out = run("reference")
+auto_out = run("auto")
+if cuda_moe_available():  # CUDA v1 requires contiguous FP32 CUDA tensors.
+    cuda_out = run("cuda")
+```
+
+`reference` always selects the packed PyTorch specification, `cuda` requires the
+strict CUDA v1 contract, and `auto` uses CUDA only when that contract is satisfied.
+The raw CUDA operator is output-only and forward-only; this milestone does not
+claim whole-layer training support.
 
 `flash_attention_forward(..., backend="auto")` selects the optional CUDA
 kernel only for its currently supported input contract and otherwise falls

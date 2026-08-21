@@ -313,6 +313,33 @@ latency 是 forward+reference-recompute backward，而报告中的矩阵 FLOPs �
 CUDA-core/WMMA engine、multiplicand/accumulator/materialized-hidden dtype 与最低计算能力；
 两种模型都不能替代 profiler 证据。
 
+### 4.9.3 Whole-layer single-device forward milestone
+
+公开入口 `deepseek_moe_forward(..., backend="reference"|"cuda"|"auto")` 把本章已经
+分别验证过的阶段串成一条完整路径：
+
+```text
+route -> pack -> offsets -> expert -> combine
+```
+
+CUDA v1 的编排位于
+[`csrc/moe/deepseek_moe_forward_cuda.cu`](../../csrc/moe/deepseek_moe_forward_cuda.cu)。
+它先调用 grouped Top-K 和 route-pack，随后用 device 上的 `zeros`、`cumsum` 与 `cat`
+建立 expert offsets，再调用 active-row SwiGLU expert，最后从 packed route id 导出 token
+index 并 combine。一次公开调用因此仍包含多个 ATen/kernel launch，也会物化 scores、packed
+rows、offsets、hidden state 与 contributions；“一个 raw operator”不等于“一个 kernel”。
+
+这个里程碑应准确称为 **single-device、staged、correctness-first** whole-layer forward。
+CUDA 路径只接受 contiguous CUDA FP32、sigmoid scoring、无 `requires_grad` 的输入，并要求
+deterministic algorithms 关闭。`reference` 总是执行 packed PyTorch 规范，`cuda` 对不满足契约
+的输入报错，`auto` 才允许在不满足 CUDA v1 契约时回退。
+
+真正的 FlashMoE 后续目标还包括跨 expert 的 tile scheduling。明确地说，persistent
+scheduling, full fusion, and one-sided multi-GPU communication remain future work；当前实现
+没有这些机制，不能据此宣称 fused 或持久化 FlashMoE 性能。前文 router/expert 的 backward
+只描述各自既有的实验性 stage 语境；新的
+whole-layer raw operator 是 forward-only，本节不把它描述为可训练算子。
+
 ## 4.10 Capacity factor 的丢弃—填充平衡
 
 令一次全局路由共有 `R=T K` 行、`E` 个 routed experts，则平均每 expert 的 route 数为：

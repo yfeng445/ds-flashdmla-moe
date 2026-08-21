@@ -57,11 +57,14 @@ jobs:
           assert ds_flash_mla_moe.native_extension_loaded()
           for operator in (
               "attention_forward",
+              "attention_fa1_forward",
+              "attention_fa2_forward",
               "attention_backward",
               "route_pack",
               "route_combine",
               "expert_major_pack",
               "grouped_topk",
+              "deepseek_moe_forward",
               "swiglu_experts",
               "tiled_gemm",
               "mla_absorbed_attention",

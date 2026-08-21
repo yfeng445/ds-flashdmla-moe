@@ -47,7 +47,33 @@ operator 的测试传 `false`，保留越界、重复和页表防御检查。这
 key 注册实现。二者分开以后，同一算子可以拥有 CPU、CUDA、Meta 或其他 backend，调用
 方不必手写设备分支去直接调用 pybind 函数。
 
+### 6.1.1 Whole-layer MoE 的 output-only 边界
+
+single-device、staged、correctness-first 的 `deepseek_moe_forward` raw schema 是：
+
+```text
+deepseek_moe_forward(Tensor x, Tensor gate_weight,
+                     Tensor expert_w1, Tensor expert_w2, Tensor expert_w3,
+                     int topk, int n_groups, int topk_groups,
+                     Tensor? score_bias, float route_scale) -> Tensor
+```
+
+它只返回最终 `[T,D]` output，不把 route indices、weights、counts、offsets 或中间 expert
+contributions 暴露为 public outputs。Python 层只为这个 raw op 注册 FakeTensor metadata：
+Fake 实现检查 shape/device/dtype/layout 与 forward-only 条件，然后返回与 `x` 同 shape 的空
+FakeTensor；它不读取数据，也不运行 route 或 expert 数学。
+
+这个 raw operator 只有 Fake + CUDA dispatch，没有 CPU、backward、autograd registration、
+`CompositeExplicitAutograd` 或 `CompositeImplicitAutograd` 实现。CUDA v1 还要求 contiguous
+CUDA FP32、sigmoid scoring、所有浮点输入均无 `requires_grad`，并在 deterministic algorithms
+启用时拒绝 atomic routing。可移植 reference 与 fallback 属于公开 facade
+`deepseek_moe_forward(..., backend="reference"|"cuda"|"auto")`，不能误写成 raw op 的
+Composite 或 whole-layer 训练支持。
+
 ## 6.2 加载顺序与纯 Python 安装
+
+下述 Composite 加载顺序描述的是已有、可分解到 PyTorch reference 的 stage operators；
+上一节的 output-only whole-layer raw op 是刻意保留的例外。
 
 普通 CPU wheel 不包含 `_C` 动态库，因此 Python 先定义同名 schema，并注册一个由
 PyTorch 运算组成的 `CompositeExplicitAutograd` reference。这里使用 explicit，是因为
@@ -226,5 +252,8 @@ attention、MLA、router 与 expert wrapper 延续同一约定，并各自公开
 3. Linux + NVIDIA GPU：运行多 shape 数值矩阵、current-stream 测试和 reference backward。
 
 第二层通过不代表 kernel 数值正确，第三层通过也不替代不同 SM、dtype 和极限 shape 的
-覆盖。当前扩展注册 16 个 CUDA operator，其中两个是 paged MLA 的 per-slot write 与直接页表
-attention。把证据拆开记录，才能准确说清“源码可编译”和“算子已在 GPU 验证”的区别。
+覆盖。按 `csrc/ops.cpp` 与各 `TORCH_LIBRARY_IMPL(..., CUDA, ...)` 的源码清点，当前扩展注册
+19 个 formal CUDA operators。新增清单项是已存在的 `attention_fa1_forward`、
+`attention_fa2_forward` 与本次 `deepseek_moe_forward`；其中两个 paged MLA operator 仍分别负责
+per-slot write 与直接页表 attention。把证据拆开记录，才能准确说清“源码可编译”和“算子已在
+GPU 验证”的区别。

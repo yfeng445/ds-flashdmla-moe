@@ -49,6 +49,7 @@ from .moe import (
     swiglu_experts_padded_reference,
     to_expert_major_reference,
 )
+from .moe_ops import MoEBackend, MoEScoreFunction, cuda_moe_available, deepseek_moe_forward
 from .ops import (
     cuda_attention_backend_available,
     cuda_gemm_available,
@@ -79,6 +80,8 @@ __all__ = [
     "MLAPagedCacheView",
     "MLAStaticCache",
     "MLAWeights",
+    "MoEBackend",
+    "MoEScoreFunction",
     "PackedRoutes",
     "RoutePackResult",
     "RouterBackend",
@@ -96,11 +99,13 @@ __all__ = [
     "cuda_gemm_available",
     "cuda_kernel_available",
     "cuda_mla_available",
+    "cuda_moe_available",
     "cuda_paged_mla_available",
     "cuda_route_ops_available",
     "cuda_router_available",
     "deepseek_grouped_topk",
     "deepseek_moe_expert_parallel_reference",
+    "deepseek_moe_forward",
     "deepseek_moe_packed_reference",
     "deepseek_moe_reference",
     "expert_major_pack",

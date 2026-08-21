@@ -5,6 +5,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
+#include "moe_cuda_ops.h"
+
 #include <cuda_runtime.h>
 
 #include <climits>
@@ -342,7 +344,42 @@ at::Tensor route_combine_cuda(
 
 }  // namespace
 
+namespace ds_flash_mla_moe::moe {
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+route_pack_cuda_entry(
+    const at::Tensor& x,
+    const at::Tensor& route_weights,
+    const at::Tensor& expert_indices,
+    const at::Tensor& expert_owner,
+    int64_t world_size) {
+  return route_pack_cuda(
+      x,
+      route_weights,
+      expert_indices,
+      expert_owner,
+      world_size);
+}
+
+at::Tensor route_combine_cuda_entry(
+    const at::Tensor& contributions,
+    const at::Tensor& route_weights,
+    const at::Tensor& token_indices,
+    int64_t token_count) {
+  return route_combine_cuda(
+      contributions,
+      route_weights,
+      token_indices,
+      token_count);
+}
+
+}  // namespace ds_flash_mla_moe::moe
+
 TORCH_LIBRARY_IMPL(ds_flash_mla_moe, CUDA, m) {
-  m.impl("route_pack", TORCH_FN(route_pack_cuda));
-  m.impl("route_combine", TORCH_FN(route_combine_cuda));
+  m.impl(
+      "route_pack",
+      TORCH_FN(ds_flash_mla_moe::moe::route_pack_cuda_entry));
+  m.impl(
+      "route_combine",
+      TORCH_FN(ds_flash_mla_moe::moe::route_combine_cuda_entry));
 }
