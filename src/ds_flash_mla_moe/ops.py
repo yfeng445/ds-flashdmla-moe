@@ -229,6 +229,13 @@ def _fake_formal_attention_forward(
     scale: float,
 ) -> Tensor:
     output = _fake_attention_forward(q, k, v, causal, scale)
+    torch._check(
+        not any(tensor.requires_grad for tensor in (q, k, v)),
+        lambda: (
+            "formal FA1/FA2 forward kernels are forward-only and do not accept "
+            "requires_grad tensors"
+        ),
+    )
     torch._check(q.ndim == 4 and k.ndim == 4 and v.ndim == 4)
     torch._check(q.dtype == torch.float16)
     torch._check(k.dtype == q.dtype and v.dtype == q.dtype)

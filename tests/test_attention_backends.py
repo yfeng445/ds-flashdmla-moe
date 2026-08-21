@@ -102,6 +102,53 @@ def test_formal_operator_fake_rejects_zero_key_length(operator_name: str) -> Non
             operator(q, k, v, False, 0.5)
 
 
+@pytest.mark.parametrize(
+    "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
+)
+@pytest.mark.parametrize("grad_enabled", [True, False])
+def test_formal_operator_fake_rejects_requires_grad_inputs(
+    operator_name: str, grad_enabled: bool
+) -> None:
+    with FakeTensorMode():
+        q = torch.randn(1, 2, 3, 5, dtype=torch.float16, requires_grad=True)
+        k = torch.randn(1, 2, 7, 5, dtype=torch.float16, requires_grad=True)
+        v = torch.randn(1, 2, 7, 4, dtype=torch.float16, requires_grad=True)
+        operator = getattr(torch.ops.ds_flash_mla_moe, operator_name).default
+        grad_context = torch.enable_grad() if grad_enabled else torch.no_grad()
+
+        with grad_context, pytest.raises(
+            RuntimeError, match="formal FA1/FA2.*forward-only.*requires_grad"
+        ):
+            operator(q, k, v, False, 0.5)
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_operator"),
+    [
+        ("cuda_rowwise", "attention_forward"),
+        ("fa1", "attention_fa1_forward"),
+        ("fa2", "attention_fa2_forward"),
+    ],
+)
+def test_cuda_attention_backend_availability_uses_backend_operator_mapping(
+    monkeypatch, backend: str, expected_operator: str
+) -> None:
+    monkeypatch.setattr(attention_ops, "_NATIVE_EXTENSION_LOADED", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        attention_ops,
+        "_operator_has_cuda_kernel",
+        lambda operator: operator == expected_operator,
+    )
+
+    assert cuda_attention_backend_available(backend)  # type: ignore[arg-type]
+
+
+def test_cuda_attention_backend_availability_rejects_unknown_backend() -> None:
+    with pytest.raises(ValueError, match="cuda_rowwise, fa1, or fa2"):
+        cuda_attention_backend_available("unknown")  # type: ignore[arg-type]
+
+
 def _fa_tolerances() -> tuple[float, float]:
     return 1e-2, 1e-2
 
@@ -207,6 +254,33 @@ def test_formal_backends_reject_cuda_requires_grad(backend: str) -> None:
         RuntimeError, match=rf"{backend} attention.*forward-only.*requires_grad"
     ):
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
+)
+@pytest.mark.parametrize("grad_enabled", [True, False])
+def test_formal_cuda_operator_rejects_requires_grad_inputs_directly(
+    operator_name: str, grad_enabled: bool
+) -> None:
+    q = torch.randn(
+        1, 2, 7, 65, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    k = torch.randn(
+        1, 2, 11, 65, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    v = torch.randn(
+        1, 2, 11, 33, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    operator = getattr(torch.ops.ds_flash_mla_moe, operator_name).default
+    grad_context = torch.enable_grad() if grad_enabled else torch.no_grad()
+
+    with grad_context, pytest.raises(
+        RuntimeError, match="formal FA1/FA2.*forward-only.*requires_grad"
+    ):
+        operator(q, k, v, False, 0.5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")

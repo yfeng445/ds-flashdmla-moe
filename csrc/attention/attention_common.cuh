@@ -40,6 +40,9 @@ inline void validate_formal_attention_forward_inputs(
     double scale) {
   TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
               "q, k, and v must be CUDA tensors");
+  TORCH_CHECK(!(q.requires_grad() || k.requires_grad() || v.requires_grad()),
+              "formal FA1/FA2 forward kernels are forward-only and do not accept "
+              "requires_grad tensors");
   TORCH_CHECK(q.device() == k.device() && k.device() == v.device(),
               "q, k, and v must be on the same CUDA device");
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
