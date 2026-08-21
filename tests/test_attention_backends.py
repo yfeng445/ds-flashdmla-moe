@@ -39,6 +39,13 @@ def test_reference_and_blockwise_are_distinct_explicit_branches(monkeypatch) -> 
 
 
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_reject_non_fp16_before_dispatch(backend: str) -> None:
+    q = torch.randn(1, 1, 3, 8)
+    with pytest.raises(RuntimeError, match=rf"{backend} attention.*supports float16"):
+        flash_attention_forward(q, q, q, backend=backend)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_fa_backends_reject_autograd_before_device_dispatch(backend: str) -> None:
     q, k, v = _cpu_inputs(requires_grad=True)
     with pytest.raises(RuntimeError, match="forward-only"):
@@ -69,6 +76,21 @@ def test_formal_operator_schemas_exist_without_native_extension() -> None:
 @pytest.mark.parametrize(
     "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
 )
+@pytest.mark.parametrize(
+    "dispatch_key",
+    ["AutogradCUDA", "CompositeExplicitAutograd", "CompositeImplicitAutograd"],
+)
+def test_formal_operators_have_no_autograd_registration(
+    operator_name: str, dispatch_key: str
+) -> None:
+    assert not torch._C._dispatch_has_kernel_for_dispatch_key(  # type: ignore[attr-defined]
+        f"ds_flash_mla_moe::{operator_name}", dispatch_key
+    )
+
+
+@pytest.mark.parametrize(
+    "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
+)
 def test_formal_operator_fake_rejects_zero_key_length(operator_name: str) -> None:
     with FakeTensorMode():
         q = torch.randn(1, 2, 3, 5, dtype=torch.float16)
@@ -82,6 +104,149 @@ def test_formal_operator_fake_rejects_zero_key_length(operator_name: str) -> Non
 
 def _fa_tolerances() -> tuple[float, float]:
     return 1e-2, 1e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_formal_backends_reject_unsupported_cuda_dtype(
+    backend: str, dtype: torch.dtype
+) -> None:
+    q = torch.randn(1, 2, 7, 65, device="cuda", dtype=dtype)
+    k = torch.randn(1, 2, 11, 65, device="cuda", dtype=dtype)
+    v = torch.randn(1, 2, 11, 33, device="cuda", dtype=dtype)
+
+    with pytest.raises(RuntimeError, match=rf"{backend} attention.*supports float16"):
+        flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_reject_mixed_cuda_dtypes(backend: str) -> None:
+    q = torch.randn(1, 2, 7, 65, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 11, 65, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 2, 11, 33, device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match=rf"{backend} attention.*same dtype"):
+        flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_reject_noncontiguous_cuda_storage(backend: str) -> None:
+    q = torch.randn(1, 2, 7, 130, device="cuda", dtype=torch.float16)[..., ::2]
+    k = torch.randn(1, 2, 11, 130, device="cuda", dtype=torch.float16)[..., ::2]
+    v = torch.randn(1, 2, 11, 66, device="cuda", dtype=torch.float16)[..., ::2]
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+
+    with pytest.raises(RuntimeError, match=rf"{backend} attention.*contiguous"):
+        flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_reject_head_dim_above_128(backend: str) -> None:
+    q = torch.randn(1, 2, 7, 129, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 11, 129, device="cuda", dtype=torch.float16)
+    v = torch.randn(1, 2, 11, 33, device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match=rf"{backend} attention.*head_dim"):
+        flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_reject_value_dim_above_128(backend: str) -> None:
+    q = torch.randn(1, 2, 7, 65, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 11, 65, device="cuda", dtype=torch.float16)
+    v = torch.randn(1, 2, 11, 129, device="cuda", dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match=rf"{backend} attention.*value_dim"):
+        flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_reject_explicit_boolean_mask(backend: str) -> None:
+    q = torch.randn(1, 2, 7, 65, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 11, 65, device="cuda", dtype=torch.float16)
+    v = torch.randn(1, 2, 11, 33, device="cuda", dtype=torch.float16)
+    attn_mask = torch.ones(7, 11, device="cuda", dtype=torch.bool)
+
+    with pytest.raises(
+        RuntimeError, match=rf"{backend} attention.*explicit attention mask"
+    ):
+        flash_attention_forward(  # type: ignore[arg-type]
+            q, k, v, attn_mask=attn_mask, backend=backend
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_reject_cuda_requires_grad(backend: str) -> None:
+    q = torch.randn(
+        1, 2, 7, 65, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    k = torch.randn(
+        1, 2, 11, 65, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    v = torch.randn(
+        1, 2, 11, 33, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+
+    with pytest.raises(
+        RuntimeError, match=rf"{backend} attention.*forward-only.*requires_grad"
+    ):
+        flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+@pytest.mark.parametrize(
+    ("batch", "heads", "query_length", "value_dim"),
+    [(0, 3, 7, 33), (2, 0, 7, 33), (2, 3, 0, 33), (2, 3, 7, 0)],
+)
+def test_formal_backends_return_exact_empty_output(
+    backend: str,
+    batch: int,
+    heads: int,
+    query_length: int,
+    value_dim: int,
+) -> None:
+    q = torch.empty(
+        batch, heads, query_length, 65, device="cuda", dtype=torch.float16
+    )
+    k = torch.empty(batch, heads, 11, 65, device="cuda", dtype=torch.float16)
+    v = torch.empty(batch, heads, 11, value_dim, device="cuda", dtype=torch.float16)
+
+    actual = flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
+
+    assert actual.shape == (batch, heads, query_length, value_dim)
+    assert actual.dtype == torch.float16
+    assert actual.device == q.device
+    assert actual.numel() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_reject_empty_key_before_dispatch(backend: str) -> None:
+    q = torch.empty(1, 2, 7, 65, device="cuda", dtype=torch.float16)
+    k = torch.empty(1, 2, 0, 65, device="cuda", dtype=torch.float16)
+    v = torch.empty(1, 2, 0, 33, device="cuda", dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="key sequence length must be positive"):
+        flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
@@ -186,6 +351,62 @@ def test_fa2_forward_uses_current_stream() -> None:
     rtol, atol = _fa_tolerances()
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     assert cuda_attention_backend_available("fa2")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_right_aligned_single_query_sees_full_history(
+    backend: str,
+) -> None:
+    q = torch.zeros(1, 2, 1, 65, device="cuda", dtype=torch.float16)
+    k = torch.zeros(1, 2, 17, 65, device="cuda", dtype=torch.float16)
+    v = torch.zeros(1, 2, 17, 33, device="cuda", dtype=torch.float16)
+    v[:, :, -1, :] = 17.0
+
+    actual = flash_attention_forward(  # type: ignore[arg-type]
+        q, k, v, causal=True, backend=backend
+    )
+
+    torch.testing.assert_close(actual, torch.ones_like(actual))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_right_aligned_partial_causal_boundary(backend: str) -> None:
+    torch.manual_seed(107)
+    q = torch.randn(1, 2, 7, 65, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 11, 65, device="cuda", dtype=torch.float16)
+    v = torch.randn(1, 2, 11, 33, device="cuda", dtype=torch.float16)
+
+    actual = flash_attention_forward(  # type: ignore[arg-type]
+        q, k, v, causal=True, backend=backend
+    )
+    expected = blockwise_attention(q, k, v, causal=True, block_size=3)
+
+    rtol, atol = _fa_tolerances()
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+@pytest.mark.parametrize("backend", ["fa1", "fa2"])
+def test_formal_backends_stable_softmax_with_large_logits(backend: str) -> None:
+    torch.manual_seed(109)
+    q = torch.randn(1, 2, 7, 65, device="cuda", dtype=torch.float16) * 20
+    k = torch.randn(1, 2, 17, 65, device="cuda", dtype=torch.float16) * 20
+    v = torch.randn(1, 2, 17, 33, device="cuda", dtype=torch.float16)
+
+    actual = flash_attention_forward(  # type: ignore[arg-type]
+        q, k, v, causal=True, backend=backend
+    )
+    expected = blockwise_attention(q, k, v, causal=True, block_size=3)
+
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    rtol, atol = _fa_tolerances()
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
 
 @pytest.mark.skipif(
