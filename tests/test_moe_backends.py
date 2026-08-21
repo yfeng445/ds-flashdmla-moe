@@ -766,3 +766,419 @@ def test_reference_backend_never_invokes_native_for_cuda_tensors(monkeypatch) ->
     expected = deepseek_moe_reference(*inputs, topk=TOPK)
 
     torch.testing.assert_close(actual, expected)
+
+
+CUDA_MOE_SHAPES = (
+    (0, 5, 7, 4, 2, 2, 1),
+    (1, 1, 1, 1, 1, 1, 1),
+    (7, 15, 17, 4, 2, 2, 1),
+    (17, 33, 65, 8, 3, 4, 2),
+    (31, 65, 33, 9, 4, 3, 2),
+)
+NATIVE_MOE_SKIP_REASON = "native CUDA DeepSeek MoE operator is unavailable"
+
+
+def _numerical_moe_inputs(
+    tokens: int,
+    model_dim: int,
+    hidden: int,
+    experts: int,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float32,
+    token_shape: tuple[int, ...] | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(1907 + tokens + 3 * model_dim + 5 * hidden + 7 * experts)
+
+    def scaled_randn(*shape: int) -> Tensor:
+        return (
+            torch.randn(*shape, generator=generator, dtype=torch.float32)
+            .mul_(0.125)
+            .to(device=device, dtype=dtype)
+            .detach()
+            .contiguous()
+        )
+
+    x_shape = (tokens,) if token_shape is None else token_shape
+    return (
+        scaled_randn(*x_shape, model_dim),
+        scaled_randn(experts, model_dim),
+        scaled_randn(experts, hidden, model_dim),
+        scaled_randn(experts, model_dim, hidden),
+        scaled_randn(experts, hidden, model_dim),
+    )
+
+
+def _numerical_score_bias(
+    experts: int,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    return (
+        torch.linspace(-0.2, 0.2, experts, dtype=torch.float32)
+        .to(device=device, dtype=dtype)
+        .detach()
+        .contiguous()
+    )
+
+
+def _assert_native_output(
+    actual: Tensor,
+    expected: Tensor,
+    x: Tensor,
+) -> None:
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+    assert actual.shape == x.shape
+    assert actual.dtype == x.dtype
+    assert actual.device == x.device
+    assert actual.stride() == x.stride()
+    assert actual.is_contiguous()
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+@pytest.mark.parametrize(
+    ("tokens", "model_dim", "hidden", "experts", "topk", "n_groups", "topk_groups"),
+    CUDA_MOE_SHAPES,
+)
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "bias"])
+@pytest.mark.parametrize("backend", ["cuda", "auto"])
+def test_native_cuda_matches_independent_reference_across_shape_matrix(
+    tokens: int,
+    model_dim: int,
+    hidden: int,
+    experts: int,
+    topk: int,
+    n_groups: int,
+    topk_groups: int,
+    with_bias: bool,
+    backend: str,
+) -> None:
+    inputs = _numerical_moe_inputs(
+        tokens,
+        model_dim,
+        hidden,
+        experts,
+        device="cuda",
+    )
+    score_bias = (
+        _numerical_score_bias(experts, device="cuda") if with_bias else None
+    )
+    kwargs = {
+        "topk": topk,
+        "n_groups": n_groups,
+        "topk_groups": topk_groups,
+        "score_bias": score_bias,
+        "route_scale": 0.75,
+    }
+    assert (
+        facade_ops._cuda_moe_ineligibility_reason(
+            *inputs,
+            "sigmoid",
+            score_bias,
+        )
+        is None
+    )
+
+    actual = deepseek_moe_forward(*inputs, backend=backend, **kwargs)  # type: ignore[arg-type]
+    expected = deepseek_moe_reference(*inputs, **kwargs)
+
+    _assert_native_output(actual, expected, inputs[0])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+@pytest.mark.parametrize("backend", ["cuda", "auto"])
+def test_native_cuda_preserves_exact_ties(
+    backend: str,
+) -> None:
+    inputs = list(_numerical_moe_inputs(7, 15, 17, 4, device="cuda"))
+    inputs[1] = torch.zeros_like(inputs[1]).detach().contiguous()
+    typed_inputs = tuple(inputs)
+    kwargs = {"topk": 2, "n_groups": 2, "topk_groups": 1}
+
+    actual = deepseek_moe_forward(*typed_inputs, backend=backend, **kwargs)  # type: ignore[arg-type]
+    expected, routing = deepseek_moe_reference(
+        *typed_inputs,
+        return_routing=True,
+        **kwargs,
+    )
+
+    assert routing.indices.tolist() == [[0, 1]] * 7
+    _assert_native_output(actual, expected, typed_inputs[0])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+@pytest.mark.parametrize("backend", ["cuda", "auto"])
+def test_native_cuda_handles_hot_and_inactive_experts(
+    backend: str,
+) -> None:
+    inputs = list(_numerical_moe_inputs(7, 15, 17, 4, device="cuda"))
+    inputs[0] = torch.ones_like(inputs[0]).mul_(0.25)
+    inputs[1] = -torch.ones_like(inputs[1])
+    inputs[1][0].fill_(1.0)
+    for weights in inputs[2:]:
+        weights[1:].fill_(8.0)
+    typed_inputs = tuple(tensor.detach().contiguous() for tensor in inputs)
+    kwargs = {"topk": 1, "n_groups": 1, "topk_groups": 1}
+
+    actual = deepseek_moe_forward(*typed_inputs, backend=backend, **kwargs)  # type: ignore[arg-type]
+    expected, routing = deepseek_moe_reference(
+        *typed_inputs,
+        return_routing=True,
+        **kwargs,
+    )
+
+    assert routing.indices.tolist() == [[0]] * 7
+    _assert_native_output(actual, expected, typed_inputs[0])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+@pytest.mark.parametrize("backend", ["cuda", "auto"])
+def test_native_cuda_restores_rank_three_facade_output(
+    backend: str,
+) -> None:
+    inputs = _numerical_moe_inputs(
+        6,
+        15,
+        17,
+        4,
+        device="cuda",
+        token_shape=(2, 3),
+    )
+    score_bias = _numerical_score_bias(4, device="cuda")
+    kwargs = {
+        "topk": 2,
+        "n_groups": 2,
+        "topk_groups": 1,
+        "score_bias": score_bias,
+        "route_scale": 1.25,
+    }
+
+    actual = deepseek_moe_forward(*inputs, backend=backend, **kwargs)  # type: ignore[arg-type]
+    expected = deepseek_moe_reference(*inputs, **kwargs)
+
+    _assert_native_output(actual, expected, inputs[0])
+
+
+CUDA_INELIGIBILITY_CASES = (
+    ("float16", "float32 only"),
+    ("bfloat16", "float32 only"),
+    ("softmax", "sigmoid scores only"),
+    ("noncontiguous", "requires contiguous tensors"),
+    ("requires_grad", "forward-only for requires_grad tensors"),
+    ("deterministic", "deterministic algorithms are enabled"),
+    ("missing_native", "does not register a CUDA DeepSeek MoE forward"),
+)
+
+
+@pytest.mark.parametrize(("case", "message"), CUDA_INELIGIBILITY_CASES)
+def test_explicit_cuda_rejects_every_ineligible_policy_case_without_native(
+    case: str,
+    message: str,
+    monkeypatch,
+) -> None:
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(case == "deterministic")
+    try:
+        with FakeTensorMode():
+            dtype = {
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }.get(case, torch.float32)
+            inputs = list(_raw_moe_inputs(dtype=dtype, device="cuda"))
+            score_func = "softmax" if case == "softmax" else "sigmoid"
+            if case == "noncontiguous":
+                inputs[0] = _noncontiguous_empty_like(inputs[0])
+            elif case == "requires_grad":
+                inputs[0].requires_grad_(True)
+            elif case == "missing_native":
+                monkeypatch.setattr(facade_ops, "_operator_has_cuda_kernel", lambda _: False)
+
+            with pytest.raises(RuntimeError, match=message):
+                deepseek_moe_forward(
+                    *inputs,
+                    topk=TOPK,
+                    n_groups=GROUPS,
+                    topk_groups=TOPK_GROUPS,
+                    score_func=score_func,  # type: ignore[arg-type]
+                    backend="cuda",
+                )
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+
+
+def _noncontiguous_clone(tensor: Tensor) -> Tensor:
+    return torch.stack((tensor, tensor), dim=-1)[..., 0]
+
+
+@pytest.mark.parametrize("case", [item[0] for item in CUDA_INELIGIBILITY_CASES])
+def test_ineligible_auto_completes_reference_fallback(
+    case: str,
+    monkeypatch,
+) -> None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }.get(case, torch.float32)
+    inputs = list(_numerical_moe_inputs(7, 5, 9, 4, device=device, dtype=dtype))
+    score_func = "softmax" if case == "softmax" else "sigmoid"
+    if case == "noncontiguous":
+        inputs[0] = _noncontiguous_clone(inputs[0])
+        assert not inputs[0].is_contiguous()
+    elif case == "requires_grad":
+        inputs[0].requires_grad_(True)
+    elif case == "missing_native":
+        monkeypatch.setattr(facade_ops, "_operator_has_cuda_kernel", lambda _: False)
+
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(case == "deterministic")
+    try:
+        kwargs = {
+            "topk": TOPK,
+            "n_groups": GROUPS,
+            "topk_groups": TOPK_GROUPS,
+            "score_func": score_func,
+            "route_scale": 0.75,
+        }
+        if inputs[0].device.type == "cuda":
+            reason = facade_ops._cuda_moe_ineligibility_reason(
+                *inputs,
+                score_func,
+                None,
+            )
+            assert reason is not None
+            assert dict(CUDA_INELIGIBILITY_CASES)[case] in reason
+        actual = deepseek_moe_forward(*inputs, backend="auto", **kwargs)  # type: ignore[arg-type]
+        expected = deepseek_moe_reference(*inputs, **kwargs)
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+    assert actual.shape == inputs[0].shape
+    assert actual.dtype == inputs[0].dtype
+    assert actual.device == inputs[0].device
+    assert actual.is_contiguous()
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+def test_native_cuda_uses_current_nondefault_stream() -> None:
+    inputs = list(_numerical_moe_inputs(7, 15, 17, 4, device="cuda"))
+    score_bias = _numerical_score_bias(4, device="cuda")
+    producer_stream = torch.cuda.current_stream()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(producer_stream)
+    kwargs = {
+        "topk": 2,
+        "n_groups": 2,
+        "topk_groups": 1,
+        "score_bias": score_bias,
+        "route_scale": 0.75,
+    }
+
+    with torch.cuda.stream(stream):
+        inputs[0].add_(0.03125)
+        actual = deepseek_moe_forward(*inputs, backend="cuda", **kwargs)  # type: ignore[arg-type]
+        actual.record_stream(stream)
+    stream.synchronize()
+    expected = deepseek_moe_reference(*inputs, **kwargs)
+
+    _assert_native_output(actual, expected, inputs[0])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+def test_raw_native_cuda_operator_passes_opcheck() -> None:
+    inputs = tuple(
+        tensor.detach().contiguous()
+        for tensor in _numerical_moe_inputs(7, 15, 17, 4, device="cuda")
+    )
+    score_bias = _numerical_score_bias(4, device="cuda").detach().contiguous()
+    result = torch.library.opcheck(
+        torch.ops.ds_flash_mla_moe.deepseek_moe_forward.default,
+        (*inputs, 2, 2, 1, score_bias, 0.75),
+    )
+
+    assert set(result.values()) == {"SUCCESS"}
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+def test_raw_native_cuda_operator_supports_fullgraph_compile() -> None:
+    inputs = tuple(
+        tensor.detach().contiguous()
+        for tensor in _numerical_moe_inputs(7, 15, 17, 4, device="cuda")
+    )
+    score_bias = _numerical_score_bias(4, device="cuda").detach().contiguous()
+
+    @torch.compile(fullgraph=True, backend="eager")
+    def compiled_raw_moe(
+        x: Tensor,
+        gate_weight: Tensor,
+        expert_w1: Tensor,
+        expert_w2: Tensor,
+        expert_w3: Tensor,
+        bias: Tensor,
+    ) -> Tensor:
+        return torch.ops.ds_flash_mla_moe.deepseek_moe_forward.default(
+            x,
+            gate_weight,
+            expert_w1,
+            expert_w2,
+            expert_w3,
+            2,
+            2,
+            1,
+            bias,
+            0.75,
+        )
+
+    actual = compiled_raw_moe(*inputs, score_bias)
+    expected = deepseek_moe_reference(
+        *inputs,
+        topk=2,
+        n_groups=2,
+        topk_groups=1,
+        score_bias=score_bias,
+        route_scale=0.75,
+    )
+
+    _assert_native_output(actual, expected, inputs[0])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not cuda_moe_available(), reason=NATIVE_MOE_SKIP_REASON)
+@pytest.mark.parametrize("inside_no_grad", [False, True], ids=["normal", "no_grad"])
+def test_raw_native_cuda_operator_rejects_requires_grad_even_in_no_grad(
+    inside_no_grad: bool,
+) -> None:
+    inputs = [
+        tensor.detach().contiguous()
+        for tensor in _numerical_moe_inputs(7, 15, 17, 4, device="cuda")
+    ]
+    inputs[0] = inputs[0].requires_grad_(True)
+
+    def call_raw() -> Tensor:
+        return _call_raw_moe(
+            tuple(inputs),
+            topk=2,
+            n_groups=2,
+            topk_groups=1,
+        )
+
+    with pytest.raises(RuntimeError, match="forward-only|requires_grad"):
+        if inside_no_grad:
+            with torch.no_grad():
+                call_raw()
+        else:
+            call_raw()
