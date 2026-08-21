@@ -1023,6 +1023,24 @@ def test_ineligible_auto_completes_reference_fallback(
     case: str,
     monkeypatch,
 ) -> None:
+    real_reference = facade_ops.deepseek_moe_packed_reference
+    reference_calls = 0
+
+    def call_real_reference(*args: object, **kwargs: object) -> Tensor:
+        nonlocal reference_calls
+        reference_calls += 1
+        return real_reference(*args, **kwargs)
+
+    monkeypatch.setattr(
+        facade_ops,
+        "_call_cuda_moe",
+        lambda *args, **kwargs: pytest.fail("ineligible auto must not call native"),
+    )
+    monkeypatch.setattr(
+        facade_ops,
+        "deepseek_moe_packed_reference",
+        call_real_reference,
+    )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = {
         "float16": torch.float16,
@@ -1068,6 +1086,7 @@ def test_ineligible_auto_completes_reference_fallback(
     assert actual.device == inputs[0].device
     assert actual.is_contiguous()
     assert torch.isfinite(actual).all()
+    assert reference_calls == 1
 
 
 @pytest.mark.cuda
