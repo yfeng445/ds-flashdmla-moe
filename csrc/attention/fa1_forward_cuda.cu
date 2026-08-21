@@ -211,6 +211,7 @@ __global__ void fa1_forward_kernel(
         normalized_output[workspace_offset] =
             next_l > 0.0F ? next_numerator / next_l : 0.0F;
       }
+      __syncthreads();
       for (int query_in_tile = threadIdx.x; query_in_tile < valid_queries;
            query_in_tile += blockDim.x) {
         const int64_t row = batch_head * query_length + query_block + query_in_tile;
