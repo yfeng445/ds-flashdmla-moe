@@ -34,6 +34,18 @@ jobs:
           --warmup 5 --iterations 20
           --output benchmark-results/baseline-gemm-torch.json
       - run: >-
+          python benchmarks/quantized_gemm.py
+          --device cuda --backend cuda --format int8
+          --m 127 --n 95 --k 63
+          --warmup 5 --iterations 20
+          --output benchmark-results/cuda-quantized-int8-smoke.json
+      - run: >-
+          python benchmarks/quantized_gemm.py
+          --device cuda --backend cuda --format fp8_e4m3fn
+          --m 127 --n 95 --k 63
+          --warmup 5 --iterations 20
+          --output benchmark-results/cuda-quantized-fp8-smoke.json
+      - run: >-
           python benchmarks/attention.py
           --device cuda --backend cuda --dtype float32
           --batch 1 --heads 2 --query-length 128 --key-length 128

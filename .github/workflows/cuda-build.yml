@@ -78,6 +78,10 @@ jobs:
               "mla_cache_projection_write_slots",
               "mla_paged_absorbed_attention",
               "mla_output_projection",
+              "quantize_int8_per_row",
+              "quantize_fp8_e4m3fn_per_row",
+              "dequantized_linear_int8",
+              "dequantized_linear_fp8_e4m3fn",
           ):
               qualified = f"ds_flash_mla_moe::{operator}"
               assert torch._C._dispatch_has_kernel_for_dispatch_key(qualified, "CUDA")

@@ -36,6 +36,7 @@ def native_build_configuration() -> dict[str, object]:
             "csrc/mla/mla_absorbed_attention_cuda.cu",
             "csrc/mla/mla_paged_attention_cuda.cu",
             "csrc/mla/mla_projection_cuda.cu",
+            "csrc/quantization/quantized_linear_cuda.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args,
@@ -68,6 +69,7 @@ def assert_native_sources_present() -> None:
         Path("csrc/mla/mla_absorbed_attention_cuda.cu"),
         Path("csrc/mla/mla_paged_attention_cuda.cu"),
         Path("csrc/mla/mla_projection_cuda.cu"),
+        Path("csrc/quantization/quantized_linear_cuda.cu"),
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:

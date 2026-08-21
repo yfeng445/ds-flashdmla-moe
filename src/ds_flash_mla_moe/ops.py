@@ -176,6 +176,20 @@ _MLA_PAGED_ABSORBED_ATTENTION_SCHEMA = (
     "bool causal, float scale) -> Tensor"
 )
 _MLA_OUTPUT_PROJECTION_SCHEMA = "mla_output_projection(Tensor heads, Tensor wo) -> Tensor"
+_QUANTIZE_INT8_PER_ROW_SCHEMA = (
+    "quantize_int8_per_row(Tensor input) -> (Tensor values, Tensor scales)"
+)
+_QUANTIZE_FP8_E4M3FN_PER_ROW_SCHEMA = (
+    "quantize_fp8_e4m3fn_per_row(Tensor input) -> (Tensor values, Tensor scales)"
+)
+_DEQUANTIZED_LINEAR_INT8_SCHEMA = (
+    "dequantized_linear_int8(Tensor activation_values, Tensor activation_scales, "
+    "Tensor weight_values, Tensor weight_scales) -> Tensor"
+)
+_DEQUANTIZED_LINEAR_FP8_E4M3FN_SCHEMA = (
+    "dequantized_linear_fp8_e4m3fn(Tensor activation_values, Tensor activation_scales, "
+    "Tensor weight_values, Tensor weight_scales) -> Tensor"
+)
 _SCHEMAS = {
     "attention_forward": _FORWARD_SCHEMA,
     "attention_fa1_forward": _FA1_FORWARD_SCHEMA,
@@ -199,6 +213,10 @@ _SCHEMAS = {
     "mla_cache_projection_write_slots": _MLA_CACHE_PROJECTION_WRITE_SLOTS_SCHEMA,
     "mla_paged_absorbed_attention": _MLA_PAGED_ABSORBED_ATTENTION_SCHEMA,
     "mla_output_projection": _MLA_OUTPUT_PROJECTION_SCHEMA,
+    "quantize_int8_per_row": _QUANTIZE_INT8_PER_ROW_SCHEMA,
+    "quantize_fp8_e4m3fn_per_row": _QUANTIZE_FP8_E4M3FN_PER_ROW_SCHEMA,
+    "dequantized_linear_int8": _DEQUANTIZED_LINEAR_INT8_SCHEMA,
+    "dequantized_linear_fp8_e4m3fn": _DEQUANTIZED_LINEAR_FP8_E4M3FN_SCHEMA,
 }
 _missing_schemas = {
     operator: schema for operator, schema in _SCHEMAS.items() if not _operator_is_defined(operator)
@@ -800,6 +818,105 @@ def _fake_tiled_gemm(
     return a.new_empty((a.shape[0], b.shape[1]))
 
 
+def _fake_quantize_per_row(input: Tensor, value_dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+    torch._check(input.ndim == 2)
+    torch._check(input.shape[0] > 0 and input.shape[1] > 0)
+    torch._check(input.device.type == "cuda")
+    torch._check(input.dtype == torch.float32)
+    torch._check(input.is_contiguous())
+    torch._check(
+        not input.requires_grad,
+        lambda: "native quantization operators are forward-only",
+    )
+    return (
+        input.new_empty(input.shape, dtype=value_dtype),
+        input.new_empty((input.shape[0],), dtype=torch.float32),
+    )
+
+
+def _fake_quantize_int8_per_row(input: Tensor) -> tuple[Tensor, Tensor]:
+    return _fake_quantize_per_row(input, torch.int8)
+
+
+def _fake_quantize_fp8_e4m3fn_per_row(input: Tensor) -> tuple[Tensor, Tensor]:
+    return _fake_quantize_per_row(input, torch.uint8)
+
+
+def _fake_dequantized_linear(
+    activation_values: Tensor,
+    activation_scales: Tensor,
+    weight_values: Tensor,
+    weight_scales: Tensor,
+    value_dtype: torch.dtype,
+) -> Tensor:
+    torch._check(activation_values.ndim == 2 and weight_values.ndim == 2)
+    torch._check(activation_values.shape[0] > 0 and activation_values.shape[1] > 0)
+    torch._check(weight_values.shape[0] > 0)
+    torch._check(activation_values.shape[1] == weight_values.shape[1])
+    torch._check(activation_scales.shape == (activation_values.shape[0],))
+    torch._check(weight_scales.shape == (weight_values.shape[0],))
+    torch._check(activation_values.dtype == value_dtype)
+    torch._check(weight_values.dtype == value_dtype)
+    torch._check(activation_scales.dtype == torch.float32)
+    torch._check(weight_scales.dtype == torch.float32)
+    torch._check(
+        activation_values.device
+        == activation_scales.device
+        == weight_values.device
+        == weight_scales.device
+    )
+    torch._check(activation_values.device.type == "cuda")
+    torch._check(
+        all(
+            tensor.is_contiguous()
+            for tensor in (
+                activation_values,
+                activation_scales,
+                weight_values,
+                weight_scales,
+            )
+        )
+    )
+    torch._check(
+        not activation_scales.requires_grad and not weight_scales.requires_grad,
+        lambda: "native dequantized linear operators are forward-only",
+    )
+    return activation_scales.new_empty(
+        (activation_values.shape[0], weight_values.shape[0]),
+        dtype=torch.float32,
+    )
+
+
+def _fake_dequantized_linear_int8(
+    activation_values: Tensor,
+    activation_scales: Tensor,
+    weight_values: Tensor,
+    weight_scales: Tensor,
+) -> Tensor:
+    return _fake_dequantized_linear(
+        activation_values,
+        activation_scales,
+        weight_values,
+        weight_scales,
+        torch.int8,
+    )
+
+
+def _fake_dequantized_linear_fp8_e4m3fn(
+    activation_values: Tensor,
+    activation_scales: Tensor,
+    weight_values: Tensor,
+    weight_scales: Tensor,
+) -> Tensor:
+    return _fake_dequantized_linear(
+        activation_values,
+        activation_scales,
+        weight_values,
+        weight_scales,
+        torch.uint8,
+    )
+
+
 def _fake_swiglu_experts(
     activations: Tensor,
     expert_offsets: Tensor,
@@ -1286,6 +1403,18 @@ torch.library.register_fake(
     _fake_mla_paged_absorbed_attention,
 )
 torch.library.register_fake("ds_flash_mla_moe::mla_output_projection", _fake_mla_output_projection)
+torch.library.register_fake("ds_flash_mla_moe::quantize_int8_per_row", _fake_quantize_int8_per_row)
+torch.library.register_fake(
+    "ds_flash_mla_moe::quantize_fp8_e4m3fn_per_row",
+    _fake_quantize_fp8_e4m3fn_per_row,
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::dequantized_linear_int8", _fake_dequantized_linear_int8
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::dequantized_linear_fp8_e4m3fn",
+    _fake_dequantized_linear_fp8_e4m3fn,
+)
 
 
 def _attention_setup_context(ctx, inputs, output) -> None:

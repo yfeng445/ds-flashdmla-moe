@@ -29,6 +29,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | DeepSeek whole-layer MoE forward | packed PyTorch | CPU + CUDA | single-device staged/fused/persistent, correctness-first FP32 sigmoid forwards | no |
 | MLA prefill/decode | naive + absorbed + paged | CPU + CUDA pipeline | staged FP16/BF16/FP32 storage, per-slot write, direct paged read | no |
 | Graph replay / request scheduling | stable-buffer graph runner + FIFO control plane | CPU contracts + CUDA replay | exact-shape buckets; fixed-page transactions | no |
+| FP8/INT8 forward experiments | explicit scales + dequantized FP32 oracle | CPU + CUDA contracts | scalar E4M3FN/INT8 quantize + linear source | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
 | One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
 
@@ -151,6 +152,16 @@ silently changing semantics.
 kernel: contiguous FP32 rank-2 matrices, fixed 16x16x16 tiles, arbitrary M/N/K
 tails, optional `alpha * A @ B + beta * C` epilogue, and an analytic PyTorch
 backward. It is a correctness milestone rather than a cuBLAS competitor.
+
+The quantization experiment keeps its storage contract visible. Activations use
+per-row FP32 scales; `[out_features, in_features]` weights use per-output-channel
+FP32 scales. Symmetric INT8 saturates to `[-127, 127]`, while FP8 E4M3FN stores
+finite `[-448, 448]` encodings as explicit `uint8` payload bits. Both
+`quantize_activations` / `quantize_weights` and `dequantized_linear` are
+forward-only. Explicit `backend="cuda"` requests fail when the format, device,
+shape, dtype, or native operator is unavailable; only `auto` may fall back. The
+native scalar kernels accumulate/output FP32 and make no Tensor Core or speedup
+claim. See [the quantization chapter](docs/chapters/09-fp8-int8-quantization.md).
 
 `swiglu_experts_expert_major(..., backend="cuda")` accepts contiguous FP16 or FP32
 expert-major rows, an int64 offsets vector, and local `[E_l,D_h,D]`/
@@ -292,6 +303,15 @@ teaching reference can run as a normal Python process:
 python benchmarks/gemm.py --device cpu --dtype float64 \
   --implementation tiled --m 37 --n 29 --k 23 \
   --tile-m 16 --tile-n 8 --tile-k 7 --iterations 5
+```
+
+The standalone quantized-linear benchmark keeps quantization outside the timed
+region and records both a paired dequantized oracle and the error relative to
+the original FP32 linear:
+
+```bash
+python benchmarks/quantized_gemm.py --device cpu --backend reference \
+  --format int8 --m 127 --n 95 --k 63 --warmup 2 --iterations 20
 ```
 
 Attention uses the same report conventions:

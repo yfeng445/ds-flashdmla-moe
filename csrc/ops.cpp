@@ -56,4 +56,10 @@ TORCH_LIBRARY(ds_flash_mla_moe, m) {
   m.def(
       "mla_paged_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv_storage, Tensor pe_storage, Tensor position_storage, Tensor block_table, Tensor sequence_lengths, Tensor key_up, Tensor value_up, Tensor query_positions, bool metadata_validated, bool causal, float scale) -> Tensor");
   m.def("mla_output_projection(Tensor heads, Tensor wo) -> Tensor");
+  m.def("quantize_int8_per_row(Tensor input) -> (Tensor values, Tensor scales)");
+  m.def("quantize_fp8_e4m3fn_per_row(Tensor input) -> (Tensor values, Tensor scales)");
+  m.def(
+      "dequantized_linear_int8(Tensor activation_values, Tensor activation_scales, Tensor weight_values, Tensor weight_scales) -> Tensor");
+  m.def(
+      "dequantized_linear_fp8_e4m3fn(Tensor activation_values, Tensor activation_scales, Tensor weight_values, Tensor weight_scales) -> Tensor");
 }

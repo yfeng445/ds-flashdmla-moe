@@ -66,6 +66,17 @@ from .ops import (
     native_extension_loaded,
     tiled_gemm,
 )
+from .quantization import (
+    QuantizationBackend,
+    QuantizationFormat,
+    QuantizedMatrix,
+    QuantizedMatrixMetadata,
+    cuda_quantization_available,
+    dequantize_matrix,
+    dequantized_linear,
+    quantize_activations,
+    quantize_weights,
+)
 from .route_ops import RoutePackResult, cuda_route_ops_available, route_combine, route_pack
 from .router_ops import RouterBackend, cuda_router_available, grouped_topk
 from .scheduler import (
@@ -100,6 +111,10 @@ __all__ = [
     "MoEBackend",
     "MoEScoreFunction",
     "PackedRoutes",
+    "QuantizationBackend",
+    "QuantizationFormat",
+    "QuantizedMatrix",
+    "QuantizedMatrixMetadata",
     "RoutePackResult",
     "RouterBackend",
     "RoutingResult",
@@ -123,6 +138,7 @@ __all__ = [
     "cuda_mla_available",
     "cuda_moe_available",
     "cuda_paged_mla_available",
+    "cuda_quantization_available",
     "cuda_route_ops_available",
     "cuda_router_available",
     "deepseek_grouped_topk",
@@ -130,6 +146,8 @@ __all__ = [
     "deepseek_moe_forward",
     "deepseek_moe_packed_reference",
     "deepseek_moe_reference",
+    "dequantize_matrix",
+    "dequantized_linear",
     "expert_major_pack",
     "flash_attention_forward",
     "gemm_reference",
@@ -141,6 +159,8 @@ __all__ = [
     "mla_paged_attention",
     "native_extension_loaded",
     "pack_routes_reference",
+    "quantize_activations",
+    "quantize_weights",
     "route_combine",
     "route_pack",
     "scaled_dot_product_attention_backward_reference",
