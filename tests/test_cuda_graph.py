@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from ds_flash_mla_moe import cuda_graph as cuda_graph_module
 from ds_flash_mla_moe.cuda_graph import (
     MLAPagedDecodeGraphBucket,
     MLAPagedDecodeGraphRunner,
@@ -74,6 +75,13 @@ def test_graph_capture_rejects_cpu_and_requires_at_least_one_input() -> None:
         SingleOutputCUDAGraphRunner.capture(lambda x: x + 1, (torch.ones(1),))
 
 
+def test_replay_submission_gate_rejects_same_thread_reentrancy() -> None:
+    gate = cuda_graph_module._ReplaySubmissionGate()
+
+    with gate, pytest.raises(RuntimeError, match="non-reentrant"), gate:
+        pass
+
+
 def test_mla_decode_bucket_requires_exact_static_shapes() -> None:
     bucket = MLAPagedDecodeGraphBucket(batch_size=2, max_logical_pages=3, model_dim=8)
 
@@ -125,6 +133,24 @@ def test_graph_replay_rejects_incompatible_bucket_before_overwriting_static_inpu
         runner.replay(torch.ones(3, 2, device="cuda"))
 
     torch.testing.assert_close(runner.static_inputs[0], before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph support")
+@pytest.mark.cuda
+def test_graph_replay_serializes_static_buffers_across_cuda_streams() -> None:
+    example = torch.zeros(1024, device="cuda")
+    runner = SingleOutputCUDAGraphRunner.capture(lambda x: x.clone(), (example,))
+    delayed_stream = torch.cuda.Stream()
+    immediate_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(delayed_stream):
+        torch.cuda._sleep(50_000_000)
+        runner.replay(torch.ones_like(example))
+    with torch.cuda.stream(immediate_stream):
+        runner.replay(torch.full_like(example, 2))
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(runner.output, torch.full_like(example, 2))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph support")
@@ -181,6 +207,62 @@ def _make_cuda_mla_graph_fixture():
     query_positions = torch.tensor([[2], [2]], device=device)
     query = torch.randn(2, 1, model_dim, device=device, dtype=dtype)
     return query, cache, block_table, lengths, config, weights, query_positions
+
+
+def _make_uncaptured_cuda_mla_inputs():
+    config = MLAConfig(
+        n_heads=1,
+        q_lora_rank=0,
+        kv_lora_rank=2,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=2,
+        v_head_dim=2,
+    )
+    model_dim = 4
+    weights = MLAWeights(
+        wkv_a=torch.randn(4, model_dim, device="cuda"),
+        kv_norm_weight=torch.randn(2, device="cuda"),
+        wkv_b=torch.randn(4, 2, device="cuda"),
+        wo=torch.randn(model_dim, 2, device="cuda"),
+        wq=torch.randn(4, model_dim, device="cuda"),
+    )
+    cache = allocate_mla_paged_cache(
+        num_pages=2,
+        page_size=2,
+        config=config,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    query = torch.randn(2, 1, model_dim, device="cuda")
+    block_table = torch.full((2, 1), -1, device="cuda", dtype=torch.long)
+    lengths = torch.zeros(2, device="cuda", dtype=torch.long)
+    return query, cache, block_table, lengths, config, weights
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.cuda
+@pytest.mark.parametrize("failure", ["dtype", "contiguous"])
+def test_mla_graph_rejects_noncanonical_static_positions_before_raw_capture(failure: str) -> None:
+    query, cache, block_table, lengths, config, weights = _make_uncaptured_cuda_mla_inputs()
+    if failure == "dtype":
+        positions = torch.zeros(2, 1, device="cuda", dtype=torch.float32)
+        expected_error = TypeError
+        message = "int64"
+    else:
+        positions = torch.zeros(2, 2, device="cuda", dtype=torch.long)[:, ::2]
+        expected_error = ValueError
+        message = "contiguous"
+
+    with pytest.raises(expected_error, match=message):
+        MLAPagedDecodeGraphRunner.capture(
+            query,
+            cache,
+            block_table,
+            lengths,
+            config,
+            weights,
+            query_positions=positions,
+        )
 
 
 @pytest.mark.skipif(

@@ -8,6 +8,7 @@ capture bucket exactly.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -62,6 +63,27 @@ class StaticTensorSpec:
             )
 
 
+class _ReplaySubmissionGate:
+    """Serialize host submissions while rejecting same-thread reentrancy."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner: int | None = None
+
+    def __enter__(self):
+        thread_id = threading.get_ident()
+        if self._owner == thread_id:
+            raise RuntimeError("CUDA graph replay is non-reentrant")
+        self._lock.acquire()
+        self._owner = thread_id
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        del exc_type, exc_value, traceback
+        self._owner = None
+        self._lock.release()
+
+
 class SingleOutputCUDAGraphRunner:
     """Capture and replay one tensor-valued CUDA operation.
 
@@ -84,6 +106,9 @@ class SingleOutputCUDAGraphRunner:
         self._output = output
         self._input_specs = input_specs
         self._input_names = input_names
+        self._replay_gate = _ReplaySubmissionGate()
+        self._replay_complete = torch.cuda.Event(blocking=False)
+        self._has_pending_replay = False
 
     @classmethod
     def capture(
@@ -198,14 +223,32 @@ class SingleOutputCUDAGraphRunner:
             spec.validate(tensor, name=name)
 
     def replay(self, *inputs: Tensor) -> Tensor:
-        """Validate every input, copy values, replay, and return stable output."""
+        """Serialize, copy values, replay, and return the stable output.
+
+        Host submissions are non-reentrant.  A CUDA event orders the next
+        replay's input copies after the previous graph completes, even when
+        callers switch streams, so the one static input set is never shared by
+        overlapping executions.
+        """
 
         self.validate_inputs(*inputs)
-        with torch.no_grad():
+        with self._replay_gate, torch.cuda.device(self._output.device), torch.no_grad():
+            stream = torch.cuda.current_stream(self._output.device)
+            if self._has_pending_replay:
+                stream.wait_event(self._replay_complete)
             for static, source in zip(self._static_inputs, inputs, strict=True):
                 static.copy_(source, non_blocking=True)
             self._graph.replay()
+            self._replay_complete.record(stream)
+            self._has_pending_replay = True
         return self._output
+
+    def synchronize(self) -> None:
+        """Wait for the most recently submitted replay, if any."""
+
+        with self._replay_gate:
+            if self._has_pending_replay:
+                self._replay_complete.synchronize()
 
     __call__ = replay
 
@@ -316,6 +359,12 @@ class MLAPagedDecodeGraphRunner:
             sequence_lengths,
             query_positions,
         )
+        if query_positions.device.type != "cuda" or query_positions.device != query_x.device:
+            raise ValueError("MLA paged decode graph query_positions must be a CUDA tensor")
+        if query_positions.dtype != torch.long:
+            raise TypeError("MLA paged decode graph query_positions must use int64")
+        if not query_positions.is_contiguous():
+            raise ValueError("MLA paged decode graph query_positions must be contiguous")
         floating_weights = tuple(
             tensor
             for tensor in (

@@ -26,7 +26,13 @@ class SequenceStatus(str, Enum):
 
 @dataclass(frozen=True)
 class SequenceState:
-    """Read-only snapshot of one scheduler sequence."""
+    """Read-only snapshot of one scheduler sequence.
+
+    ``used_page_ids`` covers the committed sequence length.  The allocator owns
+    every ``reserved_page_id`` from admission until finish/cancel, including
+    pages that future decode iterations have not reached yet.  ``page_ids`` is
+    a compatibility alias for the current used-page prefix.
+    """
 
     request_id: str
     prompt_length: int
@@ -34,8 +40,21 @@ class SequenceState:
     status: SequenceStatus
     committed_length: int
     generated_tokens: int
-    page_ids: tuple[int, ...]
+    used_page_ids: tuple[int, ...]
+    reserved_page_ids: tuple[int, ...]
     reserved_length: int | None
+
+    @property
+    def page_ids(self) -> tuple[int, ...]:
+        return self.used_page_ids
+
+    @property
+    def used_page_count(self) -> int:
+        return len(self.used_page_ids)
+
+    @property
+    def reserved_page_count(self) -> int:
+        return len(self.reserved_page_ids)
 
 
 @dataclass
@@ -46,10 +65,11 @@ class _SequenceRecord:
     status: SequenceStatus = SequenceStatus.QUEUED
     committed_length: int = 0
     generated_tokens: int = 0
-    page_ids: list[int] = field(default_factory=list)
+    reserved_page_ids: list[int] = field(default_factory=list)
     reserved_length: int | None = None
 
-    def snapshot(self) -> SequenceState:
+    def snapshot(self, page_size: int) -> SequenceState:
+        used_count = (self.committed_length + page_size - 1) // page_size
         return SequenceState(
             request_id=self.request_id,
             prompt_length=self.prompt_length,
@@ -57,7 +77,8 @@ class _SequenceRecord:
             status=self.status,
             committed_length=self.committed_length,
             generated_tokens=self.generated_tokens,
-            page_ids=tuple(self.page_ids),
+            used_page_ids=tuple(self.reserved_page_ids[:used_count]),
+            reserved_page_ids=tuple(self.reserved_page_ids),
             reserved_length=self.reserved_length,
         )
 
@@ -137,9 +158,11 @@ class FixedPageAllocator:
 class ScheduledBatch:
     """One homogeneous transactional prefill or decode iteration.
 
-    ``block_tables`` is rectangular and padded with ``-1``.  ``slot_mappings``
-    contains only the tokens scheduled in this iteration, so prefill rows may
-    have different lengths while decode rows always contain one slot.
+    ``block_tables`` is rectangular up to the widest worst-case reservation,
+    but pages beyond this iteration's sequence length remain ``-1``.  The
+    allocator still owns those hidden future pages.  ``slot_mappings`` contains
+    only this iteration's tokens, so prefill rows may have different lengths
+    while decode rows always contain one slot.
     """
 
     batch_id: int
@@ -212,7 +235,7 @@ class ContinuousBatchingScheduler:
 
     def state(self, request_id: str) -> SequenceState:
         try:
-            return self._records[request_id].snapshot()
+            return self._records[request_id].snapshot(self.page_size)
         except KeyError as error:
             raise ValueError(f"unknown request {request_id!r}") from error
 
@@ -222,7 +245,7 @@ class ContinuousBatchingScheduler:
         return (
             self.allocator.snapshot(),
             tuple(self._queued),
-            tuple(record.snapshot() for record in self._records.values()),
+            tuple(record.snapshot(self.page_size) for record in self._records.values()),
             None if self._inflight is None else self._inflight.batch_id,
         )
 
@@ -236,13 +259,24 @@ class ContinuousBatchingScheduler:
             record for record in self._records.values() if record.status is SequenceStatus.ACTIVE
         ]
         available_slots = self.max_batch_size - len(active)
-        queued = [self._records[request_id] for request_id in list(self._queued)[:available_slots]]
+        queued_candidates = [
+            self._records[request_id] for request_id in list(self._queued)[:available_slots]
+        ]
+        queued: list[_SequenceRecord] = []
+        prefix_pages = 0
+        for record in queued_candidates:
+            request_pages = self._maximum_pages(record)
+            if not self.allocator.can_allocate(prefix_pages + request_pages):
+                break
+            queued.append(record)
+            prefix_pages += request_pages
         if queued:
-            needed = sum(self._pages_for_length(record.prompt_length) for record in queued)
-            if self.allocator.can_allocate(needed):
-                return self._reserve(queued, phase="prefill")
-            if not active:
-                self.allocator.allocate(needed)  # raises without mutation and supplies detail
+            return self._reserve(queued, phase="prefill")
+        if queued_candidates and not active:
+            # The first FIFO request is itself blocked by current page
+            # ownership.  Allocate only to produce the standard detailed
+            # error; FixedPageAllocator guarantees no side effect.
+            self.allocator.allocate(self._maximum_pages(queued_candidates[0]))
         if active:
             return self._reserve(active, phase="decode")
         return None
@@ -279,8 +313,8 @@ class ContinuousBatchingScheduler:
                 reached_limit = record.generated_tokens >= record.max_new_tokens
                 if request_id in early_finished or reached_limit:
                     record.status = SequenceStatus.FINISHED
-                    self.allocator.release(record.page_ids)
-                    record.page_ids.clear()
+                    self.allocator.release(record.reserved_page_ids)
+                    record.reserved_page_ids.clear()
                     finished.append(request_id)
         self._inflight = None
         return tuple(finished)
@@ -298,7 +332,7 @@ class ContinuousBatchingScheduler:
             strict=True,
         ):
             record = self._records[request_id]
-            record.page_ids[:] = prior_pages
+            record.reserved_page_ids[:] = prior_pages
             record.reserved_length = None
             if was_queued:
                 record.status = SequenceStatus.QUEUED
@@ -316,15 +350,13 @@ class ContinuousBatchingScheduler:
             raise ValueError(f"unknown request {request_id!r}") from error
         if record.status in {SequenceStatus.FINISHED, SequenceStatus.CANCELLED}:
             return False
-        if self._inflight is not None and request_id in self._inflight.request_ids:
-            raise RuntimeError(
-                "abort or complete the in-flight batch before cancelling its request"
-            )
+        if self._inflight is not None and record.status is SequenceStatus.ACTIVE:
+            raise RuntimeError("cannot cancel an active request while an iteration is in flight")
         if record.status is SequenceStatus.QUEUED:
             self._queued.remove(request_id)
         else:
-            self.allocator.release(record.page_ids)
-            record.page_ids.clear()
+            self.allocator.release(record.reserved_page_ids)
+            record.reserved_page_ids.clear()
         record.status = SequenceStatus.CANCELLED
         record.reserved_length = None
         return True
@@ -342,14 +374,9 @@ class ContinuousBatchingScheduler:
         sequence_lengths = tuple(
             start + count for start, count in zip(start_positions, token_counts, strict=True)
         )
-        prior_pages = tuple(tuple(record.page_ids) for record in records)
+        prior_pages = tuple(tuple(record.reserved_page_ids) for record in records)
         needed_per_record = tuple(
-            self._pages_for_length(length) - len(record.page_ids)
-            for record, length in zip(
-                records,
-                sequence_lengths,
-                strict=True,
-            )
+            self._maximum_pages(record) - len(record.reserved_page_ids) for record in records
         )
         allocated_pages = self.allocator.allocate(sum(needed_per_record))
 
@@ -361,7 +388,7 @@ class ContinuousBatchingScheduler:
             sequence_lengths,
             strict=True,
         ):
-            record.page_ids.extend(allocated_pages[cursor : cursor + needed])
+            record.reserved_page_ids.extend(allocated_pages[cursor : cursor + needed])
             cursor += needed
             queued = record.status is SequenceStatus.QUEUED
             was_queued.append(queued)
@@ -372,13 +399,17 @@ class ContinuousBatchingScheduler:
                 record.status = SequenceStatus.ACTIVE
             record.reserved_length = reserved_length
 
-        max_pages = max((len(record.page_ids) for record in records), default=0)
+        max_pages = max((len(record.reserved_page_ids) for record in records), default=0)
         block_tables = tuple(
-            tuple(record.page_ids) + (-1,) * (max_pages - len(record.page_ids))
-            for record in records
+            tuple(record.reserved_page_ids[: self._pages_for_length(reserved_length)])
+            + (-1,) * (max_pages - self._pages_for_length(reserved_length))
+            for record, reserved_length in zip(records, sequence_lengths, strict=True)
         )
         slot_mappings = tuple(
-            tuple(self._physical_slot(record.page_ids, position) for position in range(start, end))
+            tuple(
+                self._physical_slot(record.reserved_page_ids, position)
+                for position in range(start, end)
+            )
             for record, start, end in zip(
                 records,
                 start_positions,
@@ -409,6 +440,9 @@ class ContinuousBatchingScheduler:
 
     def _pages_for_length(self, length: int) -> int:
         return (length + self.page_size - 1) // self.page_size
+
+    def _maximum_pages(self, record: _SequenceRecord) -> int:
+        return self._pages_for_length(record.prompt_length + record.max_new_tokens)
 
     def _physical_slot(self, page_ids: list[int], logical_position: int) -> int:
         logical_page, offset = divmod(logical_position, self.page_size)

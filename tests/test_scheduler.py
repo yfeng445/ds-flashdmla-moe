@@ -43,10 +43,59 @@ def test_scheduler_admits_prefill_fifo_and_builds_fixed_page_metadata() -> None:
     assert scheduler.queued_request_ids == ("third",)
 
 
+def test_admission_selects_largest_fundable_fifo_prefix_without_skipping() -> None:
+    scheduler = ContinuousBatchingScheduler(page_size=2, num_pages=3, max_batch_size=3)
+    scheduler.submit("first", prompt_length=3, max_new_tokens=1)
+    scheduler.submit("blocked-second", prompt_length=3, max_new_tokens=1)
+    scheduler.submit("small-third", prompt_length=1, max_new_tokens=1)
+
+    batch = scheduler.schedule()
+
+    assert batch is not None
+    assert batch.request_ids == ("first",)
+    assert scheduler.queued_request_ids == ("blocked-second", "small-third")
+    assert scheduler.state("blocked-second").status is SequenceStatus.QUEUED
+    assert scheduler.state("small-third").status is SequenceStatus.QUEUED
+    assert scheduler.allocator.free_page_count == 1
+
+
+def test_admission_reserves_worst_case_pages_and_decode_crosses_boundary_without_allocating() -> (
+    None
+):
+    scheduler = ContinuousBatchingScheduler(page_size=2, num_pages=4, max_batch_size=2)
+    scheduler.submit("a", prompt_length=2, max_new_tokens=2)
+    scheduler.submit("b", prompt_length=1, max_new_tokens=3)
+    prefill = scheduler.schedule()
+    assert prefill is not None
+
+    assert scheduler.allocator.free_page_count == 0
+    assert prefill.block_tables == ((0, -1), (2, -1))
+    scheduler.complete(prefill)
+    a = scheduler.state("a")
+    b = scheduler.state("b")
+    assert a.used_page_ids == (0,)
+    assert a.page_ids == a.used_page_ids
+    assert a.reserved_page_ids == (0, 1)
+    assert a.used_page_count == 1
+    assert a.reserved_page_count == 2
+    assert b.used_page_ids == (2,)
+    assert b.reserved_page_ids == (2, 3)
+
+    before_decode_allocator = scheduler.allocator.snapshot()
+    decode = scheduler.schedule()
+
+    assert decode is not None
+    assert decode.phase == "decode"
+    assert decode.block_tables == ((0, 1), (2, -1))
+    assert decode.slot_mappings == ((2,), (5,))
+    assert scheduler.allocator.snapshot() == before_decode_allocator
+
+
 def test_failed_multi_request_schedule_leaves_every_state_unchanged() -> None:
-    scheduler = ContinuousBatchingScheduler(page_size=2, num_pages=2, max_batch_size=2)
-    scheduler.submit("a", prompt_length=3, max_new_tokens=1)
-    scheduler.submit("b", prompt_length=2, max_new_tokens=1)
+    scheduler = ContinuousBatchingScheduler(page_size=2, num_pages=3, max_batch_size=2)
+    scheduler.allocator.allocate(2)
+    scheduler.submit("a", prompt_length=2, max_new_tokens=1)
+    scheduler.submit("b", prompt_length=1, max_new_tokens=1)
     before = scheduler.snapshot()
 
     with pytest.raises(RuntimeError, match="insufficient free pages"):
@@ -57,7 +106,7 @@ def test_failed_multi_request_schedule_leaves_every_state_unchanged() -> None:
 
 
 def test_abort_restores_prefill_admission_pages_and_fifo_order_exactly() -> None:
-    scheduler = ContinuousBatchingScheduler(page_size=2, num_pages=4, max_batch_size=2)
+    scheduler = ContinuousBatchingScheduler(page_size=2, num_pages=5, max_batch_size=2)
     scheduler.submit("a", prompt_length=3, max_new_tokens=2)
     scheduler.submit("b", prompt_length=1, max_new_tokens=2)
     before = scheduler.snapshot()
@@ -90,8 +139,8 @@ def test_decode_reserves_one_token_per_request_and_abort_restores_boundary_page(
     assert decode.token_counts == (1, 1)
     assert decode.start_positions == (2, 1)
     assert decode.sequence_lengths == (3, 2)
-    assert decode.block_tables == ((0, 2), (1, -1))
-    assert decode.slot_mappings == ((4,), (3,))
+    assert decode.block_tables == ((0, 1), (2, -1))
+    assert decode.slot_mappings == ((2,), (5,))
 
     scheduler.abort(decode)
     assert scheduler.snapshot() == before_decode
@@ -166,11 +215,29 @@ def test_cancel_rejects_inflight_request_until_batch_is_aborted() -> None:
     batch = scheduler.schedule()
     assert batch is not None
 
-    with pytest.raises(RuntimeError, match="abort or complete"):
+    with pytest.raises(RuntimeError, match="iteration is in flight"):
         scheduler.cancel("a")
 
     scheduler.abort(batch)
     assert scheduler.cancel("a") is True
+
+
+def test_cancel_rejects_any_active_request_while_an_iteration_is_inflight() -> None:
+    scheduler = ContinuousBatchingScheduler(page_size=2, num_pages=4, max_batch_size=2)
+    scheduler.submit("decoding", prompt_length=1, max_new_tokens=1)
+    first_prefill = scheduler.schedule()
+    assert first_prefill is not None
+    scheduler.complete(first_prefill)
+    scheduler.submit("replacement", prompt_length=1, max_new_tokens=1)
+    replacement_prefill = scheduler.schedule()
+    assert replacement_prefill is not None
+    assert replacement_prefill.request_ids == ("replacement",)
+
+    with pytest.raises(RuntimeError, match="iteration is in flight"):
+        scheduler.cancel("decoding")
+
+    scheduler.abort(replacement_prefill)
+    assert scheduler.cancel("decoding") is True
 
 
 def test_scheduler_rejects_stale_batches_and_duplicate_requests() -> None:
