@@ -132,12 +132,8 @@ def _call_raw_moe(
     )
 
 
-def _noncontiguous_empty_like(tensor: Tensor) -> Tensor:
-    return torch.empty(
-        (*tensor.shape, 2),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )[..., 0]
+def _noncontiguous_view(tensor: Tensor) -> Tensor:
+    return tensor.as_strided(tensor.shape, (0, *tensor.stride()[1:]))
 
 
 def test_raw_moe_operator_schema_is_always_defined() -> None:
@@ -280,9 +276,9 @@ def test_raw_moe_fake_rejects_noncontiguous_inputs(index: int) -> None:
         inputs = list(_raw_moe_inputs())
         score_bias = torch.empty(EXPERTS, dtype=torch.float32)
         if index < len(inputs):
-            inputs[index] = _noncontiguous_empty_like(inputs[index])
+            inputs[index] = _noncontiguous_view(inputs[index])
         else:
-            score_bias = _noncontiguous_empty_like(score_bias)
+            score_bias = _noncontiguous_view(score_bias)
 
         with pytest.raises(RuntimeError):
             _call_raw_moe(tuple(inputs), score_bias=score_bias)
@@ -1034,7 +1030,7 @@ def test_explicit_cuda_rejects_every_ineligible_policy_case_without_native(
             inputs = list(_raw_moe_inputs(dtype=dtype, device="cuda"))
             score_func = "softmax" if case == "softmax" else "sigmoid"
             if case == "noncontiguous":
-                inputs[0] = _noncontiguous_empty_like(inputs[0])
+                inputs[0] = _noncontiguous_view(inputs[0])
             elif case == "requires_grad":
                 inputs[0].requires_grad_(True)
             elif case == "missing_native":
