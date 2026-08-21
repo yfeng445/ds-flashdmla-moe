@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -28,7 +28,11 @@ from .version import __version__
 AttentionBenchmarkBackend = Literal[
     "auto",
     "cuda",
+    "cuda_rowwise",
     "reference",
+    "blockwise",
+    "fa1",
+    "fa2",
     "sdpa",
     "flash-attn-4",
 ]
@@ -71,8 +75,28 @@ class AttentionBenchmarkConfig:
             raise ValueError("causal benchmark requires query_length <= key_length")
         if self.dtype not in {"float16", "bfloat16", "float32", "float64"}:
             raise ValueError("dtype must be float16, bfloat16, float32, or float64")
-        if self.backend not in {"auto", "cuda", "reference", "sdpa", "flash-attn-4"}:
-            raise ValueError("backend must be auto, cuda, reference, sdpa, or flash-attn-4")
+        if self.backend not in {
+            "auto",
+            "cuda",
+            "cuda_rowwise",
+            "reference",
+            "blockwise",
+            "fa1",
+            "fa2",
+            "sdpa",
+            "flash-attn-4",
+        }:
+            raise ValueError(
+                "backend must be auto, cuda, cuda_rowwise, reference, blockwise, fa1, fa2, "
+                "sdpa, or flash-attn-4"
+            )
+        if self.backend in {"fa1", "fa2"}:
+            try:
+                device_type = torch.device(self.device).type
+            except RuntimeError as error:
+                raise ValueError("device must be a valid torch device") from error
+            if device_type != "cuda" or self.dtype != "float16":
+                raise ValueError("formal FA benchmarks require CUDA float16")
         if self.backend == "flash-attn-4":
             try:
                 device_type = torch.device(self.device).type
@@ -458,6 +482,11 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
         notes.append(
             "latency includes the BHSD-to-BSHD layout adapter and contiguous BHSD output copy"
         )
+    elif config.backend in {"fa1", "fa2"}:
+        notes.append(
+            f"backend={config.backend} is a repository teaching kernel using FP32 accumulation "
+            "and no Tensor Cores"
+        )
     report = {
         "schema_version": 1,
         "configuration": asdict(config),
@@ -477,6 +506,25 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
     if backend_metadata is not None:
         report["external_backend"] = backend_metadata
     return report
+
+
+def benchmark_attention_backends(
+    config: AttentionBenchmarkConfig,
+    backends: tuple[AttentionBenchmarkBackend, ...],
+) -> dict[str, Any]:
+    """Benchmark multiple backends with identical seeds and dimensions."""
+
+    if not backends or len(set(backends)) != len(backends):
+        raise ValueError("comparison backends must be non-empty and unique")
+    reports = {
+        backend: benchmark_attention(replace(config, backend=backend)) for backend in backends
+    }
+    return {
+        "schema_version": 1,
+        "comparison_backends": list(backends),
+        "shared_seed": config.seed,
+        "reports": reports,
+    }
 
 
 def write_benchmark_report(report: dict[str, Any], path: str | Path | None) -> None:

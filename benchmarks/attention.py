@@ -7,6 +7,7 @@ import argparse
 from ds_flash_mla_moe.benchmarking import (
     AttentionBenchmarkConfig,
     benchmark_attention,
+    benchmark_attention_backends,
     write_benchmark_report,
 )
 
@@ -28,8 +29,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--causal", action="store_true")
     parser.add_argument(
         "--backend",
-        choices=("auto", "cuda", "reference", "sdpa", "flash-attn-4"),
+        choices=(
+            "auto",
+            "cuda",
+            "cuda_rowwise",
+            "reference",
+            "blockwise",
+            "fa1",
+            "fa2",
+            "sdpa",
+            "flash-attn-4",
+        ),
         default="auto",
+    )
+    parser.add_argument(
+        "--compare-fa1-fa2",
+        action="store_true",
+        help="benchmark formal FA1 and FA2 with the same seed and dimensions",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
@@ -41,7 +57,10 @@ def parse_args() -> argparse.Namespace:
         help="skip the independent materialized reference check",
     )
     parser.add_argument("--output", help="write JSON to this path instead of stdout")
-    return parser.parse_args()
+    arguments = parser.parse_args()
+    if arguments.compare_fa1_fa2 and arguments.backend != parser.get_default("backend"):
+        parser.error("--compare-fa1-fa2 cannot be combined with a non-default --backend")
+    return arguments
 
 
 def main() -> None:
@@ -63,7 +82,12 @@ def main() -> None:
         reference_block_size=arguments.reference_block_size,
         verify=not arguments.no_verify,
     )
-    write_benchmark_report(benchmark_attention(config), arguments.output)
+    report = (
+        benchmark_attention_backends(config, ("fa1", "fa2"))
+        if arguments.compare_fa1_fa2
+        else benchmark_attention(config)
+    )
+    write_benchmark_report(report, arguments.output)
 
 
 if __name__ == "__main__":

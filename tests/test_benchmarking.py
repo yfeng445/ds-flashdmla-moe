@@ -1,16 +1,141 @@
 import json
+import sys
+from typing import get_args
 
 import pytest
 import torch
 
+from benchmarks import attention as attention_cli
 from ds_flash_mla_moe import benchmarking
 from ds_flash_mla_moe.benchmarking import (
+    AttentionBenchmarkBackend,
     AttentionBenchmarkConfig,
     attention_work_estimate,
     benchmark_attention,
     summarize_latencies,
     write_benchmark_report,
 )
+
+
+def test_attention_benchmark_backend_names_cover_facade_and_baselines() -> None:
+    assert get_args(AttentionBenchmarkBackend) == (
+        "auto",
+        "cuda",
+        "cuda_rowwise",
+        "reference",
+        "blockwise",
+        "fa1",
+        "fa2",
+        "sdpa",
+        "flash-attn-4",
+    )
+
+
+def test_formal_fa_benchmark_requires_cuda_float16() -> None:
+    with pytest.raises(ValueError, match="CUDA float16"):
+        AttentionBenchmarkConfig(backend="fa1", device="cpu", dtype="float16").validate()
+    with pytest.raises(ValueError, match="CUDA float16"):
+        AttentionBenchmarkConfig(backend="fa2", device="cuda", dtype="float32").validate()
+
+
+def test_paired_benchmark_uses_the_same_configuration(monkeypatch) -> None:
+    seen = []
+
+    def fake_benchmark(config):
+        seen.append(config)
+        return {
+            "configuration": {"backend": config.backend},
+            "raw_samples_ms": [1.0],
+        }
+
+    monkeypatch.setattr(benchmarking, "benchmark_attention", fake_benchmark)
+    base = AttentionBenchmarkConfig(
+        backend="fa1",
+        device="cuda",
+        dtype="float16",
+        seed=17,
+        query_length=31,
+        key_length=47,
+    )
+    report = benchmarking.benchmark_attention_backends(base, ("fa1", "fa2"))
+
+    assert [config.backend for config in seen] == ["fa1", "fa2"]
+    assert all(config.seed == 17 for config in seen)
+    assert all(config.query_length == 31 for config in seen)
+    assert all(config.key_length == 47 for config in seen)
+    assert report == {
+        "schema_version": 1,
+        "comparison_backends": ["fa1", "fa2"],
+        "shared_seed": 17,
+        "reports": {
+            "fa1": {
+                "configuration": {"backend": "fa1"},
+                "raw_samples_ms": [1.0],
+            },
+            "fa2": {
+                "configuration": {"backend": "fa2"},
+                "raw_samples_ms": [1.0],
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("backends", [(), ("fa1", "fa1")])
+def test_paired_benchmark_requires_nonempty_unique_backends(backends) -> None:
+    with pytest.raises(ValueError, match="non-empty and unique"):
+        benchmarking.benchmark_attention_backends(AttentionBenchmarkConfig(), backends)
+
+
+def test_cli_parses_fa_backends_and_comparison_flag(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["attention.py", "--backend", "fa2"])
+    assert attention_cli.parse_args().backend == "fa2"
+
+    monkeypatch.setattr(sys, "argv", ["attention.py", "--compare-fa1-fa2"])
+    arguments = attention_cli.parse_args()
+    assert arguments.backend == "auto"
+    assert arguments.compare_fa1_fa2 is True
+
+
+def test_cli_rejects_comparison_with_conflicting_backend(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["attention.py", "--backend", "fa1", "--compare-fa1-fa2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        attention_cli.parse_args()
+
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_cli_comparison_writes_paired_report(monkeypatch) -> None:
+    captured = {}
+
+    def fake_paired_benchmark(config, backends):
+        captured["config"] = config
+        captured["backends"] = backends
+        return {"comparison_backends": list(backends)}
+
+    def fake_writer(report, path):
+        captured["report"] = report
+        captured["path"] = path
+
+    monkeypatch.setattr(sys, "argv", ["attention.py", "--compare-fa1-fa2"])
+    monkeypatch.setattr(attention_cli, "benchmark_attention_backends", fake_paired_benchmark)
+    monkeypatch.setattr(
+        attention_cli,
+        "benchmark_attention",
+        lambda _config: pytest.fail("comparison must not run a single backend report"),
+    )
+    monkeypatch.setattr(attention_cli, "write_benchmark_report", fake_writer)
+
+    attention_cli.main()
+
+    assert captured["config"].backend == "auto"
+    assert captured["backends"] == ("fa1", "fa2")
+    assert captured["report"] == {"comparison_backends": ["fa1", "fa2"]}
+    assert captured["path"] is None
 
 
 def test_latency_summary_uses_interpolated_percentiles() -> None:
