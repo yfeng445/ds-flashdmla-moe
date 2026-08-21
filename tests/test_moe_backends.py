@@ -26,6 +26,35 @@ TOPK_GROUPS = 1
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_reader_docs_describe_the_whole_layer_moe_milestone_honestly() -> None:
+    reader_docs = (
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "docs" / "chapters" / "04-deepseek-moe.md",
+        REPO_ROOT / "docs" / "chapters" / "06-pytorch-custom-operators.md",
+        REPO_ROOT / "docs" / "chapters" / "07-benchmarking-and-roofline.md",
+    )
+
+    for document in reader_docs:
+        source = document.read_text(encoding="utf-8")
+        assert "deepseek_moe_forward" in source, document
+        assert "single-device" in source, document
+        assert "staged" in source, document
+        assert "correctness-first" in source, document
+
+
+def test_cuda_build_gate_includes_formal_attention_and_whole_layer_moe_ops() -> None:
+    workflow_source = (
+        REPO_ROOT / ".github" / "workflows" / "cuda-build.yml"
+    ).read_text(encoding="utf-8")
+
+    for operator in (
+        "attention_fa1_forward",
+        "attention_fa2_forward",
+        "deepseek_moe_forward",
+    ):
+        assert f'"{operator}"' in workflow_source
+
+
 def test_whole_layer_cuda_sources_are_packaged_and_registered() -> None:
     cuda_source = REPO_ROOT / "csrc" / "moe" / "deepseek_moe_forward_cuda.cu"
     host_header = REPO_ROOT / "csrc" / "moe" / "moe_cuda_ops.h"

@@ -375,6 +375,33 @@ F_{router}=2TDE,
 CUDA 验证还必须要求 indices 与稳定 tie-break reference 完全一致；只比较归一化 weights
 可能让选错但分数相同的 expert 漏过测试。
 
+### 7.9.1 Whole-layer MoE forward evidence
+
+`benchmarks/moe.py` 对公开 `deepseek_moe_forward` 调用计时。CUDA v1 是 single-device、
+staged、correctness-first 的 whole-layer forward，因此性能实验应显式选择 strict CUDA
+backend，避免 `auto` fallback 把 reference latency 混入结果：
+
+```bash
+python benchmarks/moe.py \
+  --device cuda --backend cuda --dtype float32 \
+  --tokens 128 --model-dim 64 --hidden-dim 128 \
+  --experts 8 --topk 2 --n-groups 1 --topk-groups 1 \
+  --warmup 5 --iterations 50 \
+  --output benchmark-results/deepseek-moe-forward.json
+```
+
+报告的 `raw_samples_ms`/`latency` 覆盖整个 facade call，而 input creation、独立 route 分析和
+reference verification 都在计时区间外。`route_distribution.values` 保存实际负载；
+`intermediate_bytes` 则按 dense scores、packed activations/weights/indices、expert hidden state
+与 contributions 分项记录 materialized-buffer 大小。该字段带 `analytical_only=true`，不是
+allocator 峰值、DRAM traffic 或 profiler counter。
+
+一个 `ds_flash_mla_moe::deepseek_moe_forward` dispatcher event 也不是单 launch 证据：当前
+编排内部仍会启动 route、pack、offset scan/cat、expert 与 combine 等多个工作项。若要报告
+launch 数、重叠或 kernel 时间，必须另存 Kineto/Nsight timeline，并把它和上述 whole-call
+event samples 区分。报告固定写入 `implementation=single_device_staged` 与
+`performance_claim=false`；在真实 shape、基线和 profiler 证据齐全前，不据此作 speed claim。
+
 ## 7.10 阶段分解不是端到端求和
 
 分布式流水线可以为每个阶段记录独立 latency，但需区分两种 max：
