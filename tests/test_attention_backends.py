@@ -175,6 +175,72 @@ def test_fa3_operator_fake_rejects_unsupported_shape_or_dtype(contract_break: st
             torch.ops.ds_flash_mla_moe.attention_fa3_forward.default(q, k, v, False, 65**-0.5)
 
 
+@pytest.mark.parametrize("noncontiguous_input", ["q", "k", "v"])
+def test_fa3_operator_fake_rejects_each_noncontiguous_input(
+    noncontiguous_input: str,
+) -> None:
+    with FakeTensorMode():
+        q = torch.randn(1, 2, 7, 65, dtype=torch.float16)
+        k = torch.randn(1, 2, 11, 65, dtype=torch.float16)
+        v = torch.randn(1, 2, 11, 33, dtype=torch.float16)
+        if noncontiguous_input == "q":
+            q = torch.randn(1, 2, 7, 130, dtype=torch.float16)[..., ::2]
+        elif noncontiguous_input == "k":
+            k = torch.randn(1, 2, 11, 130, dtype=torch.float16)[..., ::2]
+        else:
+            v = torch.randn(1, 2, 11, 66, dtype=torch.float16)[..., ::2]
+        assert not {"q": q, "k": k, "v": v}[noncontiguous_input].is_contiguous()
+
+        with pytest.raises(RuntimeError, match="contiguous"):
+            torch.ops.ds_flash_mla_moe.attention_fa3_forward.default(q, k, v, False, 65**-0.5)
+
+
+@pytest.mark.parametrize("scale", [float("nan"), float("inf"), float("-inf")])
+def test_fa3_operator_fake_rejects_nonfinite_scale(scale: float) -> None:
+    with FakeTensorMode():
+        q = torch.randn(1, 2, 7, 65, dtype=torch.float16)
+        k = torch.randn(1, 2, 11, 65, dtype=torch.float16)
+        v = torch.randn(1, 2, 11, 33, dtype=torch.float16)
+
+        with pytest.raises(RuntimeError, match="scale must be finite"):
+            torch.ops.ds_flash_mla_moe.attention_fa3_forward.default(q, k, v, False, scale)
+
+
+def test_auto_attention_probes_only_rowwise_even_if_fa3_would_be_eligible(
+    monkeypatch,
+) -> None:
+    q, k, v = _cpu_inputs()
+    blockwise_output = torch.full((1, 2, 3, 4), 7.0)
+    probed_backends: list[str] = []
+
+    def fake_ineligibility_reason(backend, *_args, **_kwargs):
+        probed_backends.append(backend)
+        return None if backend == "fa3" else "rowwise unavailable"
+
+    monkeypatch.setattr(
+        attention_ops,
+        "_attention_backend_ineligibility_reason",
+        fake_ineligibility_reason,
+    )
+    monkeypatch.setattr(
+        attention_ops,
+        "blockwise_attention",
+        lambda *_args, **_kwargs: blockwise_output,
+    )
+
+    actual = flash_attention_forward(q, k, v, backend="auto")
+
+    assert actual is blockwise_output
+    assert probed_backends == ["cuda_rowwise"]
+
+
+def test_invalid_attention_backend_diagnostic_lists_cuda_alias() -> None:
+    q, k, v = _cpu_inputs()
+
+    with pytest.raises(ValueError, match="auto, cuda, cuda_rowwise"):
+        flash_attention_forward(q, k, v, backend="invalid")  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("backend", "expected_operator"),
     [

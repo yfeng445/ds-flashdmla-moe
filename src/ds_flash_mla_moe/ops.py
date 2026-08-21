@@ -262,8 +262,13 @@ def _fake_formal_attention_forward(
     torch._check(q.ndim == 4 and k.ndim == 4 and v.ndim == 4)
     torch._check(q.dtype == torch.float16)
     torch._check(k.dtype == q.dtype and v.dtype == q.dtype)
+    torch._check(
+        all(tensor.is_contiguous() for tensor in (q, k, v)),
+        lambda: "teaching FA1/FA2/FA3 forward kernels require contiguous tensors",
+    )
     torch._check(q.shape[-1] <= 128 and v.shape[-1] <= 128)
     torch._check(k.shape[-2] > 0)
+    torch._check(math.isfinite(scale), lambda: "scale must be finite")
     return output
 
 
@@ -2445,7 +2450,7 @@ def flash_attention_forward(
     }
     if backend not in valid:
         raise ValueError(
-            "backend must be auto, cuda_rowwise, reference, blockwise, fa1, fa2, or fa3"
+            "backend must be auto, cuda, cuda_rowwise, reference, blockwise, fa1, fa2, or fa3"
         )
     if backend == "cuda":
         warnings.warn(
