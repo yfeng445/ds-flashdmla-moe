@@ -41,6 +41,19 @@ def test_reader_docs_describe_the_whole_layer_moe_milestone_honestly() -> None:
         assert "staged" in source, document
         assert "correctness-first" in source, document
 
+    future_work_statement = (
+        "persistent scheduling, full fusion, and one-sided multi-GPU "
+        "communication remain future work"
+    )
+    future_work_docs = reader_docs[:2]
+    missing_statement = [
+        document
+        for document in future_work_docs
+        if future_work_statement
+        not in " ".join(document.read_text(encoding="utf-8").split())
+    ]
+    assert not missing_statement, missing_statement
+
 
 def test_cuda_build_gate_includes_formal_attention_and_whole_layer_moe_ops() -> None:
     workflow_source = (

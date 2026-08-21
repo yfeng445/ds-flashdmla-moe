@@ -50,8 +50,9 @@ or profiler-driven tuning against cuBLAS/CUTLASS.
 behind one public call. CUDA v1 is a single-device, staged, correctness-first
 whole-layer forward that makes multiple internal launches. It accepts contiguous
 CUDA FP32 tensors, sigmoid scoring, no `requires_grad`, and deterministic mode
-disabled. It is not the future FlashMoE target: persistent scheduling, dedicated
-tile scheduling, and one-sided multi-GPU communication remain follow-up work.
+disabled. It is not the future FlashMoE target: persistent scheduling, full fusion,
+and one-sided multi-GPU communication remain future work; dedicated tile scheduling
+remains future work as well.
 
 ## Quick start
 

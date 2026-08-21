@@ -334,9 +334,10 @@ CUDA 路径只接受 contiguous CUDA FP32、sigmoid scoring、无 `requires_grad
 deterministic algorithms 关闭。`reference` 总是执行 packed PyTorch 规范，`cuda` 对不满足契约
 的输入报错，`auto` 才允许在不满足 CUDA v1 契约时回退。
 
-真正的 FlashMoE 后续目标还包括 persistent scheduling、跨 expert 的 tile scheduling，以及
-one-sided multi-GPU communication；当前实现没有这些机制，不能据此宣称 fused 或持久化
-FlashMoE 性能。前文 router/expert 的 backward 只描述各自既有的实验性 stage 语境；新的
+真正的 FlashMoE 后续目标还包括跨 expert 的 tile scheduling。明确地说，persistent
+scheduling, full fusion, and one-sided multi-GPU communication remain future work；当前实现
+没有这些机制，不能据此宣称 fused 或持久化 FlashMoE 性能。前文 router/expert 的 backward
+只描述各自既有的实验性 stage 语境；新的
 whole-layer raw operator 是 forward-only，本节不把它描述为可训练算子。
 
 ## 4.10 Capacity factor 的丢弃—填充平衡
