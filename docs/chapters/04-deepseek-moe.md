@@ -315,30 +315,34 @@ CUDA-core/WMMA engine、multiplicand/accumulator/materialized-hidden dtype 与�
 
 ### 4.9.3 Whole-layer single-device forward milestone
 
-公开入口 `deepseek_moe_forward(..., backend="reference"|"cuda"|"auto")` 把本章已经
-分别验证过的阶段串成一条完整路径：
+公开入口 `deepseek_moe_forward` 支持 `reference`、`cuda_staged`、`cuda_fused`、
+`cuda_persistent`、`cuda` 和 `auto`，把本章已经分别验证过的阶段串成完整路径：
 
 ```text
 route -> pack -> offsets -> expert -> combine
 ```
 
-CUDA v1 的编排位于
+`cuda_staged` 的编排位于
 [`csrc/moe/deepseek_moe_forward_cuda.cu`](../../csrc/moe/deepseek_moe_forward_cuda.cu)。
 它先调用 grouped Top-K 和 route-pack，随后用 device 上的 `zeros`、`cumsum` 与 `cat`
 建立 expert offsets，再调用 active-row SwiGLU expert，最后从 packed route id 导出 token
 index 并 combine。一次公开调用因此仍包含多个 ATen/kernel launch，也会物化 scores、packed
 rows、offsets、hidden state 与 contributions；“一个 raw operator”不等于“一个 kernel”。
 
-这个里程碑应准确称为 **single-device、staged、correctness-first** whole-layer forward。
-CUDA 路径只接受 contiguous CUDA FP32、sigmoid scoring、无 `requires_grad` 的输入，并要求
-deterministic algorithms 关闭。`reference` 总是执行 packed PyTorch 规范，`cuda` 对不满足契约
-的输入报错，`auto` 才允许在不满足 CUDA v1 契约时回退。
+`cuda_fused` 使用 private single-device histogram/scan/scatter pack，直接返回 packed
+activations、route weights、token indices 和 expert offsets；down projection 的 epilogue
+按 route weight atomic-add 到最终 `[T,D]` output，因此不物化 contributions，也不调用公开
+combine。`cuda_persistent` 在同一 expert core 上增加 occupancy-bounded device task queue，
+小 route count 仍回退到 fused scheduler。router 继续作为独立阶段。
 
-真正的 FlashMoE 后续目标还包括跨 expert 的 tile scheduling。明确地说，persistent
-scheduling, full fusion, and one-sided multi-GPU communication remain future work；当前实现
-没有这些机制，不能据此宣称 fused 或持久化 FlashMoE 性能。前文 router/expert 的 backward
-只描述各自既有的实验性 stage 语境；新的
-whole-layer raw operator 是 forward-only，本节不把它描述为可训练算子。
+这些路径都应准确称为 **single-device、correctness-first** whole-layer forward，其中
+`cuda_staged` 保留 staged 比较语义。它们只接受 contiguous CUDA FP32、sigmoid scoring、
+无 `requires_grad` 的输入，并要求 deterministic algorithms 关闭。`cuda` 是 `cuda_fused`
+兼容别名；显式 backend 不回退；`auto` 优先 fused、必要时选择 staged，但不会自动选择
+persistent。The persistent variant is a single-device expert core, not a distributed FlashMoE
+megakernel。one-sided multi-GPU communication 与完整 scheduler/subscriber/processor 协议仍是
+future work；这里不据此宣称分布式 FlashMoE 或性能优势。新的 whole-layer raw operators
+仍是 forward-only，本节不把它们描述为可训练算子。
 
 ## 4.10 Capacity factor 的丢弃—填充平衡
 

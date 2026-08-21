@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -20,6 +21,8 @@ namespace {
 constexpr int kTile = 16;
 constexpr int kOffsetThreads = 128;
 constexpr int kWarpThreads = 32;
+constexpr int kFusedThreads = 256;
+constexpr int64_t kPersistentSmallWorkRoutes = 8;
 
 __host__ __device__ int64_t ceil_div_positive(int64_t value, int64_t divisor) {
   return value / divisor + static_cast<int64_t>(value % divisor != 0);
@@ -95,6 +98,25 @@ __device__ int64_t task_expert(
   }
   assert(lower >= 0 && lower < experts);
   assert(task_offsets[lower] <= task && task < task_offsets[lower + 1]);
+  return lower;
+}
+
+__device__ int64_t packed_row_expert(
+    int64_t row,
+    const int64_t* __restrict__ expert_offsets,
+    int64_t experts) {
+  int64_t lower = 0;
+  int64_t upper = experts;
+  while (lower < upper) {
+    const int64_t middle = lower + (upper - lower) / 2;
+    if (expert_offsets[middle + 1] <= row) {
+      lower = middle + 1;
+    } else {
+      upper = middle;
+    }
+  }
+  assert(lower >= 0 && lower < experts);
+  assert(expert_offsets[lower] <= row && row < expert_offsets[lower + 1]);
   return lower;
 }
 
@@ -237,6 +259,218 @@ __global__ void swiglu_down_grouped_tiled_float_kernel(
     if (row < expert_end && model < model_dim) {
       output[row * model_dim + model] = accumulator;
     }
+  }
+}
+
+__device__ void compute_fused_hidden_task(
+    int64_t task,
+    const float* __restrict__ activations,
+    const int64_t* __restrict__ expert_offsets,
+    const float* __restrict__ w1,
+    const float* __restrict__ w3,
+    float* __restrict__ hidden_state,
+    int64_t experts,
+    int64_t rows,
+    int64_t model_dim,
+    int64_t hidden_dim,
+    int64_t hidden_tiles) {
+  const int64_t row = task / hidden_tiles;
+  const int64_t hidden =
+      (task % hidden_tiles) * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  if (row >= rows || hidden >= hidden_dim) {
+    return;
+  }
+  const int64_t expert = packed_row_expert(row, expert_offsets, experts);
+  float gate = 0.0F;
+  float up = 0.0F;
+  const int64_t weight_base = (expert * hidden_dim + hidden) * model_dim;
+  const int64_t activation_base = row * model_dim;
+  for (int64_t model = 0; model < model_dim; ++model) {
+    const float activation = activations[activation_base + model];
+    gate = fmaf(activation, w1[weight_base + model], gate);
+    up = fmaf(activation, w3[weight_base + model], up);
+  }
+  hidden_state[row * hidden_dim + hidden] = gate * sigmoid_stable(gate) * up;
+}
+
+__device__ void compute_fused_down_task(
+    int64_t task,
+    const float* __restrict__ hidden_state,
+    const int64_t* __restrict__ expert_offsets,
+    const float* __restrict__ packed_weights,
+    const int64_t* __restrict__ token_indices,
+    const float* __restrict__ w2,
+    float* __restrict__ output,
+    int64_t experts,
+    int64_t rows,
+    int64_t token_count,
+    int64_t model_dim,
+    int64_t hidden_dim,
+    int64_t model_tiles) {
+  const int64_t row = task / model_tiles;
+  const int64_t model =
+      (task % model_tiles) * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  if (row >= rows || model >= model_dim) {
+    return;
+  }
+  const int64_t expert = packed_row_expert(row, expert_offsets, experts);
+  const int64_t token = token_indices[row];
+  assert(token >= 0 && token < token_count);
+  float down = 0.0F;
+  const int64_t hidden_base = row * hidden_dim;
+  const int64_t weight_base = (expert * model_dim + model) * hidden_dim;
+  for (int64_t hidden = 0; hidden < hidden_dim; ++hidden) {
+    down = fmaf(hidden_state[hidden_base + hidden], w2[weight_base + hidden], down);
+  }
+  atomicAdd(
+      output + token * model_dim + model,
+      down * packed_weights[row]);
+}
+
+__global__ void fused_hidden_float_kernel(
+    const float* __restrict__ activations,
+    const int64_t* __restrict__ expert_offsets,
+    const float* __restrict__ w1,
+    const float* __restrict__ w3,
+    float* __restrict__ hidden_state,
+    int64_t experts,
+    int64_t rows,
+    int64_t model_dim,
+    int64_t hidden_dim,
+    int64_t hidden_tiles,
+    int64_t task_count) {
+  for (int64_t task = blockIdx.x; task < task_count; task += gridDim.x) {
+    compute_fused_hidden_task(
+        task,
+        activations,
+        expert_offsets,
+        w1,
+        w3,
+        hidden_state,
+        experts,
+        rows,
+        model_dim,
+        hidden_dim,
+        hidden_tiles);
+  }
+}
+
+__global__ void fused_down_atomic_float_kernel(
+    const float* __restrict__ hidden_state,
+    const int64_t* __restrict__ expert_offsets,
+    const float* __restrict__ packed_weights,
+    const int64_t* __restrict__ token_indices,
+    const float* __restrict__ w2,
+    float* __restrict__ output,
+    int64_t experts,
+    int64_t rows,
+    int64_t token_count,
+    int64_t model_dim,
+    int64_t hidden_dim,
+    int64_t model_tiles,
+    int64_t task_count) {
+  for (int64_t task = blockIdx.x; task < task_count; task += gridDim.x) {
+    compute_fused_down_task(
+        task,
+        hidden_state,
+        expert_offsets,
+        packed_weights,
+        token_indices,
+        w2,
+        output,
+        experts,
+        rows,
+        token_count,
+        model_dim,
+        hidden_dim,
+        model_tiles);
+  }
+}
+
+// This bounded queue is a single-device expert core. It is deliberately not a
+// distributed FlashMoE megakernel: routing, transport, and remote scheduling
+// remain outside these two expert-stage kernels.
+__global__ void persistent_hidden_float_kernel(
+    const float* __restrict__ activations,
+    const int64_t* __restrict__ expert_offsets,
+    const float* __restrict__ w1,
+    const float* __restrict__ w3,
+    float* __restrict__ hidden_state,
+    int64_t* __restrict__ persistent_task_queue,
+    int64_t experts,
+    int64_t rows,
+    int64_t model_dim,
+    int64_t hidden_dim,
+    int64_t hidden_tiles,
+    int64_t task_count) {
+  __shared__ int64_t task;
+  while (true) {
+    if (threadIdx.x == 0) {
+      task = static_cast<int64_t>(atomicAdd(
+          reinterpret_cast<unsigned long long*>(persistent_task_queue),
+          static_cast<unsigned long long>(1)));
+    }
+    __syncthreads();
+    if (task >= task_count) {
+      break;
+    }
+    compute_fused_hidden_task(
+        task,
+        activations,
+        expert_offsets,
+        w1,
+        w3,
+        hidden_state,
+        experts,
+        rows,
+        model_dim,
+        hidden_dim,
+        hidden_tiles);
+    __syncthreads();
+  }
+}
+
+__global__ void persistent_down_atomic_float_kernel(
+    const float* __restrict__ hidden_state,
+    const int64_t* __restrict__ expert_offsets,
+    const float* __restrict__ packed_weights,
+    const int64_t* __restrict__ token_indices,
+    const float* __restrict__ w2,
+    float* __restrict__ output,
+    int64_t* __restrict__ persistent_task_queue,
+    int64_t experts,
+    int64_t rows,
+    int64_t token_count,
+    int64_t model_dim,
+    int64_t hidden_dim,
+    int64_t model_tiles,
+    int64_t task_count) {
+  __shared__ int64_t task;
+  while (true) {
+    if (threadIdx.x == 0) {
+      task = static_cast<int64_t>(atomicAdd(
+          reinterpret_cast<unsigned long long*>(persistent_task_queue),
+          static_cast<unsigned long long>(1)));
+    }
+    __syncthreads();
+    if (task >= task_count) {
+      break;
+    }
+    compute_fused_down_task(
+        task,
+        hidden_state,
+        expert_offsets,
+        packed_weights,
+        token_indices,
+        w2,
+        output,
+        experts,
+        rows,
+        token_count,
+        model_dim,
+        hidden_dim,
+        model_tiles);
+    __syncthreads();
   }
 }
 
@@ -501,6 +735,235 @@ int64_t launch_blocks(
   return task_upper_bound < bounded_target ? task_upper_bound : bounded_target;
 }
 
+int64_t occupancy_bounded_blocks(
+    int64_t task_count,
+    int active_blocks_per_multiprocessor,
+    const cudaDeviceProp* properties) {
+  TORCH_CHECK(
+      active_blocks_per_multiprocessor > 0,
+      "persistent expert kernel has zero occupancy");
+  const int64_t occupancy_target =
+      static_cast<int64_t>(properties->multiProcessorCount) *
+      active_blocks_per_multiprocessor;
+  const int64_t device_bound = occupancy_target < properties->maxGridSize[0]
+      ? occupancy_target
+      : properties->maxGridSize[0];
+  return task_count < device_bound ? task_count : device_bound;
+}
+
+at::Tensor swiglu_experts_fused_cuda(
+    const at::Tensor& activations,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& packed_weights,
+    const at::Tensor& token_indices,
+    const at::Tensor& expert_w1,
+    const at::Tensor& expert_w2,
+    const at::Tensor& expert_w3,
+    int64_t token_count,
+    bool request_persistent) {
+  TORCH_CHECK(
+      !at::globalContext().deterministicAlgorithms(),
+      "the fused CUDA experts use atomic output accumulation; disable deterministic "
+      "algorithms or use the reference backend");
+  check_cuda_expert_tensor(activations, "activations");
+  check_cuda_expert_tensor(expert_w1, "expert_w1");
+  check_cuda_expert_tensor(expert_w2, "expert_w2");
+  check_cuda_expert_tensor(expert_w3, "expert_w3");
+  TORCH_CHECK(activations.scalar_type() == at::kFloat,
+              "fused activations must use float32");
+  TORCH_CHECK(expert_w1.scalar_type() == at::kFloat &&
+                  expert_w2.scalar_type() == at::kFloat &&
+                  expert_w3.scalar_type() == at::kFloat,
+              "fused expert weights must use float32");
+  TORCH_CHECK(expert_offsets.is_cuda(), "expert_offsets must be a CUDA tensor");
+  TORCH_CHECK(packed_weights.is_cuda(), "packed_weights must be a CUDA tensor");
+  TORCH_CHECK(token_indices.is_cuda(), "token_indices must be a CUDA tensor");
+  TORCH_CHECK(expert_offsets.scalar_type() == at::kLong,
+              "expert_offsets must use int64");
+  TORCH_CHECK(packed_weights.scalar_type() == at::kFloat,
+              "packed_weights must use float32");
+  TORCH_CHECK(token_indices.scalar_type() == at::kLong,
+              "token_indices must use int64");
+  TORCH_CHECK(
+      expert_offsets.is_contiguous() && packed_weights.is_contiguous() &&
+          token_indices.is_contiguous(),
+      "fused expert metadata must be contiguous");
+  TORCH_CHECK(
+      activations.device() == expert_offsets.device() &&
+          activations.device() == packed_weights.device() &&
+          activations.device() == token_indices.device() &&
+          activations.device() == expert_w1.device() &&
+          activations.device() == expert_w2.device() &&
+          activations.device() == expert_w3.device(),
+      "fused expert tensors must be on the same CUDA device");
+  TORCH_CHECK(activations.dim() == 2,
+              "activations must have shape [rows, model_dim]");
+  TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a vector");
+  TORCH_CHECK(packed_weights.dim() == 1, "packed_weights must be a vector");
+  TORCH_CHECK(token_indices.dim() == 1, "token_indices must be a vector");
+  TORCH_CHECK(expert_w1.dim() == 3 && expert_w2.dim() == 3 && expert_w3.dim() == 3,
+              "expert weights must be rank-3 tensors");
+
+  const int64_t experts = expert_w1.size(0);
+  const int64_t hidden_dim = expert_w1.size(1);
+  const int64_t model_dim = expert_w1.size(2);
+  const int64_t rows = activations.size(0);
+  TORCH_CHECK(experts > 0, "experts must be positive");
+  TORCH_CHECK(experts < INT64_MAX, "experts + 1 overflows int64");
+  TORCH_CHECK(model_dim > 0 && hidden_dim > 0,
+              "model_dim and hidden_dim must be positive");
+  TORCH_CHECK(activations.size(1) == model_dim,
+              "activation model dimension does not match expert weights");
+  TORCH_CHECK(expert_w3.sizes() == expert_w1.sizes(),
+              "expert_w3 shape must match expert_w1");
+  TORCH_CHECK(
+      expert_w2.size(0) == experts && expert_w2.size(1) == model_dim &&
+          expert_w2.size(2) == hidden_dim,
+      "expert_w2 must have shape [experts, model_dim, hidden_dim]");
+  TORCH_CHECK(expert_offsets.numel() == experts + 1,
+              "expert_offsets must have shape [experts + 1]");
+  TORCH_CHECK(packed_weights.numel() == rows && token_indices.numel() == rows,
+              "fused expert metadata row counts must match activations");
+  TORCH_CHECK(token_count >= 0, "token_count must be non-negative");
+  TORCH_CHECK(rows == 0 || token_count > 0,
+              "non-empty routed activations require a positive token_count");
+
+  // The private whole-layer caller generated expert_offsets on the same stream.
+  // Validate host-visible structure without device-to-host synchronization; the
+  // device assertions below are diagnostics rather than a public validation API.
+
+  const c10::cuda::CUDAGuard device_guard(activations.device());
+  const cudaStream_t stream =
+      at::cuda::getCurrentCUDAStream(activations.get_device());
+  const cudaDeviceProp* properties =
+      at::cuda::getDeviceProperties(activations.get_device());
+  auto output = at::zeros({token_count, model_dim}, activations.options());
+
+  const int64_t offset_items = experts + 1;
+  const int64_t offset_blocks_unbounded =
+      ceil_div_positive(offset_items, kOffsetThreads);
+  const int64_t offset_blocks = offset_blocks_unbounded < properties->maxGridSize[0]
+      ? offset_blocks_unbounded
+      : properties->maxGridSize[0];
+  validate_offsets_kernel<<<
+      static_cast<unsigned int>(offset_blocks), kOffsetThreads, 0, stream>>>(
+      expert_offsets.const_data_ptr<int64_t>(), experts, rows);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (rows == 0) {
+    return output;
+  }
+
+  const int64_t hidden_tiles = ceil_div_positive(hidden_dim, kFusedThreads);
+  const int64_t model_tiles = ceil_div_positive(model_dim, kFusedThreads);
+  TORCH_CHECK(rows <= INT64_MAX / hidden_tiles,
+              "fused hidden task count overflows int64");
+  TORCH_CHECK(rows <= INT64_MAX / model_tiles,
+              "fused down task count overflows int64");
+  const int64_t hidden_task_count = rows * hidden_tiles;
+  const int64_t down_task_count = rows * model_tiles;
+  auto hidden_state = at::empty({rows, hidden_dim}, activations.options());
+
+  const bool use_persistent = request_persistent && rows > kPersistentSmallWorkRoutes;
+  if (!use_persistent) {
+    const unsigned int hidden_blocks = static_cast<unsigned int>(
+        launch_blocks(hidden_task_count, properties));
+    const unsigned int down_blocks = static_cast<unsigned int>(
+        launch_blocks(down_task_count, properties));
+    fused_hidden_float_kernel<<<hidden_blocks, kFusedThreads, 0, stream>>>(
+        activations.const_data_ptr<float>(),
+        expert_offsets.const_data_ptr<int64_t>(),
+        expert_w1.const_data_ptr<float>(),
+        expert_w3.const_data_ptr<float>(),
+        hidden_state.mutable_data_ptr<float>(),
+        experts,
+        rows,
+        model_dim,
+        hidden_dim,
+        hidden_tiles,
+        hidden_task_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    fused_down_atomic_float_kernel<<<down_blocks, kFusedThreads, 0, stream>>>(
+        hidden_state.const_data_ptr<float>(),
+        expert_offsets.const_data_ptr<int64_t>(),
+        packed_weights.const_data_ptr<float>(),
+        token_indices.const_data_ptr<int64_t>(),
+        expert_w2.const_data_ptr<float>(),
+        output.mutable_data_ptr<float>(),
+        experts,
+        rows,
+        token_count,
+        model_dim,
+        hidden_dim,
+        model_tiles,
+        down_task_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+  }
+
+  auto persistent_task_queue = at::zeros({1}, expert_offsets.options());
+  int hidden_blocks_per_multiprocessor = 0;
+  int down_blocks_per_multiprocessor = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &hidden_blocks_per_multiprocessor,
+      persistent_hidden_float_kernel,
+      kFusedThreads,
+      0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &down_blocks_per_multiprocessor,
+      persistent_down_atomic_float_kernel,
+      kFusedThreads,
+      0));
+  const unsigned int persistent_hidden_blocks = static_cast<unsigned int>(
+      occupancy_bounded_blocks(
+          hidden_task_count,
+          hidden_blocks_per_multiprocessor,
+          properties));
+  const unsigned int persistent_down_blocks = static_cast<unsigned int>(
+      occupancy_bounded_blocks(
+          down_task_count,
+          down_blocks_per_multiprocessor,
+          properties));
+  persistent_hidden_float_kernel<<<
+      persistent_hidden_blocks, kFusedThreads, 0, stream>>>(
+      activations.const_data_ptr<float>(),
+      expert_offsets.const_data_ptr<int64_t>(),
+      expert_w1.const_data_ptr<float>(),
+      expert_w3.const_data_ptr<float>(),
+      hidden_state.mutable_data_ptr<float>(),
+      persistent_task_queue.mutable_data_ptr<int64_t>(),
+      experts,
+      rows,
+      model_dim,
+      hidden_dim,
+      hidden_tiles,
+      hidden_task_count);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_CUDA_CHECK(cudaMemsetAsync(
+      persistent_task_queue.mutable_data_ptr<int64_t>(),
+      0,
+      sizeof(int64_t),
+      stream));
+  persistent_down_atomic_float_kernel<<<
+      persistent_down_blocks, kFusedThreads, 0, stream>>>(
+      hidden_state.const_data_ptr<float>(),
+      expert_offsets.const_data_ptr<int64_t>(),
+      packed_weights.const_data_ptr<float>(),
+      token_indices.const_data_ptr<int64_t>(),
+      expert_w2.const_data_ptr<float>(),
+      output.mutable_data_ptr<float>(),
+      persistent_task_queue.mutable_data_ptr<int64_t>(),
+      experts,
+      rows,
+      token_count,
+      model_dim,
+      hidden_dim,
+      model_tiles,
+      down_task_count);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
+
 at::Tensor swiglu_experts_cuda(
     const at::Tensor& activations,
     const at::Tensor& expert_offsets,
@@ -702,6 +1165,48 @@ at::Tensor swiglu_experts_cuda_entry(
       expert_w1,
       expert_w2,
       expert_w3);
+}
+
+at::Tensor swiglu_experts_fused_cuda_entry(
+    const at::Tensor& activations,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& packed_weights,
+    const at::Tensor& token_indices,
+    const at::Tensor& expert_w1,
+    const at::Tensor& expert_w2,
+    const at::Tensor& expert_w3,
+    int64_t token_count) {
+  return swiglu_experts_fused_cuda(
+      activations,
+      expert_offsets,
+      packed_weights,
+      token_indices,
+      expert_w1,
+      expert_w2,
+      expert_w3,
+      token_count,
+      false);
+}
+
+at::Tensor swiglu_experts_persistent_cuda_entry(
+    const at::Tensor& activations,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& packed_weights,
+    const at::Tensor& token_indices,
+    const at::Tensor& expert_w1,
+    const at::Tensor& expert_w2,
+    const at::Tensor& expert_w3,
+    int64_t token_count) {
+  return swiglu_experts_fused_cuda(
+      activations,
+      expert_offsets,
+      packed_weights,
+      token_indices,
+      expert_w1,
+      expert_w2,
+      expert_w3,
+      token_count,
+      true);
 }
 
 }  // namespace ds_flash_mla_moe::moe

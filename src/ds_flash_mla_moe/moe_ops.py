@@ -11,8 +11,26 @@ from torch import Tensor
 from .moe import deepseek_moe_packed_reference
 from .ops import _operator_has_cuda_kernel
 
-MoEBackend = Literal["auto", "cuda", "reference"]
+MoEBackend = Literal[
+    "auto",
+    "cuda",
+    "cuda_staged",
+    "cuda_fused",
+    "cuda_persistent",
+    "reference",
+]
 MoEScoreFunction = Literal["sigmoid", "softmax"]
+
+_EXPLICIT_CUDA_MOE_OPERATORS = {
+    "cuda": "deepseek_moe_forward_fused",
+    "cuda_staged": "deepseek_moe_forward",
+    "cuda_fused": "deepseek_moe_forward_fused",
+    "cuda_persistent": "deepseek_moe_forward_persistent",
+}
+_AUTO_CUDA_MOE_OPERATORS = (
+    "deepseek_moe_forward_fused",
+    "deepseek_moe_forward",
+)
 
 
 def _validate_moe_inputs(
@@ -90,6 +108,8 @@ def _cuda_moe_ineligibility_reason(
     expert_w3: Tensor,
     score_func: str,
     score_bias: Tensor | None,
+    *,
+    operator: str = "deepseek_moe_forward_fused",
 ) -> str | None:
     tensors = (x, gate_weight, expert_w1, expert_w2, expert_w3)
     floating_tensors = tensors if score_bias is None else (*tensors, score_bias)
@@ -105,7 +125,7 @@ def _cuda_moe_ineligibility_reason(
         return "the CUDA whole-layer operator requires contiguous tensors"
     if torch.are_deterministic_algorithms_enabled():
         return "deterministic algorithms are enabled"
-    if not _operator_has_cuda_kernel("deepseek_moe_forward"):
+    if not _operator_has_cuda_kernel(operator):
         return "the loaded native extension does not register a CUDA DeepSeek MoE forward"
     return None
 
@@ -122,9 +142,10 @@ def _call_cuda_moe(
     topk_groups: int,
     score_bias: Tensor | None,
     route_scale: float,
+    operator: str = "deepseek_moe_forward_fused",
 ) -> Tensor:
     original_shape = x.shape
-    output = torch.ops.ds_flash_mla_moe.deepseek_moe_forward.default(
+    output = getattr(torch.ops.ds_flash_mla_moe, operator).default(
         x.reshape(-1, x.shape[-1]),
         gate_weight,
         expert_w1,
@@ -156,8 +177,10 @@ def deepseek_moe_forward(
 ) -> Tensor:
     """Evaluate a DeepSeek-style MoE through one strict backend selection."""
 
-    if backend not in {"auto", "cuda", "reference"}:
-        raise ValueError("backend must be auto, cuda, or reference")
+    if backend not in {"auto", *_EXPLICIT_CUDA_MOE_OPERATORS, "reference"}:
+        raise ValueError(
+            "backend must be auto, cuda, cuda_staged, cuda_fused, cuda_persistent, or reference"
+        )
     effective_topk_groups = _validate_moe_inputs(
         x,
         gate_weight,
@@ -186,18 +209,20 @@ def deepseek_moe_forward(
             route_scale=route_scale,
         ).contiguous()
 
-    reason = _cuda_moe_ineligibility_reason(
-        x,
-        gate_weight,
-        expert_w1,
-        expert_w2,
-        expert_w3,
-        score_func,
-        score_bias,
-    )
-    if backend == "cuda" and reason is not None:
-        raise RuntimeError(f"CUDA DeepSeek MoE is unavailable: {reason}")
-    if reason is None:
+    if backend != "auto":
+        operator = _EXPLICIT_CUDA_MOE_OPERATORS[backend]
+        reason = _cuda_moe_ineligibility_reason(
+            x,
+            gate_weight,
+            expert_w1,
+            expert_w2,
+            expert_w3,
+            score_func,
+            score_bias,
+            operator=operator,
+        )
+        if reason is not None:
+            raise RuntimeError(f"CUDA DeepSeek MoE is unavailable: {reason}")
         return _call_cuda_moe(
             x,
             gate_weight,
@@ -209,7 +234,34 @@ def deepseek_moe_forward(
             topk_groups=effective_topk_groups,
             score_bias=score_bias,
             route_scale=route_scale,
+            operator=operator,
         )
+
+    for operator in _AUTO_CUDA_MOE_OPERATORS:
+        reason = _cuda_moe_ineligibility_reason(
+            x,
+            gate_weight,
+            expert_w1,
+            expert_w2,
+            expert_w3,
+            score_func,
+            score_bias,
+            operator=operator,
+        )
+        if reason is None:
+            return _call_cuda_moe(
+                x,
+                gate_weight,
+                expert_w1,
+                expert_w2,
+                expert_w3,
+                topk=topk,
+                n_groups=n_groups,
+                topk_groups=effective_topk_groups,
+                score_bias=score_bias,
+                route_scale=route_scale,
+                operator=operator,
+            )
     return deepseek_moe_packed_reference(
         x,
         gate_weight,
@@ -226,6 +278,8 @@ def deepseek_moe_forward(
 
 
 def cuda_moe_available() -> bool:
-    """Return whether the native whole-layer CUDA operator is available."""
+    """Return whether the fused compatibility CUDA backend is available."""
 
-    return bool(torch.cuda.is_available() and _operator_has_cuda_kernel("deepseek_moe_forward"))
+    return bool(
+        torch.cuda.is_available() and _operator_has_cuda_kernel("deepseek_moe_forward_fused")
+    )

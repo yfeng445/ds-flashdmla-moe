@@ -65,6 +65,8 @@ jobs:
               "expert_major_pack",
               "grouped_topk",
               "deepseek_moe_forward",
+              "deepseek_moe_forward_fused",
+              "deepseek_moe_forward_persistent",
               "swiglu_experts",
               "tiled_gemm",
               "mla_absorbed_attention",

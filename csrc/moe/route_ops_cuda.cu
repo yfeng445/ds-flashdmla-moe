@@ -124,6 +124,72 @@ __global__ void pack_routes_float_kernel(
   }
 }
 
+__global__ void count_single_device_experts_kernel(
+    const int64_t* __restrict__ expert_indices,
+    int64_t* __restrict__ expert_offsets,
+    int64_t route_count,
+    int64_t experts) {
+  for (int64_t route = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       route < route_count;
+       route += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t expert = expert_indices[route];
+    assert(expert >= 0 && expert < experts);
+    atomicAdd(
+        reinterpret_cast<unsigned long long*>(expert_offsets + expert + 1),
+        static_cast<unsigned long long>(1));
+  }
+}
+
+__global__ void scan_single_device_expert_offsets_kernel(
+    int64_t* __restrict__ expert_offsets,
+    int64_t experts) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    int64_t prefix = 0;
+    expert_offsets[0] = 0;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      prefix += expert_offsets[expert + 1];
+      expert_offsets[expert + 1] = prefix;
+    }
+  }
+}
+
+__global__ void pack_single_device_routes_float_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ route_weights,
+    const int64_t* __restrict__ expert_indices,
+    const int64_t* __restrict__ expert_offsets,
+    int64_t* __restrict__ route_pack_cursors,
+    float* __restrict__ packed_activations,
+    float* __restrict__ packed_weights,
+    int64_t* __restrict__ token_indices,
+    int64_t route_count,
+    int64_t topk,
+    int64_t model_dim,
+    int64_t experts) {
+  const int64_t route = static_cast<int64_t>(blockIdx.x);
+  if (route >= route_count) {
+    return;
+  }
+
+  const int64_t expert = expert_indices[route];
+  assert(expert >= 0 && expert < experts);
+  __shared__ int64_t packed_row;
+  if (threadIdx.x == 0) {
+    const auto local_row = atomicAdd(
+        reinterpret_cast<unsigned long long*>(route_pack_cursors + expert),
+        static_cast<unsigned long long>(1));
+    packed_row = expert_offsets[expert] + static_cast<int64_t>(local_row);
+    packed_weights[packed_row] = route_weights[route];
+    token_indices[packed_row] = route / topk;
+  }
+  __syncthreads();
+
+  const int64_t token = route / topk;
+  for (int64_t column = threadIdx.x; column < model_dim; column += blockDim.x) {
+    packed_activations[packed_row * model_dim + column] = x[token * model_dim + column];
+  }
+}
+
 __global__ void combine_routes_float_kernel(
     const float* __restrict__ contributions,
     const float* __restrict__ route_weights,
@@ -288,6 +354,102 @@ route_pack_cuda(
       rank_counts};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+single_device_route_pack_cuda(
+    const at::Tensor& x,
+    const at::Tensor& route_weights,
+    const at::Tensor& expert_indices,
+    int64_t experts) {
+  TORCH_CHECK(
+      !at::globalContext().deterministicAlgorithms(),
+      "native single-device route pack uses atomic row assignment; disable "
+      "deterministic algorithms or use the reference pack");
+  check_cuda_float_tensor(x, "x");
+  check_cuda_float_tensor(route_weights, "route_weights");
+  check_cuda_long_tensor(expert_indices, "expert_indices");
+  TORCH_CHECK(
+      x.device() == route_weights.device() && x.device() == expert_indices.device(),
+      "all single-device route-pack tensors must be on the same CUDA device");
+  TORCH_CHECK(x.dim() == 2, "x must have shape [tokens, model_dim]");
+  TORCH_CHECK(
+      route_weights.dim() == 2 && expert_indices.dim() == 2,
+      "route weights and expert indices must have shape [tokens, topk]");
+  TORCH_CHECK(
+      route_weights.sizes() == expert_indices.sizes(),
+      "route weights and expert indices must have identical shapes");
+  TORCH_CHECK(
+      x.size(0) == route_weights.size(0),
+      "x and routing tensors must have the same token count");
+  TORCH_CHECK(x.size(1) > 0, "model_dim must be positive");
+  TORCH_CHECK(route_weights.size(1) > 0, "topk must be positive");
+  TORCH_CHECK(experts > 0, "experts must be positive");
+  TORCH_CHECK(experts < INT64_MAX, "experts + 1 overflows int64");
+
+  // The offsets are generated and consumed on this stream. Host checks cover
+  // their shape and allocation arithmetic without device-to-host synchronization;
+  // their values are guaranteed by the private histogram/scan producer.
+
+  const int64_t tokens = x.size(0);
+  const int64_t topk = route_weights.size(1);
+  const int64_t model_dim = x.size(1);
+  TORCH_CHECK(tokens <= INT64_MAX / topk, "tokens * topk overflows int64");
+  const int64_t route_count = tokens * topk;
+
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  const cudaDeviceProp* properties = at::cuda::getDeviceProperties(x.get_device());
+  TORCH_CHECK(
+      route_count <= static_cast<int64_t>(properties->maxGridSize[0]),
+      "too many routes for the one-block-per-route single-device CUDA pack kernel: ",
+      route_count);
+
+  auto long_options = expert_indices.options().dtype(at::kLong);
+  auto expert_offsets = at::zeros({experts + 1}, long_options);
+  auto route_pack_cursors = at::zeros({experts}, long_options);
+  auto packed_activations = at::empty({route_count, model_dim}, x.options());
+  auto packed_weights = at::empty({route_count}, route_weights.options());
+  auto token_indices = at::empty({route_count}, long_options);
+
+  if (route_count > 0) {
+    const int64_t unbounded_count_blocks = (route_count + kThreads - 1) / kThreads;
+    const int64_t count_blocks = unbounded_count_blocks < properties->maxGridSize[0]
+        ? unbounded_count_blocks
+        : properties->maxGridSize[0];
+    count_single_device_experts_kernel<<<
+        static_cast<unsigned int>(count_blocks), kThreads, 0, stream>>>(
+        expert_indices.const_data_ptr<int64_t>(),
+        expert_offsets.mutable_data_ptr<int64_t>(),
+        route_count,
+        experts);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  scan_single_device_expert_offsets_kernel<<<1, 1, 0, stream>>>(
+      expert_offsets.mutable_data_ptr<int64_t>(),
+      experts);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (route_count > 0) {
+    pack_single_device_routes_float_kernel<<<
+        static_cast<unsigned int>(route_count), kThreads, 0, stream>>>(
+        x.const_data_ptr<float>(),
+        route_weights.const_data_ptr<float>(),
+        expert_indices.const_data_ptr<int64_t>(),
+        expert_offsets.const_data_ptr<int64_t>(),
+        route_pack_cursors.mutable_data_ptr<int64_t>(),
+        packed_activations.mutable_data_ptr<float>(),
+        packed_weights.mutable_data_ptr<float>(),
+        token_indices.mutable_data_ptr<int64_t>(),
+        route_count,
+        topk,
+        model_dim,
+        experts);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  return {packed_activations, packed_weights, token_indices, expert_offsets};
+}
+
 at::Tensor route_combine_cuda(
     const at::Tensor& contributions,
     const at::Tensor& route_weights,
@@ -359,6 +521,19 @@ route_pack_cuda_entry(
       expert_indices,
       expert_owner,
       world_size);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+single_device_route_pack_cuda_entry(
+    const at::Tensor& x,
+    const at::Tensor& route_weights,
+    const at::Tensor& expert_indices,
+    int64_t experts) {
+  return single_device_route_pack_cuda(
+      x,
+      route_weights,
+      expert_indices,
+      experts);
 }
 
 at::Tensor route_combine_cuda_entry(

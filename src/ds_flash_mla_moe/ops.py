@@ -125,6 +125,16 @@ _DEEPSEEK_MOE_FORWARD_SCHEMA = (
     "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
     "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
 )
+_DEEPSEEK_MOE_FORWARD_FUSED_SCHEMA = (
+    "deepseek_moe_forward_fused(Tensor x, Tensor gate_weight, Tensor expert_w1, "
+    "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
+    "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
+)
+_DEEPSEEK_MOE_FORWARD_PERSISTENT_SCHEMA = (
+    "deepseek_moe_forward_persistent(Tensor x, Tensor gate_weight, Tensor expert_w1, "
+    "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
+    "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
+)
 _MLA_ABSORBED_ATTENTION_SCHEMA = (
     "mla_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv, Tensor pe, "
     "Tensor key_up, Tensor value_up, Tensor query_positions, Tensor key_positions, "
@@ -174,6 +184,8 @@ _SCHEMAS = {
     "expert_major_pack": _EXPERT_MAJOR_PACK_SCHEMA,
     "grouped_topk": _GROUPED_TOPK_SCHEMA,
     "deepseek_moe_forward": _DEEPSEEK_MOE_FORWARD_SCHEMA,
+    "deepseek_moe_forward_fused": _DEEPSEEK_MOE_FORWARD_FUSED_SCHEMA,
+    "deepseek_moe_forward_persistent": _DEEPSEEK_MOE_FORWARD_PERSISTENT_SCHEMA,
     "mla_absorbed_attention": _MLA_ABSORBED_ATTENTION_SCHEMA,
     "mla_query_projection": _MLA_QUERY_PROJECTION_SCHEMA,
     "mla_query_lora_projection": _MLA_QUERY_LORA_PROJECTION_SCHEMA,
@@ -882,6 +894,10 @@ def _fake_deepseek_moe_forward(
     torch._check(expert_w2.shape == (experts, model_dim, hidden))
     torch._check(expert_w3.shape == (experts, hidden, model_dim))
 
+    torch._check(
+        x.dtype == torch.float32,
+        lambda: "the native DeepSeek MoE forward operators require float32 tensors",
+    )
     torch._check(all(tensor.is_floating_point() for tensor in floating_tensors))
     torch._check(all(tensor.dtype == x.dtype for tensor in floating_tensors))
     torch._check(all(tensor.device == x.device for tensor in floating_tensors))
@@ -1231,6 +1247,12 @@ torch.library.register_fake("ds_flash_mla_moe::swiglu_experts", _fake_swiglu_exp
 torch.library.register_fake("ds_flash_mla_moe::expert_major_pack", _fake_expert_major_pack)
 torch.library.register_fake("ds_flash_mla_moe::grouped_topk", _fake_grouped_topk)
 torch.library.register_fake("ds_flash_mla_moe::deepseek_moe_forward", _fake_deepseek_moe_forward)
+torch.library.register_fake(
+    "ds_flash_mla_moe::deepseek_moe_forward_fused", _fake_deepseek_moe_forward
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::deepseek_moe_forward_persistent", _fake_deepseek_moe_forward
+)
 torch.library.register_fake(
     "ds_flash_mla_moe::mla_absorbed_attention", _fake_mla_absorbed_attention
 )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor
@@ -19,6 +19,15 @@ from .benchmarking import (
 )
 from .moe import deepseek_grouped_topk, deepseek_moe_reference
 from .moe_ops import MoEBackend, deepseek_moe_forward
+from .ops import _operator_has_cuda_kernel
+
+ExecutedMoEBackend = Literal[
+    "reference",
+    "cuda_staged",
+    "cuda_fused",
+    "cuda_persistent",
+]
+_PERSISTENT_SMALL_WORK_ROUTES = 8
 
 
 @dataclass(frozen=True)
@@ -67,8 +76,17 @@ class MoEForwardBenchmarkConfig:
             raise ValueError("iterations must be positive and warmup must be non-negative")
         if self.dtype not in {"float16", "bfloat16", "float32", "float64"}:
             raise ValueError("unsupported whole-layer MoE benchmark dtype")
-        if self.backend not in {"auto", "cuda", "reference"}:
-            raise ValueError("backend must be auto, cuda, or reference")
+        if self.backend not in {
+            "auto",
+            "cuda",
+            "cuda_staged",
+            "cuda_fused",
+            "cuda_persistent",
+            "reference",
+        }:
+            raise ValueError(
+                "backend must be auto, cuda, cuda_staged, cuda_fused, cuda_persistent, or reference"
+            )
         try:
             device_type = torch.device(self.device).type
         except RuntimeError as error:
@@ -77,8 +95,10 @@ class MoEForwardBenchmarkConfig:
             raise ValueError("MoE benchmark device must be CPU or CUDA")
         if device_type == "cpu" and self.dtype == "float16":
             raise ValueError("float16 CPU MoE compute is not a supported benchmark")
-        if self.backend == "cuda" and (device_type != "cuda" or self.dtype != "float32"):
-            raise ValueError("backend=cuda requires device=cuda and dtype=float32")
+        if self.backend in {"cuda", "cuda_staged", "cuda_fused", "cuda_persistent"} and (
+            device_type != "cuda" or self.dtype != "float32"
+        ):
+            raise ValueError("native CUDA backends require device=cuda and dtype=float32")
 
 
 def moe_initialization_model(config: MoEForwardBenchmarkConfig) -> dict[str, Any]:
@@ -97,10 +117,178 @@ def moe_initialization_model(config: MoEForwardBenchmarkConfig) -> dict[str, Any
     }
 
 
-def moe_intermediate_bytes(config: MoEForwardBenchmarkConfig) -> dict[str, Any]:
-    """Model the major materialized buffers in the staged single-device forward."""
+def _inventory_buffer(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    element_size = torch.empty((), dtype=dtype).element_size()
+    return {
+        "shape": list(shape),
+        "dtype": str(dtype).removeprefix("torch."),
+        "kind": kind,
+        "bytes": math.prod(shape) * element_size,
+    }
+
+
+def _summarize_inventory(
+    implementation: str,
+    modeled_backend: str,
+    executed_backend: ExecutedMoEBackend,
+    buffers: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "implementation": implementation,
+        "modeled_backend": modeled_backend,
+        "executed_backend": executed_backend,
+        "evidence_kind": "analytical_model",
+        "materialized_by_execution": modeled_backend == executed_backend,
+        "buffers": buffers,
+        "metadata_bytes": sum(
+            int(buffer["bytes"]) for buffer in buffers.values() if buffer["kind"] == "metadata"
+        ),
+        "total_bytes": sum(int(buffer["bytes"]) for buffer in buffers.values()),
+    }
+
+
+def _moe_intermediate_inventories(
+    config: MoEForwardBenchmarkConfig,
+    *,
+    storage_dtype: torch.dtype,
+    compute_dtype: torch.dtype,
+    executed_backend: ExecutedMoEBackend,
+) -> dict[str, Any]:
+    route_rows = config.tokens * config.topk
+    experts_plus_one = config.experts + 1
+    staged_buffers = {
+        "gate_logits": _inventory_buffer(
+            (config.tokens, config.experts), compute_dtype, kind="scratch"
+        ),
+        "dense_scores": _inventory_buffer(
+            (config.tokens, config.experts), compute_dtype, kind="scratch"
+        ),
+        "selected_route_weights": _inventory_buffer(
+            (config.tokens, config.topk), storage_dtype, kind="metadata"
+        ),
+        "selected_expert_indices": _inventory_buffer(
+            (config.tokens, config.topk), torch.long, kind="metadata"
+        ),
+        "expert_owner": _inventory_buffer((config.experts,), torch.long, kind="metadata"),
+        "route_key_counts": _inventory_buffer((config.experts,), torch.long, kind="metadata"),
+        "route_key_offsets": _inventory_buffer((experts_plus_one,), torch.long, kind="metadata"),
+        "route_key_cursors": _inventory_buffer((config.experts,), torch.long, kind="metadata"),
+        "counts_per_expert": _inventory_buffer((config.experts,), torch.long, kind="metadata"),
+        "rank_counts": _inventory_buffer((1,), torch.long, kind="metadata"),
+        "packed_activations": _inventory_buffer(
+            (route_rows, config.model_dim), storage_dtype, kind="activation"
+        ),
+        "packed_route_weights": _inventory_buffer((route_rows,), storage_dtype, kind="metadata"),
+        "packed_route_indices": _inventory_buffer((route_rows,), torch.long, kind="metadata"),
+        "packed_expert_indices": _inventory_buffer((route_rows,), torch.long, kind="metadata"),
+        "expert_count_prefix_sum": _inventory_buffer(
+            (config.experts,), torch.long, kind="metadata"
+        ),
+        "expert_offset_seed": _inventory_buffer((1,), torch.long, kind="metadata"),
+        "expert_offsets": _inventory_buffer((experts_plus_one,), torch.long, kind="metadata"),
+        "packed_token_indices": _inventory_buffer((route_rows,), torch.long, kind="metadata"),
+        "hidden_task_offsets": _inventory_buffer((experts_plus_one,), torch.long, kind="metadata"),
+        "down_task_offsets": _inventory_buffer((experts_plus_one,), torch.long, kind="metadata"),
+        "expert_hidden_state": _inventory_buffer(
+            (route_rows, config.hidden_dim), compute_dtype, kind="activation"
+        ),
+        "contributions": _inventory_buffer(
+            (route_rows, config.model_dim), storage_dtype, kind="activation"
+        ),
+    }
+    fused_buffers = {
+        name: staged_buffers[name]
+        for name in (
+            "gate_logits",
+            "dense_scores",
+            "selected_route_weights",
+            "selected_expert_indices",
+            "packed_activations",
+            "packed_route_weights",
+            "packed_token_indices",
+            "expert_offsets",
+            "expert_hidden_state",
+        )
+    }
+    fused_buffers["route_pack_cursors"] = _inventory_buffer(
+        (config.experts,), torch.long, kind="metadata"
+    )
+    persistent_queue_materialized = route_rows > _PERSISTENT_SMALL_WORK_ROUTES
+    persistent_buffers = dict(fused_buffers)
+    if persistent_queue_materialized:
+        persistent_buffers["persistent_task_queue"] = _inventory_buffer(
+            (1,), torch.long, kind="metadata"
+        )
+    persistent_inventory = _summarize_inventory(
+        "single_device_cuda_persistent",
+        "cuda_persistent",
+        executed_backend,
+        persistent_buffers,
+    )
+    persistent_inventory["scheduler_policy"] = {
+        "small_work_fallback_max_routes": _PERSISTENT_SMALL_WORK_ROUTES,
+        "persistent_queue_materialized": persistent_queue_materialized,
+    }
+    return {
+        "cuda_staged": _summarize_inventory(
+            "single_device_cuda_staged",
+            "cuda_staged",
+            executed_backend,
+            staged_buffers,
+        ),
+        "cuda_fused": _summarize_inventory(
+            "single_device_cuda_fused",
+            "cuda_fused",
+            executed_backend,
+            fused_buffers,
+        ),
+        "cuda_persistent": persistent_inventory,
+    }
+
+
+def _resolved_benchmark_backend(config: MoEForwardBenchmarkConfig) -> ExecutedMoEBackend:
+    """Resolve the backend used by benchmark-generated contiguous inference inputs."""
+
+    if config.backend == "reference":
+        return "reference"
+    if config.backend == "cuda_staged":
+        return "cuda_staged"
+    if config.backend in {"cuda", "cuda_fused"}:
+        return "cuda_fused"
+    if config.backend == "cuda_persistent":
+        return "cuda_persistent"
+    cuda_inputs_are_eligible = (
+        torch.cuda.is_available()
+        and torch.device(config.device).type == "cuda"
+        and config.dtype == "float32"
+        and not torch.are_deterministic_algorithms_enabled()
+    )
+    if not cuda_inputs_are_eligible:
+        return "reference"
+    for operator, executed_backend in (
+        ("deepseek_moe_forward_fused", "cuda_fused"),
+        ("deepseek_moe_forward", "cuda_staged"),
+    ):
+        if _operator_has_cuda_kernel(operator):
+            return cast(ExecutedMoEBackend, executed_backend)
+    return "reference"
+
+
+def moe_intermediate_bytes(
+    config: MoEForwardBenchmarkConfig,
+    *,
+    executed_backend: ExecutedMoEBackend | None = None,
+) -> dict[str, Any]:
+    """Model backend-qualified CUDA staged, fused, and persistent buffers."""
 
     config.validate()
+    if executed_backend is None:
+        executed_backend = _resolved_benchmark_backend(config)
     storage_dtype = _dtype_from_name(config.dtype)
     compute_dtype = torch.float64 if storage_dtype == torch.float64 else torch.float32
     storage_element_size = torch.empty((), dtype=storage_dtype).element_size()
@@ -115,6 +303,7 @@ def moe_intermediate_bytes(config: MoEForwardBenchmarkConfig) -> dict[str, Any]:
     contributions = route_rows * config.model_dim * storage_element_size
     return {
         "analytical_only": True,
+        "executed_backend": executed_backend,
         "floating_dtype": config.dtype,
         "floating_element_size": storage_element_size,
         "index_dtype": "int64",
@@ -133,6 +322,18 @@ def moe_intermediate_bytes(config: MoEForwardBenchmarkConfig) -> dict[str, Any]:
             + packed_indices
             + expert_hidden_state
             + contributions
+        ),
+        "legacy_flat_fields": {
+            "historical_compatibility": True,
+            "modeled_backend": "cuda_staged",
+            "executed_backend": executed_backend,
+            "materialized_by_execution": executed_backend == "cuda_staged",
+        },
+        "inventories": _moe_intermediate_inventories(
+            config,
+            storage_dtype=storage_dtype,
+            compute_dtype=compute_dtype,
+            executed_backend=executed_backend,
         ),
     }
 
@@ -249,7 +450,7 @@ def _verify(
         ),
     )
     rtol, atol = _verification_tolerances(actual.dtype)
-    if actual.device.type == "cuda" and config.backend in {"auto", "cuda"}:
+    if actual.device.type == "cuda" and config.backend != "reference":
         rtol = max(rtol, 1e-3)
         atol = max(atol, 1e-3)
     error = _normalized_error(actual, expected, rtol, atol)
@@ -316,10 +517,19 @@ def benchmark_moe_forward(config: MoEForwardBenchmarkConfig) -> dict[str, Any]:
             else _measure_cpu(operation, config.warmup, config.iterations)
         )
 
+    executed_backend = _resolved_benchmark_backend(config)
+    implementation = {
+        "reference": "reference",
+        "cuda_staged": "single_device_cuda_staged",
+        "cuda_fused": "single_device_cuda_fused",
+        "cuda_persistent": "single_device_cuda_persistent",
+    }[executed_backend]
+
     return {
         "schema_version": 1,
         "benchmark": "deepseek_moe_forward",
-        "implementation": "single_device_staged",
+        "implementation": implementation,
+        "executed_backend": executed_backend,
         "performance_claim": False,
         "configuration": asdict(config),
         "initialization": moe_initialization_model(config),
@@ -332,14 +542,21 @@ def benchmark_moe_forward(config: MoEForwardBenchmarkConfig) -> dict[str, Any]:
         },
         "verification": verification,
         "route_distribution": _route_distribution(routing.indices, config.experts),
-        "intermediate_bytes": moe_intermediate_bytes(config),
+        "intermediate_bytes": moe_intermediate_bytes(
+            config,
+            executed_backend=executed_backend,
+        ),
         "latency": summarize_latencies(samples),
         "raw_samples_ms": samples,
         "notes": [
             "latency samples time deepseek_moe_forward only",
             "input creation, route analysis, and independent reference verification are untimed",
-            "intermediate bytes are analytical materialized-buffer sizes, not memory traffic",
+            "intermediate bytes are backend-qualified analytical models, not observations or memory traffic",
+            "legacy flat intermediate fields are retained as historical CUDA-staged estimates",
             "packed indices count packed route and expert int64 arrays",
-            "this staged implementation report makes no performance claim",
+            "the fused and persistent inventories describe implemented single-device paths",
+            "persistent scheduling is an expert-core task queue, not a distributed megakernel",
+            "inventory totals sum materialized sizes and are not simultaneous peak memory",
+            "this backend-explicit implementation report makes no performance claim",
         ],
     }
