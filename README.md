@@ -31,7 +31,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Graph replay / request scheduling | stable-buffer graph runner + FIFO control plane | CPU contracts + CUDA replay | exact-shape buckets; fixed-page transactions | no |
 | FP8/INT8 forward experiments | explicit scales + dequantized FP32 oracle | CPU + CUDA contracts | scalar E4M3FN/INT8 quantize + linear source | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
-| One-sided EP layout | symmetric-buffer cost model | CPU | no NVSHMEM backend | analytical only |
+| Logical EP/TP foundations | topology + protocol simulator + TP SwiGLU | exhaustive CPU contracts | no transport kernel | single-process evidence only |
 
 Files under `csrc/experimental/` are teaching prototypes. They are intentionally
 excluded from the importable wheel and supported API, and must not be treated as
@@ -282,6 +282,18 @@ Both reports retain raw timing/trace facts and make no speedup claim.
   `[peer, round, buffer, local_expert, capacity, feature]` layout and its
   route-cell overflow/storage cost. It does not allocate NVSHMEM memory or
   imply that a one-sided backend has been implemented.
+- `ParallelMesh` fixes TP-fastest rank mapping, while `OneSidedCell` makes
+  payload-before-signal and consumed-generation acknowledgement executable.
+  `FakeDistributedMoE` restores shuffled dispatch/return rows by explicit route
+  identity. Its reports always mark the run as simulated and explicitly deny
+  remote-visibility, transport, and multi-GPU evidence.
+- `tensor_parallel_swiglu_forward` is a forward-only logical TP oracle for TP
+  sizes 1/2/4: W1/W3 shard hidden rows, W2 shards the matching columns, and
+  partials sum locally in FP32 or FP64. It performs no cross-device reduction.
+
+```bash
+python benchmarks/logical_distributed.py --pes 2 --experts 4 --tp-size 2
+```
 
 ## Development order
 

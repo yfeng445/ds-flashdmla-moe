@@ -27,6 +27,7 @@
 | [7. Benchmark 与 Roofline](chapters/07-benchmarking-and-roofline.md) | 如何得到单卡与多 rank 的可复核性能证据 | `benchmarking.py`、`benchmarks/` |
 | [8. 对称内存与 One-sided MoE](chapters/08-one-sided-symmetric-memory.md) | PGAS、data/flag 协议、时间缓冲与内存代价 | `symmetric_memory.py` |
 | [9. FP8 E4M3FN 与 INT8 量化](chapters/09-fp8-int8-quantization.md) | 显式 scale、饱和、反量化 linear 与验证边界 | `quantization.py`、`quantized_benchmarking.py` |
+| [10. 单卡可验证的 One-sided 协议与 TP](chapters/10-logical-one-sided-and-tp.md) | rank 双射、generation 状态机、route identity 与 logical TP | `parallel_topology.py`、`one_sided_protocol.py`、`fake_distributed.py`、`tensor_parallel.py` |
 | [练习](exercises.md) | 从公式、reference 到 kernel 的递进任务 | 全仓库 |
 
 系统复习可先阅读[AI Infra 知识与面试准备指南](infra-interview-guide.md)，再使用

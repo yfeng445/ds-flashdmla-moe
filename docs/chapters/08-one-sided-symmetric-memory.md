@@ -176,7 +176,7 @@ tile 完成”压成同一个计数器，往往会让 consumer 在最后一次 r
 producer 可以填充 `1-b`。每个 buffer 至少需要状态：
 
 ```text
-EMPTY → WRITING → READY → READING → EMPTY(next generation)
+EMPTY → WRITING → READY → READING → CONSUMED → EMPTY(next generation)
 ```
 
 若 persistent kernel 同时承担通信和 GEMM，还要预留足够的 GPU execution resources 给进度
@@ -190,11 +190,13 @@ signal polling 与计算都能持续前进。
 
 ## 8.8 从模型到真实 backend 的验证阶梯
 
-本仓库当前只提供布局和存储代价模型，没有链接 NVSHMEM，也没有宣称 single-kernel MoE。
+本仓库当前提供布局/存储代价模型，以及单进程 logical-PE generation 状态机；它没有链接
+真实 one-sided transport，也没有宣称 single-kernel MoE。第十章给出 simulator 的可执行契约与
+证据边界。
 实现 one-sided backend 时建议逐级建立证据：
 
 1. 用整数 counts 验证 shape、offset、capacity 与 bytes；
-2. 用单 GPU 模拟 producer/consumer generation，覆盖复用和 wraparound；
+2. 用单 GPU 模拟 producer/consumer generation，覆盖复用和 wraparound（当前已完成）；
 3. 两 GPU 固定路由，逐行比较 payload 与 Gloo/NCCL reference；
 4. 加入 0-count peer、热门 expert、满容量和 overflow；
 5. 重复多轮并随机延迟 producer，使用 Compute Sanitizer 检查 race；
