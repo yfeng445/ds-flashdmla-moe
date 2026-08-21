@@ -88,8 +88,8 @@ def test_masked_auto_backend_falls_back_to_reference() -> None:
 
 def test_cuda_backend_fails_loudly_without_eligible_inputs() -> None:
     q = torch.randn(1, 2, 3, 4)
-    with pytest.raises(RuntimeError, match="CUDA attention is unavailable"):
-        flash_attention_forward(q, q, q, backend="cuda")
+    with pytest.raises(RuntimeError, match="cuda_rowwise attention is unavailable"):
+        flash_attention_forward(q, q, q, backend="cuda_rowwise")
 
 
 @pytest.mark.parametrize("backend", ["unknown", "CUDA", ""])
@@ -267,7 +267,7 @@ def test_cuda_forward_matches_reference(
     v = torch.randn(2, 3, key_length, value_dim, device="cuda", dtype=dtype)
 
     with torch.no_grad():
-        actual = flash_attention_forward(q, k, v, causal=causal, backend="cuda")
+        actual = flash_attention_forward(q, k, v, causal=causal, backend="cuda_rowwise")
         expected = blockwise_attention(q, k, v, causal=causal, block_size=3)
 
     rtol, atol = _cuda_attention_tolerances(dtype)
@@ -285,7 +285,7 @@ def test_cuda_kernel_uses_current_stream() -> None:
 
     with torch.no_grad(), torch.cuda.stream(stream):
         q.fill_(0.25)
-        output = flash_attention_forward(q, q, q, causal=True, backend="cuda")
+        output = flash_attention_forward(q, q, q, causal=True, backend="cuda_rowwise")
         output.record_stream(stream)
     stream.synchronize()
 
@@ -306,7 +306,7 @@ def test_cuda_forward_autograd_matches_reference(dtype: torch.dtype) -> None:
     expected_inputs = [tensor.detach().clone().requires_grad_(True) for tensor in inputs]
     upstream = torch.randn_like(inputs[0])
 
-    actual = flash_attention_forward(*inputs, causal=True, backend="cuda")
+    actual = flash_attention_forward(*inputs, causal=True, backend="cuda_rowwise")
     expected = blockwise_attention(*expected_inputs, causal=True, block_size=3)
     actual.backward(upstream)
     expected.backward(upstream)
@@ -394,7 +394,7 @@ def test_low_precision_noncontiguous_inputs_follow_the_explicit_fallback_contrac
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
     with pytest.raises(RuntimeError, match="contiguous"):
-        flash_attention_forward(q, k, v, causal=True, backend="cuda")
+        flash_attention_forward(q, k, v, causal=True, backend="cuda_rowwise")
 
 
 @pytest.mark.skipif(
@@ -408,7 +408,7 @@ def test_cuda_attention_rejects_mixed_storage_dtypes() -> None:
     v = torch.randn(1, 2, 5, 4, device="cuda", dtype=torch.float16)
 
     with pytest.raises(RuntimeError, match="same dtype"):
-        flash_attention_forward(q, k, v, backend="cuda")
+        flash_attention_forward(q, k, v, backend="cuda_rowwise")
 
 
 @pytest.mark.skipif(
@@ -422,7 +422,7 @@ def test_cuda_attention_rejects_mixed_storage_dtypes() -> None:
 def test_deterministic_mode_uses_reference_backward() -> None:
     inputs = [torch.randn(1, 2, 5, 8, device="cuda", requires_grad=True) for _ in range(3)]
     with _deterministic_algorithms():
-        output = flash_attention_forward(*inputs, causal=True, backend="cuda")
+        output = flash_attention_forward(*inputs, causal=True, backend="cuda_rowwise")
         output.sum().backward()
     for tensor in inputs:
         assert tensor.grad is not None

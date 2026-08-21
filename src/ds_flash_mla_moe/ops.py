@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from pathlib import Path
 from typing import Literal
 
@@ -16,11 +17,21 @@ from .attention import (
     _validate_attention_inputs,
     blockwise_attention,
     scaled_dot_product_attention_backward_reference,
+    scaled_dot_product_attention_reference,
 )
 from .gemm import _gemm_compute_dtype, _validate_gemm_inputs, gemm_reference
 from .moe import RoutingResult, deepseek_grouped_topk, pack_routes_reference
 
-AttentionBackend = Literal["auto", "cuda", "reference"]
+AttentionBackend = Literal[
+    "auto",
+    "cuda",
+    "cuda_rowwise",
+    "reference",
+    "blockwise",
+    "fa1",
+    "fa2",
+]
+NativeAttentionBackend = Literal["cuda_rowwise", "fa1", "fa2"]
 GEMMBackend = Literal["auto", "cuda", "reference"]
 MLABackend = Literal["auto", "cuda", "reference"]
 
@@ -76,6 +87,12 @@ _NATIVE_EXTENSION_LOADED = _load_native_library()
 
 _FORWARD_SCHEMA = (
     "attention_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor"
+)
+_FA1_FORWARD_SCHEMA = (
+    "attention_fa1_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor"
+)
+_FA2_FORWARD_SCHEMA = (
+    "attention_fa2_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor"
 )
 _BACKWARD_SCHEMA = (
     "attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v, "
@@ -142,6 +159,8 @@ _MLA_PAGED_ABSORBED_ATTENTION_SCHEMA = (
 _MLA_OUTPUT_PROJECTION_SCHEMA = "mla_output_projection(Tensor heads, Tensor wo) -> Tensor"
 _SCHEMAS = {
     "attention_forward": _FORWARD_SCHEMA,
+    "attention_fa1_forward": _FA1_FORWARD_SCHEMA,
+    "attention_fa2_forward": _FA2_FORWARD_SCHEMA,
     "attention_backward": _BACKWARD_SCHEMA,
     "route_pack": _ROUTE_PACK_SCHEMA,
     "route_combine": _ROUTE_COMBINE_SCHEMA,
@@ -200,6 +219,21 @@ def _fake_attention_forward(
     torch._check(q.shape[-1] > 0)
     torch._check((not causal) or q.shape[-2] <= k.shape[-2])
     return v.new_empty((*q.shape[:-1], v.shape[-1]))
+
+
+def _fake_formal_attention_forward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    causal: bool,
+    scale: float,
+) -> Tensor:
+    output = _fake_attention_forward(q, k, v, causal, scale)
+    torch._check(q.ndim == 4 and k.ndim == 4 and v.ndim == 4)
+    torch._check(q.dtype == torch.float16)
+    torch._check(k.dtype == q.dtype and v.dtype == q.dtype)
+    torch._check(q.shape[-1] <= 128 and v.shape[-1] <= 128)
+    return output
 
 
 def _composite_attention_backward(
@@ -1123,6 +1157,12 @@ composite_implicit.impl("attention_backward", _composite_attention_backward)
 _LIBRARY_HANDLES.append(composite_implicit)
 
 torch.library.register_fake("ds_flash_mla_moe::attention_forward", _fake_attention_forward)
+torch.library.register_fake(
+    "ds_flash_mla_moe::attention_fa1_forward", _fake_formal_attention_forward
+)
+torch.library.register_fake(
+    "ds_flash_mla_moe::attention_fa2_forward", _fake_formal_attention_forward
+)
 torch.library.register_fake("ds_flash_mla_moe::route_pack", _fake_route_pack)
 torch.library.register_fake("ds_flash_mla_moe::route_combine", _fake_route_combine)
 torch.library.register_fake("ds_flash_mla_moe::tiled_gemm", _fake_tiled_gemm)
@@ -1634,10 +1674,31 @@ def native_extension_loaded() -> bool:
     return _NATIVE_EXTENSION_LOADED
 
 
-def cuda_kernel_available() -> bool:
-    """Return whether the native library is loaded and a CUDA device is usable."""
+_ATTENTION_OPERATOR = {
+    "cuda_rowwise": "attention_forward",
+    "fa1": "attention_fa1_forward",
+    "fa2": "attention_fa2_forward",
+}
 
-    return _NATIVE_EXTENSION_LOADED and torch.cuda.is_available()
+
+def cuda_attention_backend_available(
+    backend: NativeAttentionBackend = "cuda_rowwise",
+) -> bool:
+    """Return whether the selected native attention backend can execute."""
+
+    if backend not in _ATTENTION_OPERATOR:
+        raise ValueError("native attention backend must be cuda_rowwise, fa1, or fa2")
+    return (
+        _NATIVE_EXTENSION_LOADED
+        and torch.cuda.is_available()
+        and _operator_has_cuda_kernel(_ATTENTION_OPERATOR[backend])
+    )
+
+
+def cuda_kernel_available() -> bool:
+    """Return whether the row-wise native attention backend can execute."""
+
+    return cuda_attention_backend_available("cuda_rowwise")
 
 
 def cuda_gemm_available() -> bool:
@@ -2213,30 +2274,43 @@ def tiled_gemm(
     return gemm_reference(a, b, c, alpha=alpha, beta=beta)
 
 
-def _cuda_ineligibility_reason(
+def _attention_backend_ineligibility_reason(
+    backend: NativeAttentionBackend,
     q: Tensor,
     k: Tensor,
     v: Tensor,
     *,
     attn_mask: Tensor | None,
 ) -> str | None:
-    if not _NATIVE_EXTENSION_LOADED:
-        return "the native extension is not installed"
-    if q.device.type != "cuda" or k.device.type != "cuda" or v.device.type != "cuda":
-        return "q, k, and v must be CUDA tensors"
+    if backend in {"fa1", "fa2"} and any(t.requires_grad for t in (q, k, v)):
+        return f"{backend} is forward-only and does not accept requires_grad tensors"
     if q.ndim != 4:
-        return "the CUDA kernel currently requires [batch, heads, sequence, dimension] tensors"
-    supported_dtypes = {torch.float16, torch.bfloat16, torch.float32}
-    if q.dtype not in supported_dtypes:
-        return "the CUDA kernel supports float16, bfloat16, and float32"
+        return "the CUDA kernel requires [batch, heads, sequence, dimension] tensors"
+    supported = (
+        {torch.float16}
+        if backend in {"fa1", "fa2"}
+        else {torch.float16, torch.bfloat16, torch.float32}
+    )
+    if q.dtype not in supported:
+        rendered = (
+            "float16" if backend in {"fa1", "fa2"} else "float16, bfloat16, or float32"
+        )
+        return f"{backend} supports {rendered}"
     if k.dtype != q.dtype or v.dtype != q.dtype:
         return "q, k, and v must have the same dtype"
-    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
-        return "the CUDA kernel currently requires contiguous tensors"
+    if not all(t.is_contiguous() for t in (q, k, v)):
+        return "the CUDA kernel requires contiguous tensors"
     if attn_mask is not None:
-        return "the CUDA kernel does not support an explicit attention mask yet"
-    if not _operator_has_cuda_kernel("attention_forward"):
-        return "the loaded native extension does not register a CUDA forward kernel"
+        return "the CUDA kernel does not support an explicit attention mask"
+    if backend in {"fa1", "fa2"} and (q.shape[-1] > 128 or v.shape[-1] > 128):
+        return "formal FA1/FA2 currently require head_dim <= 128 and value_dim <= 128"
+    if not _NATIVE_EXTENSION_LOADED:
+        return "the native extension is not installed"
+    if any(t.device.type != "cuda" for t in (q, k, v)):
+        return "q, k, and v must be CUDA tensors"
+    operator = _ATTENTION_OPERATOR[backend]
+    if not _operator_has_cuda_kernel(operator):
+        return f"the loaded native extension does not register {operator}"
     return None
 
 
@@ -2263,21 +2337,19 @@ def flash_attention_forward(
     backend: AttentionBackend = "auto",
     reference_block_size: int = 64,
 ) -> Tensor:
-    """Run the native CUDA forward kernel when eligible, otherwise use the specification.
-
-    The native kernel accepts contiguous float16, bfloat16, or float32
-    rank-four CUDA tensors with a shared dtype and no explicit mask. Dot
-    products, online-softmax state, and output accumulation use float32.
-    ``backend="cuda"`` enforces that contract. ``backend="auto"`` falls back
-    to the differentiable blockwise PyTorch specification for unsupported
-    shapes, dtypes, layouts, devices, or masks. Autograd uses the native
-    float32-accumulating backward when eligible and the differentiable
-    specification for deterministic or higher-order gradients.
-    """
+    """Dispatch attention to a strict backend or the automatic row-wise fallback."""
 
     _validate_attention_inputs(q, k, v)
-    if backend not in {"auto", "cuda", "reference"}:
-        raise ValueError("backend must be 'auto', 'cuda', or 'reference'")
+    valid = {"auto", "cuda", "cuda_rowwise", "reference", "blockwise", "fa1", "fa2"}
+    if backend not in valid:
+        raise ValueError("backend must be auto, cuda_rowwise, reference, blockwise, fa1, or fa2")
+    if backend == "cuda":
+        warnings.warn(
+            "backend='cuda' is deprecated; use backend='cuda_rowwise'",
+            FutureWarning,
+            stacklevel=2,
+        )
+        backend = "cuda_rowwise"
     if causal and q.shape[-2] > k.shape[-2]:
         raise ValueError("right-aligned causal attention requires query_length <= key_length")
     _validate_attention_mask_request(q, k, causal=causal, attn_mask=attn_mask)
@@ -2286,19 +2358,35 @@ def flash_attention_forward(
     if not math.isfinite(effective_scale):
         raise ValueError("scale must be finite")
 
-    reason = _cuda_ineligibility_reason(q, k, v, attn_mask=attn_mask)
-    if backend == "cuda":
-        if reason is not None:
-            raise RuntimeError(f"CUDA attention is unavailable: {reason}")
-        return torch.ops.ds_flash_mla_moe.attention_forward.default(
-            q, k, v, causal, effective_scale
+    if backend == "reference":
+        return scaled_dot_product_attention_reference(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=effective_scale,
+            attn_mask=attn_mask,
+        )
+    if backend == "blockwise":
+        return blockwise_attention(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=effective_scale,
+            attn_mask=attn_mask,
+            block_size=reference_block_size,
         )
 
-    if backend == "auto" and reason is None:
-        return torch.ops.ds_flash_mla_moe.attention_forward.default(
-            q, k, v, causal, effective_scale
-        )
-
+    selected = "cuda_rowwise" if backend == "auto" else backend
+    reason = _attention_backend_ineligibility_reason(
+        selected, q, k, v, attn_mask=attn_mask
+    )
+    if reason is None:
+        operator = getattr(torch.ops.ds_flash_mla_moe, _ATTENTION_OPERATOR[selected]).default
+        return operator(q, k, v, causal, effective_scale)
+    if backend != "auto":
+        raise RuntimeError(f"{selected} attention is unavailable: {reason}")
     return blockwise_attention(
         q,
         k,

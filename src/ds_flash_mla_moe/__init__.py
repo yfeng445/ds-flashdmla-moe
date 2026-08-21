@@ -50,6 +50,7 @@ from .moe import (
     to_expert_major_reference,
 )
 from .ops import (
+    cuda_attention_backend_available,
     cuda_gemm_available,
     cuda_kernel_available,
     cuda_mla_available,
@@ -90,6 +91,7 @@ __all__ = [
     "blockwise_attention",
     "build_mla_cache",
     "combine_packed_routes",
+    "cuda_attention_backend_available",
     "cuda_expert_ops_available",
     "cuda_gemm_available",
     "cuda_kernel_available",
