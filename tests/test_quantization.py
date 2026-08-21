@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import torch
@@ -120,6 +120,13 @@ def test_quantization_rejects_non_finite_inputs(
             format=quantization_format,  # type: ignore[arg-type]
             backend="reference",
         )
+
+
+def test_unavailable_explicit_cuda_still_rejects_non_finite_input_strictly() -> None:
+    matrix = torch.tensor([[1.0, float("nan")]])
+
+    with pytest.raises(ValueError, match="finite"):
+        quantize_activations(matrix, format="int8", backend="cuda")
 
 
 @pytest.mark.parametrize("quantization_format", ["int8", "fp8_e4m3fn"])
@@ -283,6 +290,72 @@ def test_quantized_matrix_rejects_mutable_or_inconsistent_payload_metadata() -> 
         )
 
 
+@pytest.mark.parametrize(
+    ("metadata_override", "message"),
+    [
+        ({"source_dtype": torch.float64}, "source dtype"),
+        ({"scale_granularity": "per_tensor"}, "scale granularity"),
+    ],
+)
+def test_quantized_matrix_rejects_forged_public_metadata(
+    metadata_override: dict[str, object],
+    message: str,
+) -> None:
+    quantized = quantize_activations(torch.randn(2, 3), format="int8", backend="reference")
+    forged = replace(quantized.metadata, **metadata_override)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match=message):
+        QuantizedMatrix(
+            values=quantized.values,
+            scales=quantized.scales,
+            metadata=forged,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("requires_grad", "forward-only"),
+        ("non_finite_scale", "finite"),
+        ("non_positive_scale", "positive"),
+        ("value_dtype", "values dtype"),
+        ("scale_dtype", "scales must use"),
+        ("non_contiguous_values", "contiguous"),
+    ],
+)
+def test_dequantize_revalidates_post_construction_tensor_mutation(
+    mutation: str,
+    message: str,
+) -> None:
+    quantized = quantize_activations(torch.randn(2, 3), format="int8", backend="reference")
+    if mutation == "requires_grad":
+        quantized.scales.requires_grad_(True)
+    elif mutation == "non_finite_scale":
+        quantized.scales.fill_(float("nan"))
+    elif mutation == "non_positive_scale":
+        quantized.scales.zero_()
+    elif mutation == "value_dtype":
+        quantized.values.data = quantized.values.to(torch.float32)
+    elif mutation == "scale_dtype":
+        quantized.scales.data = quantized.scales.to(torch.float64)
+    else:
+        storage = torch.empty(2, 6, dtype=torch.int8)
+        storage[:, ::2].copy_(quantized.values)
+        quantized.values.set_(storage[:, ::2])
+
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        dequantize_matrix(quantized)
+
+
+def test_linear_revalidates_mutated_weight_before_backend_selection() -> None:
+    activations = quantize_activations(torch.randn(2, 3), format="int8", backend="reference")
+    weight = quantize_weights(torch.randn(4, 3), format="int8", backend="reference")
+    weight.scales.requires_grad_(True)
+
+    with pytest.raises(RuntimeError, match="forward-only"):
+        dequantized_linear(activations, weight, backend="cuda")
+
+
 @pytest.mark.parametrize("quantization_format", ["int8", "fp8_e4m3fn"])
 def test_cuda_quantization_capability_flag_is_consistent(quantization_format: str) -> None:
     available = cuda_quantization_available(quantization_format)  # type: ignore[arg-type]
@@ -334,6 +407,40 @@ def test_cuda_quantization_and_linear_match_dequantized_reference(
         backend="reference",
     )
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("quantization_format", ["int8", "fp8_e4m3fn"])
+@pytest.mark.cuda
+def test_cuda_quantizer_broadcasts_row_scale_to_nonzero_thread_lanes(
+    quantization_format: str,
+) -> None:
+    if not cuda_quantization_available(quantization_format):  # type: ignore[arg-type]
+        pytest.skip(f"requires native CUDA {quantization_format} quantization")
+    pattern = torch.tensor([1.0, 0.5, -0.25, 0.125])
+    first_row = pattern.repeat(129)[:513]
+    matrix = torch.stack((first_row, first_row * 3.0)).to("cuda").contiguous()
+
+    actual = quantize_activations(
+        matrix,
+        format=quantization_format,  # type: ignore[arg-type]
+        backend="cuda",
+    )
+    expected = quantize_activations(
+        matrix,
+        format=quantization_format,  # type: ignore[arg-type]
+        backend="reference",
+    )
+
+    # CUDA thread 0 owns columns 0/256/512; these nonzero-thread columns prove
+    # that the block-wide row scale was broadcast rather than merely published
+    # through a global-memory store by thread 0.
+    nonzero_thread_columns = [1, 255, 257, 511]
+    torch.testing.assert_close(
+        actual.values[:, nonzero_thread_columns],
+        expected.values[:, nonzero_thread_columns],
+    )
+    torch.testing.assert_close(actual.values, expected.values)
+    torch.testing.assert_close(actual.scales, expected.scales)
 
 
 @pytest.mark.parametrize("quantization_format", ["int8", "fp8_e4m3fn"])

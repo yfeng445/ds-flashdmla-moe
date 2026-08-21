@@ -18,6 +18,10 @@ _FORMATS: dict[QuantizationFormat, tuple[torch.dtype, float]] = {
     "fp8_e4m3fn": (torch.uint8, 448.0),
     "int8": (torch.int8, 127.0),
 }
+_FORMAT_GRANULARITIES: dict[QuantizationFormat, frozenset[str]] = {
+    "fp8_e4m3fn": frozenset({"per_row", "per_output_channel"}),
+    "int8": frozenset({"per_row", "per_output_channel"}),
+}
 _QUANTIZE_OPERATOR: dict[QuantizationFormat, str] = {
     "fp8_e4m3fn": "quantize_fp8_e4m3fn_per_row",
     "int8": "quantize_int8_per_row",
@@ -60,45 +64,61 @@ class QuantizedMatrix:
     metadata: QuantizedMatrixMetadata
 
     def __post_init__(self) -> None:
-        expected_dtype, bound = _format_spec(self.metadata.format)
-        if self.metadata.value_dtype != expected_dtype:
-            raise ValueError("metadata value dtype does not match the quantization format")
-        if self.values.dtype != self.metadata.value_dtype:
-            raise ValueError("values dtype does not match quantized metadata")
-        if self.scales.dtype != self.metadata.scale_dtype or self.scales.dtype != torch.float32:
-            raise ValueError("scales must use the float32 dtype declared by metadata")
-        if tuple(self.values.shape) != self.metadata.shape:
-            raise ValueError("values shape does not match quantized metadata")
-        if tuple(self.scales.shape) != (self.metadata.shape[0],):
-            raise ValueError("scales must contain one value per matrix row")
-        if self.values.device != self.scales.device:
-            raise ValueError("values and scales must share a device")
-        if not self.values.is_contiguous() or not self.scales.is_contiguous():
-            raise ValueError("quantized values and scales must be contiguous")
-        if self.metadata.scale_index_axis != 0 or self.metadata.scale_reduction_axis != 1:
-            raise ValueError("quantized matrices require scales indexed by axis 0 over axis 1")
-        if self.metadata.accumulator_dtype != torch.float32:
-            raise ValueError("dequantized linear accumulation must use float32")
-        if self.metadata.layout != "row_major_contiguous":
-            raise ValueError("quantized matrices require row-major contiguous layout")
-        if self.metadata.quantized_min != -bound or self.metadata.quantized_max != bound:
-            raise ValueError("metadata saturation bounds do not match the quantization format")
-        if self.scales.requires_grad:
-            raise RuntimeError("quantized matrix metadata is forward-only")
-        if not bool(torch.isfinite(self.scales).all().item()) or not bool(
-            (self.scales > 0).all().item()
-        ):
-            raise ValueError("quantized scales must be finite and strictly positive")
-        if self.metadata.format == "fp8_e4m3fn":
-            finite_codes = torch.bitwise_and(self.values, 0x7F) != 0x7F
-            if not bool(finite_codes.all().item()):
-                raise ValueError("FP8 E4M3FN payload must not contain NaN encodings")
+        _validate_quantized_matrix(self)
 
 
 def _format_spec(format: QuantizationFormat) -> tuple[torch.dtype, float]:
     if format not in _FORMATS:
         raise ValueError("format must be 'fp8_e4m3fn' or 'int8'")
     return _FORMATS[format]
+
+
+def _validate_quantized_matrix(matrix: QuantizedMatrix) -> None:
+    metadata = matrix.metadata
+    expected_dtype, bound = _format_spec(metadata.format)
+    if metadata.scale_granularity not in _FORMAT_GRANULARITIES[metadata.format]:
+        raise ValueError("metadata scale granularity is unsupported for the quantization format")
+    if metadata.source_dtype != torch.float32:
+        raise ValueError("metadata source dtype must be float32")
+    if len(metadata.shape) != 2 or metadata.shape[0] <= 0 or metadata.shape[1] <= 0:
+        raise ValueError("metadata shape must contain two positive matrix dimensions")
+    if metadata.value_dtype != expected_dtype:
+        raise ValueError("metadata value dtype does not match the quantization format")
+    if metadata.scale_dtype != torch.float32:
+        raise ValueError("metadata scale dtype must be float32")
+    if metadata.scale_index_axis != 0 or metadata.scale_reduction_axis != 1:
+        raise ValueError("quantized matrices require scales indexed by axis 0 over axis 1")
+    if metadata.accumulator_dtype != torch.float32:
+        raise ValueError("dequantized linear accumulation must use float32")
+    if metadata.layout != "row_major_contiguous":
+        raise ValueError("quantized matrices require row-major contiguous layout")
+    if metadata.quantized_min != -bound or metadata.quantized_max != bound:
+        raise ValueError("metadata saturation bounds do not match the quantization format")
+
+    if matrix.values.dtype != metadata.value_dtype:
+        raise ValueError("values dtype does not match quantized metadata")
+    if matrix.scales.dtype != metadata.scale_dtype:
+        raise ValueError("scales must use the float32 dtype declared by metadata")
+    if tuple(matrix.values.shape) != metadata.shape:
+        raise ValueError("values shape does not match quantized metadata")
+    if tuple(matrix.scales.shape) != (metadata.shape[0],):
+        raise ValueError("scales must contain one value per matrix row")
+    if matrix.values.device != matrix.scales.device:
+        raise ValueError("values and scales must share a device")
+    if not matrix.values.is_contiguous() or not matrix.scales.is_contiguous():
+        raise ValueError("quantized values and scales must be contiguous")
+    if matrix.values.requires_grad or matrix.scales.requires_grad:
+        raise RuntimeError("quantized matrices are forward-only")
+    if not bool(torch.isfinite(matrix.scales).all().item()) or not bool(
+        (matrix.scales > 0).all().item()
+    ):
+        raise ValueError("quantized scales must be finite and strictly positive")
+    if metadata.format == "fp8_e4m3fn":
+        finite_codes = torch.bitwise_and(matrix.values, 0x7F) != 0x7F
+        if not bool(finite_codes.all().item()):
+            raise ValueError("FP8 E4M3FN payload must not contain NaN encodings")
+    elif not bool((matrix.values >= -127).all().item()):
+        raise ValueError("symmetric INT8 payload must stay within [-127, 127]")
 
 
 def _validate_backend(backend: QuantizationBackend) -> None:
@@ -117,6 +137,9 @@ def _validate_source_matrix(matrix: Tensor) -> None:
         raise ValueError("quantization input must be row-major contiguous")
     if matrix.requires_grad:
         raise RuntimeError("quantization experiments are forward-only")
+
+
+def _validate_finite_source_matrix(matrix: Tensor) -> None:
     if not bool(torch.isfinite(matrix).all().item()):
         raise ValueError("quantization input must contain only finite values")
 
@@ -182,6 +205,7 @@ def _quantize_matrix(
     reason = _cuda_quantize_ineligibility_reason(matrix, format)
     if backend == "cuda":
         if reason is not None:
+            _validate_finite_source_matrix(matrix)
             raise RuntimeError(f"CUDA {format} quantization is unavailable: {reason}")
         values, scales = getattr(torch.ops.ds_flash_mla_moe, _QUANTIZE_OPERATOR[format]).default(
             matrix
@@ -191,6 +215,7 @@ def _quantize_matrix(
             matrix
         )
     else:
+        _validate_finite_source_matrix(matrix)
         values, scales = _reference_quantize(matrix, format)
     return QuantizedMatrix(
         values=values,
@@ -234,6 +259,11 @@ def quantize_weights(
 def dequantize_matrix(matrix: QuantizedMatrix) -> Tensor:
     """Materialize a quantized matrix in row-major FP32 using its explicit scales."""
 
+    _validate_quantized_matrix(matrix)
+    return _dequantize_validated(matrix)
+
+
+def _dequantize_validated(matrix: QuantizedMatrix) -> Tensor:
     if matrix.metadata.format == "int8":
         normalized = matrix.values.to(torch.float32)
     else:
@@ -242,6 +272,8 @@ def dequantize_matrix(matrix: QuantizedMatrix) -> Tensor:
 
 
 def _validate_linear_inputs(activations: QuantizedMatrix, weight: QuantizedMatrix) -> None:
+    _validate_quantized_matrix(activations)
+    _validate_quantized_matrix(weight)
     if activations.metadata.scale_granularity != "per_row":
         raise ValueError("linear activations must use per_row scales")
     if weight.metadata.scale_granularity != "per_output_channel":
@@ -308,7 +340,7 @@ def dequantized_linear(
             weight.values,
             weight.scales,
         )
-    return dequantize_matrix(activations) @ dequantize_matrix(weight).T
+    return _dequantize_validated(activations) @ _dequantize_validated(weight).T
 
 
 def cuda_quantization_available(format: QuantizationFormat | None = None) -> bool:

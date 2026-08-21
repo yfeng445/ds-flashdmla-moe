@@ -78,6 +78,7 @@ __global__ void quantize_per_row_kernel(
   }
 
   __shared__ float reduction[kQuantizeThreads];
+  __shared__ float row_scale;
   reduction[threadIdx.x] = local_maximum;
   __syncthreads();
   for (int stride = kQuantizeThreads / 2; stride > 0; stride /= 2) {
@@ -88,12 +89,14 @@ __global__ void quantize_per_row_kernel(
   }
   if (threadIdx.x == 0) {
     const float bound = kFP8 ? kFP8E4M3FNBound : kInt8Bound;
-    scales[row] =
-        reduction[0] == 0.0F ? 1.0F : fmaxf(reduction[0] / bound, FLT_MIN);
+    row_scale = reduction[0] == 0.0F
+        ? 1.0F
+        : fmaxf(reduction[0] / bound, FLT_MIN);
+    scales[row] = row_scale;
   }
   __syncthreads();
 
-  const float scale = scales[row];
+  const float scale = row_scale;
   for (int64_t column = threadIdx.x; column < columns; column += blockDim.x) {
     const float normalized = row_input[column] / scale;
     if constexpr (kFP8) {
