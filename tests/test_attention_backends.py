@@ -114,6 +114,34 @@ def test_fa1_forward_matches_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 @pytest.mark.cuda
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    ("query_length", "key_length", "head_dim", "value_dim"),
+    [(1, 7, 8, 5), (4, 4, 32, 32), (7, 11, 65, 33), (9, 17, 128, 127)],
+)
+def test_fa2_forward_matches_reference(
+    causal: bool,
+    query_length: int,
+    key_length: int,
+    head_dim: int,
+    value_dim: int,
+) -> None:
+    torch.manual_seed(101)
+    q = torch.randn(2, 3, query_length, head_dim, device="cuda", dtype=torch.float16)
+    k = torch.randn(2, 3, key_length, head_dim, device="cuda", dtype=torch.float16)
+    v = torch.randn(2, 3, key_length, value_dim, device="cuda", dtype=torch.float16)
+    with torch.no_grad():
+        actual = flash_attention_forward(q, k, v, causal=causal, backend="fa2")
+        expected = blockwise_attention(q, k, v, causal=causal, block_size=3)
+    rtol, atol = _fa_tolerances()
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    assert actual.shape == (2, 3, query_length, value_dim)
+    assert actual.dtype == torch.float16
+    assert actual.is_contiguous()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
 def test_fa1_forward_uses_current_stream() -> None:
     torch.manual_seed(103)
     q = torch.empty(1, 2, 7, 65, device="cuda", dtype=torch.float16)
@@ -134,3 +162,47 @@ def test_fa1_forward_uses_current_stream() -> None:
     rtol, atol = _fa_tolerances()
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     assert cuda_attention_backend_available("fa1")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.cuda
+def test_fa2_forward_uses_current_stream() -> None:
+    torch.manual_seed(103)
+    q = torch.empty(1, 2, 7, 65, device="cuda", dtype=torch.float16)
+    k = torch.empty(1, 2, 11, 65, device="cuda", dtype=torch.float16)
+    v = torch.empty(1, 2, 11, 33, device="cuda", dtype=torch.float16)
+    stream = torch.cuda.Stream()
+
+    with torch.no_grad(), torch.cuda.stream(stream):
+        q.normal_()
+        k.normal_()
+        v.normal_()
+        actual = flash_attention_forward(q, k, v, causal=True, backend="fa2")
+        actual.record_stream(stream)
+    stream.synchronize()
+
+    with torch.no_grad():
+        expected = blockwise_attention(q, k, v, causal=True, block_size=3)
+    rtol, atol = _fa_tolerances()
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    assert cuda_attention_backend_available("fa2")
+
+
+@pytest.mark.skipif(
+    not (
+        cuda_attention_backend_available("fa1")
+        and cuda_attention_backend_available("fa2")
+    ),
+    reason="requires built FA1 and FA2 CUDA kernels",
+)
+@pytest.mark.cuda
+def test_fa1_and_fa2_match_the_same_reference_on_identical_inputs() -> None:
+    torch.manual_seed(103)
+    q = torch.randn(1, 2, 9, 65, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 2, 17, 65, device="cuda", dtype=torch.float16)
+    v = torch.randn(1, 2, 17, 33, device="cuda", dtype=torch.float16)
+    expected = blockwise_attention(q, k, v, causal=True, block_size=5)
+    rtol, atol = _fa_tolerances()
+    for backend in ("fa1", "fa2"):
+        actual = flash_attention_forward(q, k, v, causal=True, backend=backend)
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
