@@ -84,7 +84,7 @@
 - [x] Update README and relevant chapters for backend tables, activity/intermediate deltas, FA version distinctions, graph/scheduler use, quantization scope, and distributed validation boundary.
 - [x] Add reproducible benchmark commands and checked-in structured single-GPU evidence only for measurements actually run.
 - [x] Run the full pytest suite, Ruff check/format check, `git diff --check`, hosted CUDA build workflow, and direct installed-wheel RTX CUDA tests. No matching self-hosted workflow runner was registered, so the native matrix ran directly on the same RTX 5090 instead.
-- [ ] Request whole-branch code review, resolve blocking findings, merge the feature branch into `main`, and push both branch and updated `main`.
+- [x] Request whole-branch code review, resolve blocking findings, merge the feature branch into `main`, and push both branch and updated `main`.
 - [x] Commit final integration as `docs: record next-phase kernel evidence`.
 
 ## Deferred hardware evidence
