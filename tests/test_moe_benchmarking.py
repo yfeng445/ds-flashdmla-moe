@@ -113,6 +113,26 @@ def test_intermediate_bytes_are_hand_counted_from_staged_route_rows() -> None:
     }
 
 
+def test_bfloat16_intermediate_bytes_keep_compute_buffers_in_float32() -> None:
+    report = benchmark_moe_forward(_small_config(dtype="bfloat16"))
+    intermediate_bytes = report["intermediate_bytes"]
+
+    assert intermediate_bytes["floating_dtype"] == "bfloat16"
+    assert intermediate_bytes["floating_element_size"] == 2
+    assert intermediate_bytes["index_dtype"] == "int64"
+    assert intermediate_bytes["index_element_size"] == 8
+    assert intermediate_bytes["route_rows"] == 14
+    assert intermediate_bytes["dense_scores"] == 7 * 4 * 4
+    assert intermediate_bytes["packed_activations"] == 14 * 5 * 2
+    assert intermediate_bytes["packed_weights"] == 14 * 2
+    assert intermediate_bytes["packed_indices"] == 2 * 14 * 8
+    assert intermediate_bytes["expert_hidden_state"] == 14 * 9 * 4
+    assert intermediate_bytes["contributions"] == 14 * 5 * 2
+    assert intermediate_bytes["total_major_intermediates"] == (
+        7 * 4 * 4 + 14 * 5 * 2 + 14 * 2 + 2 * 14 * 8 + 14 * 9 * 4 + 14 * 5 * 2
+    )
+
+
 def test_whole_layer_benchmark_can_skip_reference_verification() -> None:
     report = benchmark_moe_forward(_small_config(verify=False))
 

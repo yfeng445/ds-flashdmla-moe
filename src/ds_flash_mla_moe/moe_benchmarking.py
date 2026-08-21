@@ -103,20 +103,22 @@ def moe_intermediate_bytes(config: MoEForwardBenchmarkConfig) -> dict[str, Any]:
     """Model the major materialized buffers in the staged single-device forward."""
 
     config.validate()
-    dtype = _dtype_from_name(config.dtype)
-    floating_element_size = torch.empty((), dtype=dtype).element_size()
+    storage_dtype = _dtype_from_name(config.dtype)
+    compute_dtype = torch.float64 if storage_dtype == torch.float64 else torch.float32
+    storage_element_size = torch.empty((), dtype=storage_dtype).element_size()
+    compute_element_size = torch.empty((), dtype=compute_dtype).element_size()
     index_element_size = torch.empty((), dtype=torch.long).element_size()
     route_rows = config.tokens * config.topk
-    dense_scores = config.tokens * config.experts * floating_element_size
-    packed_activations = route_rows * config.model_dim * floating_element_size
-    packed_weights = route_rows * floating_element_size
+    dense_scores = config.tokens * config.experts * compute_element_size
+    packed_activations = route_rows * config.model_dim * storage_element_size
+    packed_weights = route_rows * storage_element_size
     packed_indices = 2 * route_rows * index_element_size
-    expert_hidden_state = route_rows * config.hidden_dim * floating_element_size
-    contributions = route_rows * config.model_dim * floating_element_size
+    expert_hidden_state = route_rows * config.hidden_dim * compute_element_size
+    contributions = route_rows * config.model_dim * storage_element_size
     return {
         "analytical_only": True,
         "floating_dtype": config.dtype,
-        "floating_element_size": floating_element_size,
+        "floating_element_size": storage_element_size,
         "index_dtype": "int64",
         "index_element_size": index_element_size,
         "route_rows": route_rows,
