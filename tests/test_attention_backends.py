@@ -12,6 +12,23 @@ from ds_flash_mla_moe import (
 )
 
 
+@pytest.fixture
+def _require_formal_cuda_kernels() -> None:
+    unavailable = [
+        backend
+        for backend in ("fa1", "fa2")
+        if not cuda_attention_backend_available(backend)  # type: ignore[arg-type]
+    ]
+    if unavailable:
+        pytest.skip(
+            "requires built formal FA1 and FA2 CUDA kernels; unavailable: "
+            + ", ".join(unavailable)
+        )
+
+
+_REQUIRES_FORMAL_CUDA = pytest.mark.usefixtures("_require_formal_cuda_kernels")
+
+
 def _cpu_inputs(*, requires_grad: bool = False):
     q = torch.randn(1, 2, 3, 5, requires_grad=requires_grad)
     k = torch.randn(1, 2, 7, 5, requires_grad=requires_grad)
@@ -153,7 +170,7 @@ def _fa_tolerances() -> tuple[float, float]:
     return 1e-2, 1e-2
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -168,7 +185,7 @@ def test_formal_backends_reject_unsupported_cuda_dtype(
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_reject_mixed_cuda_dtypes(backend: str) -> None:
@@ -180,7 +197,7 @@ def test_formal_backends_reject_mixed_cuda_dtypes(backend: str) -> None:
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_reject_noncontiguous_cuda_storage(backend: str) -> None:
@@ -195,7 +212,7 @@ def test_formal_backends_reject_noncontiguous_cuda_storage(backend: str) -> None
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_reject_head_dim_above_128(backend: str) -> None:
@@ -207,7 +224,7 @@ def test_formal_backends_reject_head_dim_above_128(backend: str) -> None:
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_reject_value_dim_above_128(backend: str) -> None:
@@ -219,7 +236,7 @@ def test_formal_backends_reject_value_dim_above_128(backend: str) -> None:
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_reject_explicit_boolean_mask(backend: str) -> None:
@@ -236,7 +253,7 @@ def test_formal_backends_reject_explicit_boolean_mask(backend: str) -> None:
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_reject_cuda_requires_grad(backend: str) -> None:
@@ -256,7 +273,7 @@ def test_formal_backends_reject_cuda_requires_grad(backend: str) -> None:
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize(
     "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
@@ -283,7 +300,7 @@ def test_formal_cuda_operator_rejects_requires_grad_inputs_directly(
         operator(q, k, v, False, 0.5)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 @pytest.mark.parametrize(
@@ -311,7 +328,7 @@ def test_formal_backends_return_exact_empty_output(
     assert actual.numel() == 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_reject_empty_key_before_dispatch(backend: str) -> None:
@@ -323,7 +340,7 @@ def test_formal_backends_reject_empty_key_before_dispatch(backend: str) -> None:
         flash_attention_forward(q, k, v, backend=backend)  # type: ignore[arg-type]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
@@ -351,7 +368,7 @@ def test_fa1_forward_matches_reference(
     assert actual.is_contiguous()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
@@ -379,7 +396,7 @@ def test_fa2_forward_matches_reference(
     assert actual.is_contiguous()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 def test_fa1_forward_uses_current_stream() -> None:
     torch.manual_seed(103)
@@ -403,7 +420,7 @@ def test_fa1_forward_uses_current_stream() -> None:
     assert cuda_attention_backend_available("fa1")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 def test_fa2_forward_uses_current_stream() -> None:
     torch.manual_seed(103)
@@ -427,7 +444,7 @@ def test_fa2_forward_uses_current_stream() -> None:
     assert cuda_attention_backend_available("fa2")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_right_aligned_single_query_sees_full_history(
@@ -445,7 +462,7 @@ def test_formal_backends_right_aligned_single_query_sees_full_history(
     torch.testing.assert_close(actual, torch.ones_like(actual))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_right_aligned_partial_causal_boundary(backend: str) -> None:
@@ -463,7 +480,7 @@ def test_formal_backends_right_aligned_partial_causal_boundary(backend: str) -> 
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 @pytest.mark.parametrize("backend", ["fa1", "fa2"])
 def test_formal_backends_stable_softmax_with_large_logits(backend: str) -> None:
@@ -483,13 +500,7 @@ def test_formal_backends_stable_softmax_with_large_logits(backend: str) -> None:
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
 
-@pytest.mark.skipif(
-    not (
-        cuda_attention_backend_available("fa1")
-        and cuda_attention_backend_available("fa2")
-    ),
-    reason="requires built FA1 and FA2 CUDA kernels",
-)
+@_REQUIRES_FORMAL_CUDA
 @pytest.mark.cuda
 def test_fa1_and_fa2_match_the_same_reference_on_identical_inputs() -> None:
     torch.manual_seed(103)
