@@ -116,6 +116,9 @@ python benchmarks/logical_distributed.py \
 ```
 
 输出保留 route identities、checksum、协议 cell 数和上述四个证据字段，不报告速度提升。
+仓库保留了该命令的
+[结构化输出](../../validation/logical/2026-08-22-ep-tp-reference.json)；其 checksum 只用于
+固定这个 deterministic example，不是跨机或跨 GPU 运行证据。
 进入真实多卡实现前，至少还要补齐：
 
 1. 两卡与四卡上的 payload 可见性和 generation 顺序；

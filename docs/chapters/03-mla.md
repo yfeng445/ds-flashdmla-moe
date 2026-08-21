@@ -334,3 +334,21 @@ CPU 侧的 `ContinuousBatchingScheduler` 提供 `FixedPageAllocator` 及
 这条路径补上了固定页分配、请求回收和最小多请求 continuous batching，但仍没有 eviction、
 prefix sharing、chunked prefill、优先级、speculative decoding、网络层或模型执行器。它把
 storage/compute primitive 与可测试控制面接起来，仍不是完整 serving runtime。
+
+聚焦验证中，CPU scheduler 契约测试为 `20 passed`；RTX 5090 installed-wheel
+的 CUDA graph 子集为 `7 passed, 6 deselected`，覆盖 stable output address、bucket
+不兼容时 copy 前拒绝、paged-MLA raw replay、host reentrancy、cross-stream event
+串行化和 canonical int64 positions。以下命令分别复现原生 graph 和最小调度器
+lifecycle：
+
+```bash
+python -m pytest -o addopts= -ra -m cuda tests/test_cuda_graph.py
+python benchmarks/cuda_graph.py --batch 32 --width 256 --warmup 5 --iterations 20
+python benchmarks/continuous_batching.py \
+  --requests 8 --prompt-length 8 --max-new-tokens 4 \
+  --page-size 4 --num-pages 64 --max-batch-size 4
+```
+
+Graph benchmark 保留 eager/replay 原始样本但不做 speedup claim；scheduler benchmark
+不启动模型 kernel，只记录请求/页状态迁移。完整环境见
+[单卡证据快照](../../validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)。

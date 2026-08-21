@@ -405,6 +405,46 @@ launch 数、重叠或 kernel 时间，必须另存 Kineto/Nsight timeline，并
 event samples 区分。报告写入实际 `executed_backend`/`implementation` 和
 `performance_claim=false`；在真实 shape、基线和 profiler 证据齐全前，不据此作 speed claim。
 
+### 7.9.2 2026-08-22 单卡 MoE 观测
+
+以下数据来自 RTX 5090、PyTorch 2.10.0+cu128 上的同一个 FP32 workload：
+`T=128, D=64, D_h=128, E=8, K=2`，每个 backend 都执行两次 warmup 和三次
+timed iteration。Kineto capture 包含完整 profiling harness，包括新建 setup、route
+analysis、reference verification、warmup 和 timed call：
+
+| Backend | Kineto 观测的 aggregate custom-kernel activities | 观测的 device activities | 分析中间张量 bytes | 其中 metadata bytes | allocator peak delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `cuda_staged` | 66 | 676 | 281200 | 10864 | 1423360 |
+| `cuda_fused` | 42 | 586 | 211080 | 6280 | 1423360 |
+| `cuda_persistent` | 42 | 604 | 211088 | 6288 | 1423360 |
+
+相对 staged，fused 的分析中间张量减少 70120 bytes（约 24.94%），其中
+metadata 减少 4584 bytes（约 42.19%）；persistent 因 device queue 比 fused 多 8
+bytes。这些差值和源码中删除 rank/owner metadata、重复 offset、`cat/cumsum/floor_divide`
+产物、materialized contributions 以及独立 combine 的方向一致。但三者本次观测的
+allocator peak delta 相同，所以不应把分析字节差值转写为已观测的 peak-memory 降幅。
+
+`observed_custom_kernel_count` 是 Kineto key averages 中识别到的 activity occurrence
+聚合值，不是物理 launch count；parent operator 和 child kernel 也不可相加。本轮
+未采集 Nsight Systems/Compute，因此不声称 launch 数、occupancy、DRAM traffic、
+overlap 或稳定 speedup。
+
+可用下列命令逐 backend 复现同一 capture 边界：
+
+```bash
+for backend in cuda_staged cuda_fused cuda_persistent; do
+  python benchmarks/moe.py \
+    --mode kineto --device cuda --backend "$backend" --dtype float32 \
+    --tokens 128 --model-dim 64 --hidden-dim 128 \
+    --experts 8 --topk 2 --n-groups 1 --topk-groups 1 \
+    --warmup 2 --iterations 3 \
+    --output "benchmark-results/moe-${backend}-kineto.json"
+done
+```
+
+机器可读摘要、hosted build 与 installed-wheel 命令见
+[2026-08-22 单卡快照](../../validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)。
+
 ## 7.10 阶段分解不是端到端求和
 
 分布式流水线可以为每个阶段记录独立 latency，但需区分两种 max：

@@ -94,3 +94,36 @@ python benchmarks/quantized_gemm.py \
 报告保留 raw latency samples、payload/scale/output 的分析字节数，并写入
 `performance_claim=false`。只有 CUDA build、同流执行、graph replay、数值配对和 profiler 证据都来自
 同一环境后，才适合讨论实现层面的性能。
+
+## 9.5 RTX 5090 数值与 Graph 证据
+
+2026-08-22 的 hosted CUDA 12.8 build 生成 CPython 3.12 wheel，并在 RTX 5090、
+PyTorch 2.10.0+cu128 上以 installed-wheel 方式执行 CUDA-marked 量化测试：
+
+```text
+6 passed, 59 deselected in 15.29s
+```
+
+INT8 与 FP8 E4M3FN 各自覆盖三类原生路径：paired dequantized-linear
+reference、`K=513` 下跨越多个 CUDA thread/block stride 的 scale broadcast 与非零
+lane payload 精确回归，以及非默认 current stream + CUDA Graph capture/replay。
+这些测试验证数值、消费时 metadata 和图捕获契约，不验证 Tensor Core 吞吐。
+
+同一轮还对 `M=5, N=7, K=513`、一次 warmup 和两次采样运行结构化
+smoke：INT8 对 paired dequantized reference 的最大绝对误差为
+`1.71661376953125e-05`，最大 tolerance ratio 为 `0.16004451299051473`；FP8 E4M3FN
+对应为 `2.193450927734375e-05` 与 `0.1622789392032281`。这两组是小 shape 数值
+smoke，原始 timing 不用于性能结论。
+
+```bash
+python benchmarks/quantized_gemm.py \
+  --device cuda --backend cuda --format int8 \
+  --m 5 --n 7 --k 513 --warmup 1 --iterations 2
+
+python benchmarks/quantized_gemm.py \
+  --device cuda --backend cuda --format fp8_e4m3fn \
+  --m 5 --n 7 --k 513 --warmup 1 --iterations 2
+```
+
+结构化摘要和 installed-wheel pytest 命令见
+[单卡证据快照](../../validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)。

@@ -246,7 +246,8 @@ Both reports retain raw timing/trace facts and make no speedup claim.
 │   ├── attention/                # native CUDA operator source
 │   ├── gemm/                     # fixed-tile CUDA teaching kernel
 │   ├── mla/                      # staged projection/cache/absorbed MLA kernels
-│   ├── moe/                      # route and active-row SwiGLU kernels
+│   ├── moe/                      # staged/fused/persistent single-GPU MoE forwards
+│   ├── quantization/             # scalar FP8/INT8 forward experiments
 │   └── experimental/attention/   # unverified course-era CUDA prototypes
 ├── benchmarks/                   # structured latency and environment reports
 ├── docs/                         # textbook-style notes and reading guide
@@ -295,15 +296,28 @@ Both reports retain raw timing/trace facts and make no speedup claim.
 python benchmarks/logical_distributed.py --pes 2 --experts 4 --tp-size 2
 ```
 
-## Development order
+## Current boundary and next development order
 
-1. Lock down mathematical references and adversarial shape tests.
-2. Replace the attention prototypes with a verified forward kernel, followed by
-   backward.
-3. Implement MLA prefill and compressed-cache decode.
-4. Implement the unfused MoE route/dispatch/expert/combine pipeline.
-5. Migrate the verified Gloo Expert Parallel protocol to NCCL, then explore
-   fusion and overlap without changing its route-identity contract.
+The repository now has executable references and explicit forward backends for
+FA1/FA2/FA3, staged/fused/persistent single-device MoE, paged MLA graph replay,
+FP8/INT8 experiments, and a minimal continuous-batching control plane. The next
+implementation order is:
+
+1. Re-run fixed-shape Kineto baselines after each kernel change and collect
+   Nsight Systems/Compute evidence when those tools are available.
+2. Reduce the remaining router/expert scheduling launches and tune the persistent
+   single-device path without changing its explicit route-identity contract.
+3. Move the FA3 teaching path toward hardware-specific TMA/WGMMA and add
+   Tensor-Core quantized kernels only when their numerical contracts remain
+   visible through the same Python facade.
+4. Connect graph replay and the continuous-batching scheduler to a real decode
+   executor while preserving exact-shape/address and transactional page rules.
+5. Only after the single-device path is stable, implement and validate real
+   one-sided EP/TP transport on two or four GPUs.
+
+Supported development remains forward-only for these new paths. Historical
+backward experiments stay under `csrc/experimental/` and are not part of this
+milestone.
 
 Performance claims will be added only with reproducible benchmark inputs,
 hardware/software metadata, and raw results.
@@ -534,6 +548,26 @@ the optional FlashAttention-4 backend, four staged MLA FP16/BF16 native/PyTorch 
 paged MLA decode pairs. It is
 a local diagnostic snapshot, not a general performance claim, an Nsight report, or a replacement
 for self-hosted GPU CI.
+
+The [2026-08-22 next-phase snapshot](validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)
+adds installed-wheel correctness results for FA3, graph replay, FP8/INT8, and the
+three whole-layer MoE backends. Its MoE Kineto capture used one RTX 5090 workload
+with 128 tokens, 8 experts, top-2 routing, two warmups, and three timed iterations:
+
+| Backend | Observed aggregate custom-kernel activities | Observed device activities | Analytical intermediate bytes | Analytical metadata bytes |
+| --- | ---: | ---: | ---: | ---: |
+| `cuda_staged` | 66 | 676 | 281200 | 10864 |
+| `cuda_fused` | 42 | 586 | 211080 | 6280 |
+| `cuda_persistent` | 42 | 604 | 211088 | 6288 |
+
+These are Kineto aggregate activity occurrences for the complete profiling
+harness, not guaranteed physical launch counts. The byte totals are analytical
+materialization inventories, not measured DRAM traffic. No Nsight capture or
+stable speedup claim is attached to this table. The exact machine-readable
+summary and reproducible commands live beside the snapshot. The separate
+[logical EP/TP record](validation/logical/2026-08-22-ep-tp-reference.json) is a
+single-process simulation and explicitly reports that no transport, remote
+visibility, or multi-GPU behavior was verified.
 
 ## Learning material
 

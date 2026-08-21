@@ -132,6 +132,14 @@ backend 的支持范围。对于支持的输入，至少覆盖：
 以及超过其上限的
 `D` 或 `D_v`。这类测试验证的是 backend contract，而不是数值误差。
 
+2026-08-22 的 installed-wheel 单卡验证在 RTX 5090 / PyTorch 2.10.0+cu128
+上选中全部 82 个 CUDA attention-backend 用例，结果为 `82 passed, 46
+deselected`。该矩阵覆盖 FA3 的 causal/non-causal、decode、尾部 shape、raw/public
+路径和非默认 stream，同时覆盖 FA1/FA2/FA3 同输入对齐。它证明的是数值与
+stream contract，不是某个 asynchronous copy 必然降为特定指令，也不是性能结论。
+完整环境与复现命令见
+[单卡证据快照](../../validation/single-gpu/2026-08-22-rtx5090-next-phase/README.md)。
+
 ## 2.6 统一 facade、backend 矩阵与第一版正确性 kernel
 
 公开入口统一为 `flash_attention_forward`；显式 backend 的实现和当前能力如下：
@@ -156,15 +164,9 @@ q = torch.randn(1, 4, 256, 64, device="cuda", dtype=torch.float16)
 k = torch.randn(1, 4, 256, 64, device="cuda", dtype=torch.float16)
 v = torch.randn(1, 4, 256, 64, device="cuda", dtype=torch.float16)
 
-out_fa1 = flash_attention_forward(
-    q, k, v, causal=True, scale=None, attn_mask=None, backend="fa1"
-)
-out_fa2 = flash_attention_forward(
-    q, k, v, causal=True, scale=None, attn_mask=None, backend="fa2"
-)
-out_fa3 = flash_attention_forward(
-    q, k, v, causal=True, scale=None, attn_mask=None, backend="fa3"
-)
+out_fa1 = flash_attention_forward(q, k, v, causal=True, scale=None, attn_mask=None, backend="fa1")
+out_fa2 = flash_attention_forward(q, k, v, causal=True, scale=None, attn_mask=None, backend="fa2")
+out_fa3 = flash_attention_forward(q, k, v, causal=True, scale=None, attn_mask=None, backend="fa3")
 torch.testing.assert_close(out_fa1, out_fa2, atol=2e-2, rtol=2e-2)
 torch.testing.assert_close(out_fa2, out_fa3, atol=2e-2, rtol=2e-2)
 ```
