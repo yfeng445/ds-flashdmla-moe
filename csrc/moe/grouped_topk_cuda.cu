@@ -4,6 +4,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
+#include "moe_cuda_ops.h"
+
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
@@ -219,6 +221,30 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cuda(
 
 }  // namespace
 
+namespace ds_flash_mla_moe::moe {
+
+std::tuple<at::Tensor, at::Tensor> grouped_topk_cuda_entry(
+    const at::Tensor& x,
+    const at::Tensor& gate_weight,
+    int64_t topk,
+    int64_t n_groups,
+    int64_t topk_groups,
+    const std::optional<at::Tensor>& score_bias,
+    double route_scale) {
+  return grouped_topk_cuda(
+      x,
+      gate_weight,
+      topk,
+      n_groups,
+      topk_groups,
+      score_bias,
+      route_scale);
+}
+
+}  // namespace ds_flash_mla_moe::moe
+
 TORCH_LIBRARY_IMPL(ds_flash_mla_moe, CUDA, m) {
-  m.impl("grouped_topk", TORCH_FN(grouped_topk_cuda));
+  m.impl(
+      "grouped_topk",
+      TORCH_FN(ds_flash_mla_moe::moe::grouped_topk_cuda_entry));
 }

@@ -5,6 +5,8 @@
 #include <c10/util/Half.h>
 #include <torch/library.h>
 
+#include "moe_cuda_ops.h"
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -686,6 +688,26 @@ at::Tensor swiglu_experts_cuda(
 
 }  // namespace
 
+namespace ds_flash_mla_moe::moe {
+
+at::Tensor swiglu_experts_cuda_entry(
+    const at::Tensor& activations,
+    const at::Tensor& expert_offsets,
+    const at::Tensor& expert_w1,
+    const at::Tensor& expert_w2,
+    const at::Tensor& expert_w3) {
+  return swiglu_experts_cuda(
+      activations,
+      expert_offsets,
+      expert_w1,
+      expert_w2,
+      expert_w3);
+}
+
+}  // namespace ds_flash_mla_moe::moe
+
 TORCH_LIBRARY_IMPL(ds_flash_mla_moe, CUDA, m) {
-  m.impl("swiglu_experts", TORCH_FN(swiglu_experts_cuda));
+  m.impl(
+      "swiglu_experts",
+      TORCH_FN(ds_flash_mla_moe::moe::swiglu_experts_cuda_entry));
 }

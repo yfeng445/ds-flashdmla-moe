@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 import torch
@@ -22,6 +23,34 @@ EXPERTS = 4
 TOPK = 2
 GROUPS = 2
 TOPK_GROUPS = 1
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_whole_layer_cuda_sources_are_packaged_and_registered() -> None:
+    cuda_source = REPO_ROOT / "csrc" / "moe" / "deepseek_moe_forward_cuda.cu"
+    host_header = REPO_ROOT / "csrc" / "moe" / "moe_cuda_ops.h"
+    assert cuda_source.is_file()
+    assert host_header.is_file()
+
+    setup_source = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
+    assert '"csrc/moe/deepseek_moe_forward_cuda.cu"' in setup_source
+
+    operator_schema = (
+        "deepseek_moe_forward(Tensor x, Tensor gate_weight, Tensor expert_w1, "
+        "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
+        "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
+    )
+    ops_source = (REPO_ROOT / "csrc" / "ops.cpp").read_text(encoding="utf-8")
+    assert operator_schema in ops_source
+
+    manifest_lines = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+    csrc_patterns = {
+        pattern
+        for line in manifest_lines
+        if line.startswith("recursive-include csrc ")
+        for pattern in line.split()[2:]
+    }
+    assert {"*.h", "*.cu", "*.cpp"} <= csrc_patterns
 
 
 def _raw_moe_inputs(
