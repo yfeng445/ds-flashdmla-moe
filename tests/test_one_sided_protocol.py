@@ -302,3 +302,21 @@ def test_protocol_registry_validates_pe_ids_keys_and_duplicate_cells() -> None:
         protocol.open_cell(CellKey(0, 1, -1, 0, 0))
     with pytest.raises(ProtocolError, match="unknown cell"):
         protocol.cell(CellKey(1, 0, 0, 0, 0))
+
+
+def test_protocol_rejects_route_source_outside_pe_count_atomically() -> None:
+    protocol = OneSidedProtocol(pe_count=2, cell_capacity=1)
+    cell = protocol.open_cell(_key())
+    cell.begin_write(actor_pe=0, generation=0, count=1)
+    before = cell.snapshot()
+
+    with pytest.raises(ProtocolError, match="source_pe must be in"):
+        cell.write_payload(
+            actor_pe=0,
+            generation=0,
+            row_index=0,
+            identity=RouteIdentity(source_pe=2, generation=0, route_id=0),
+            payload=torch.tensor([1.0]),
+        )
+
+    assert cell.snapshot() == before

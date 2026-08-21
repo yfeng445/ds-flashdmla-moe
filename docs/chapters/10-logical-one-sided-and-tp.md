@@ -39,6 +39,12 @@ EMPTY
   -> EMPTY(next generation)
 ```
 
+dispatch 与 return 共用一个持久 protocol registry，但使用互不相同的 `round_id`：当前分别
+为 0 和 1。generation 只表示 scheduler iteration，不再同时充当 phase id。即使 source 与
+owner 是同一个 PE，或两个方向的 route 恰好交换 producer/consumer，两个 phase 也不会
+alias 到同一个 cell。完成 consumed acknowledgement 后，下一 generation 复用原 cell；本轮
+没有 payload 的既有 cell 也执行 count=0 生命周期，从而保持 generation 同步。
+
 producer 必须先预留 count、写完 `[0,count)` 的所有 payload rows，再发布同 generation
 的 ready signal。consumer 读取后发布 consumed acknowledgement；只有 producer 观察到
 同 generation 的 acknowledgement 才能 recycle。`count=0` 仍经过完整的 signal/read/ack
@@ -93,7 +99,9 @@ y=\sum_{j=0}^{p-1}W_2^{(j)}
 ```
 
 `tensor_parallel_swiglu_forward` 支持 `tp_size=1/2/4`，要求 hidden 可整除。FP64 输入使用
-FP64 partial accumulation，其余浮点输入使用 FP32，最后只 cast 一次。它是明确的
+FP64 partial accumulation，其余浮点输入使用 FP32。为匹配仓库既有 expert oracle 与原生
+WMMA stage boundary，FP16 会在 W2 前把每个 shard 的 materialized hidden round 到 FP16，
+再转回 FP32 做 down projection；最终输出只 cast 一次。它是明确的
 forward-only functional oracle：任何输入带 `requires_grad` 都会报错，包括调用方处于
 `no_grad` 上下文时。这里的 sum 是本设备上的 Python 运算，不代表执行了跨卡 reduction。
 

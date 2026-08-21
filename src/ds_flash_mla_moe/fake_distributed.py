@@ -79,6 +79,9 @@ class _CellRoute:
 class FakeDistributedMoE:
     """Run an expert dispatch/return exchange through logical protocol cells."""
 
+    _DISPATCH_ROUND_ID = 0
+    _RETURN_ROUND_ID = 1
+
     def __init__(
         self,
         *,
@@ -105,6 +108,10 @@ class FakeDistributedMoE:
         self._expert_owner = owners
         self._cell_capacity = cell_capacity
         self._completed_rounds = 0
+        self._protocol = OneSidedProtocol(
+            pe_count=pe_count,
+            cell_capacity=cell_capacity,
+        )
         self._local_experts = tuple(
             tuple(expert for expert, owner in enumerate(owners) if owner == pe)
             for pe in range(pe_count)
@@ -116,6 +123,12 @@ class FakeDistributedMoE:
     @property
     def completed_rounds(self) -> int:
         return self._completed_rounds
+
+    @property
+    def protocol(self) -> OneSidedProtocol:
+        """Return the persistent registry used by both protocol phases."""
+
+        return self._protocol
 
     def local_experts(self, pe: int) -> tuple[int, ...]:
         self._validate_pe(pe)
@@ -188,8 +201,6 @@ class FakeDistributedMoE:
         route: LogicalRoute | ReturnedRoute,
         *,
         returning: bool,
-        round_id: int,
-        buffer_slot: int,
     ) -> CellKey:
         owner = self._expert_owner[route.global_expert_id]
         producer = owner if returning else route.identity.source_pe
@@ -197,8 +208,8 @@ class FakeDistributedMoE:
         return CellKey(
             producer_pe=producer,
             consumer_pe=consumer,
-            round_id=round_id,
-            buffer_slot=buffer_slot,
+            round_id=self._RETURN_ROUND_ID if returning else self._DISPATCH_ROUND_ID,
+            buffer_slot=0,
             local_expert_slot=self._local_slot[route.global_expert_id],
         )
 
@@ -207,8 +218,6 @@ class FakeDistributedMoE:
         routes: Sequence[LogicalRoute | ReturnedRoute],
         *,
         returning: bool,
-        round_id: int,
-        buffer_slot: int,
     ) -> tuple[
         dict[CellKey, tuple[_CellRoute, ...]],
         dict[RouteIdentity, tuple[CellKey, int]],
@@ -218,8 +227,6 @@ class FakeDistributedMoE:
             key = self._cell_key(
                 route,
                 returning=returning,
-                round_id=round_id,
-                buffer_slot=buffer_slot,
             )
             grouped_lists.setdefault(key, []).append(route)
         groups: dict[CellKey, tuple[_CellRoute, ...]] = {}
@@ -244,14 +251,21 @@ class FakeDistributedMoE:
         delivery_order: tuple[RouteIdentity, ...],
         *,
         generation: int,
+        phase_round_id: int,
     ) -> tuple[tuple[OneSidedCell, tuple[_CellRoute, ...]], ...]:
-        protocol = OneSidedProtocol(
-            pe_count=self._pe_count,
-            cell_capacity=self._cell_capacity,
-        )
+        phase_keys = {
+            key
+            for key in self._protocol.cell_keys
+            if key.round_id == phase_round_id and key.buffer_slot == 0
+        }
+        all_keys = tuple(sorted(phase_keys | groups.keys()))
         cells: dict[CellKey, OneSidedCell] = {}
-        for key, rows in groups.items():
-            cell = protocol.open_cell(key, initial_generation=generation)
+        for key in all_keys:
+            rows = groups.get(key, ())
+            if key in phase_keys:
+                cell = self._protocol.cell(key)
+            else:
+                cell = self._protocol.open_cell(key, initial_generation=generation)
             cell.begin_write(
                 actor_pe=key.producer_pe,
                 generation=generation,
@@ -273,9 +287,35 @@ class FakeDistributedMoE:
             cell.signal_ready(
                 actor_pe=key.producer_pe,
                 generation=generation,
-                count=len(groups[key]),
+                count=len(groups.get(key, ())),
             )
-        return tuple((cells[key], groups[key]) for key in sorted(groups))
+        return tuple((cells[key], groups.get(key, ())) for key in all_keys)
+
+    @staticmethod
+    def _consume_cells(
+        cells: tuple[tuple[OneSidedCell, tuple[_CellRoute, ...]], ...],
+        *,
+        generation: int,
+    ) -> dict[RouteIdentity, ReturnedRoute | LogicalRoute]:
+        consumed: dict[RouteIdentity, ReturnedRoute | LogicalRoute] = {}
+        for cell, rows in cells:
+            payload_rows = cell.begin_read(
+                actor_pe=cell.key.consumer_pe,
+                generation=generation,
+            )
+            route_by_row = {row.row_index: row.route for row in rows}
+            for payload_row in payload_rows:
+                route = route_by_row[payload_row.row_index]
+                route_type = LogicalRoute if isinstance(route, LogicalRoute) else ReturnedRoute
+                consumed[payload_row.identity] = route_type(
+                    payload_row.identity, route.global_expert_id, payload_row.payload
+                )
+            cell.ack_consumed(
+                actor_pe=cell.key.consumer_pe,
+                generation=generation,
+            )
+            cell.recycle(actor_pe=cell.key.producer_pe, generation=generation)
+        return consumed
 
     def dispatch_and_return(
         self,
@@ -283,12 +323,15 @@ class FakeDistributedMoE:
         *,
         expert_fn: Callable[[int, Tensor], Tensor] | None = None,
         generation: int | None = None,
-        round_id: int | None = None,
-        buffer_slot: int = 0,
         delivery_order: Sequence[RouteIdentity] | None = None,
         return_order: Sequence[RouteIdentity] | None = None,
     ) -> SimulationResult:
-        """Dispatch, compute, and restore routes by identity, not arrival order."""
+        """Dispatch, compute, and restore routes by identity, not arrival order.
+
+        ``expert_fn`` is preflighted on private payload clones before the
+        persistent protocol is mutated. This keeps invalid expert results
+        atomic with respect to cell generations.
+        """
 
         selected_generation = self._completed_rounds if generation is None else generation
         self._validate_nonnegative(selected_generation, "generation")
@@ -297,19 +340,32 @@ class FakeDistributedMoE:
             raise SimulationError(
                 f"{direction} generation {selected_generation}; expected {self._completed_rounds}"
             )
-        selected_round = selected_generation if round_id is None else round_id
-        self._validate_nonnegative(selected_round, "round_id")
-        self._validate_nonnegative(buffer_slot, "buffer_slot")
         route_tuple = tuple(routes)
         indexed = self._validate_routes(route_tuple, selected_generation)
         identities = tuple(indexed)
         dispatch_delivery = self._validated_order(delivery_order, identities, "delivery_order")
         return_delivery = self._validated_order(return_order, identities, "return_order")
+        compute = expert_fn if expert_fn is not None else lambda _expert, payload: payload
+        computed: dict[RouteIdentity, ReturnedRoute] = {}
+        for identity, route in indexed.items():
+            value = compute(route.global_expert_id, route.payload.detach().clone())
+            if not isinstance(value, Tensor):
+                raise SimulationError("expert_fn must return a torch.Tensor")
+            computed[identity] = ReturnedRoute(
+                identity=identity,
+                global_expert_id=route.global_expert_id,
+                payload=value.detach().clone(),
+            )
+
         dispatch_groups, dispatch_positions = self._group_routes(
             route_tuple,
             returning=False,
-            round_id=selected_round,
-            buffer_slot=buffer_slot,
+        )
+
+        returned_values = tuple(computed[identity] for identity in identities)
+        return_groups, return_positions = self._group_routes(
+            returned_values,
+            returning=True,
         )
         dispatch_cells = self._execute_cells(
             dispatch_groups,
@@ -317,65 +373,28 @@ class FakeDistributedMoE:
             indexed,
             dispatch_delivery,
             generation=selected_generation,
+            phase_round_id=self._DISPATCH_ROUND_ID,
         )
+        dispatched = self._consume_cells(dispatch_cells, generation=selected_generation)
+        if dispatched.keys() != indexed.keys():
+            raise SimulationError("dispatch protocol did not preserve every route identity")
 
-        compute = expert_fn if expert_fn is not None else lambda _expert, payload: payload
-        computed: dict[RouteIdentity, ReturnedRoute] = {}
-        for cell, rows in dispatch_cells:
-            payload_rows = cell.begin_read(
-                actor_pe=cell.key.consumer_pe,
-                generation=selected_generation,
-            )
-            route_by_row = {row.row_index: row.route for row in rows}
-            for payload_row in payload_rows:
-                dispatched = route_by_row[payload_row.row_index]
-                value = compute(dispatched.global_expert_id, payload_row.payload)
-                if not isinstance(value, Tensor):
-                    raise SimulationError("expert_fn must return a torch.Tensor")
-                computed[payload_row.identity] = ReturnedRoute(
-                    identity=payload_row.identity,
-                    global_expert_id=dispatched.global_expert_id,
-                    payload=value.detach().clone(),
-                )
-            cell.ack_consumed(
-                actor_pe=cell.key.consumer_pe,
-                generation=selected_generation,
-            )
-            cell.recycle(actor_pe=cell.key.producer_pe, generation=selected_generation)
-
-        returned_values = tuple(computed[identity] for identity in identities)
-        return_groups, return_positions = self._group_routes(
-            returned_values,
-            returning=True,
-            round_id=selected_round,
-            buffer_slot=buffer_slot,
-        )
         return_cells = self._execute_cells(
             return_groups,
             return_positions,
             computed,
             return_delivery,
             generation=selected_generation,
+            phase_round_id=self._RETURN_ROUND_ID,
         )
-        restored: dict[RouteIdentity, ReturnedRoute] = {}
-        for cell, rows in return_cells:
-            payload_rows = cell.begin_read(
-                actor_pe=cell.key.consumer_pe,
-                generation=selected_generation,
-            )
-            route_by_row = {row.row_index: row.route for row in rows}
-            for payload_row in payload_rows:
-                returned = route_by_row[payload_row.row_index]
-                restored[payload_row.identity] = ReturnedRoute(
-                    identity=payload_row.identity,
-                    global_expert_id=returned.global_expert_id,
-                    payload=payload_row.payload,
-                )
-            cell.ack_consumed(
-                actor_pe=cell.key.consumer_pe,
-                generation=selected_generation,
-            )
-            cell.recycle(actor_pe=cell.key.producer_pe, generation=selected_generation)
+        consumed_returns = self._consume_cells(return_cells, generation=selected_generation)
+        restored = {
+            identity: route
+            for identity, route in consumed_returns.items()
+            if isinstance(route, ReturnedRoute)
+        }
+        if restored.keys() != computed.keys():
+            raise SimulationError("return protocol did not preserve every route identity")
 
         restored_routes = tuple(restored[identity] for identity in sorted(restored))
         self._completed_rounds += 1
@@ -383,7 +402,7 @@ class FakeDistributedMoE:
             routes=restored_routes,
             report=SimulationReport(
                 route_count=len(restored_routes),
-                dispatch_cell_count=len(dispatch_groups),
-                return_cell_count=len(return_groups),
+                dispatch_cell_count=len(dispatch_cells),
+                return_cell_count=len(return_cells),
             ),
         )

@@ -31,7 +31,7 @@ producer-consumer pipelines before applying those ideas to attention and MoE.
 | Graph replay / request scheduling | stable-buffer graph runner + FIFO control plane | CPU contracts + CUDA replay | exact-shape buckets; fixed-page transactions | no |
 | FP8/INT8 forward experiments | explicit scales + dequantized FP32 oracle | CPU + CUDA contracts | scalar E4M3FN/INT8 quantize + linear source | no |
 | Expert parallelism | variable All-to-All | CPU forward/backward | native route + async chunk pipeline | Gloo verified; NCCL CI pending |
-| Logical EP/TP foundations | topology + protocol simulator + TP SwiGLU | exhaustive CPU contracts | no transport kernel | single-process evidence only |
+| Logical EP/TP foundations | topology + protocol simulator + TP SwiGLU | CPU contract tests | no transport kernel | single-process evidence only |
 
 Files under `csrc/experimental/` are teaching prototypes. They are intentionally
 excluded from the importable wheel and supported API, and must not be treated as

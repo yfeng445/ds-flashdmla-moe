@@ -99,6 +99,8 @@ def tensor_parallel_swiglu_forward(
             gate = F.linear(x_acc, w1[start:end].to(accumulation_dtype))
             up = F.linear(x_acc, w3[start:end].to(accumulation_dtype))
             hidden_shard = F.silu(gate) * up
+            if x.dtype == torch.float16:
+                hidden_shard = hidden_shard.to(x.dtype).to(accumulation_dtype)
             partials.append(F.linear(hidden_shard, w2[:, start:end].to(accumulation_dtype)))
         output_acc = partials[0]
         for partial in partials[1:]:

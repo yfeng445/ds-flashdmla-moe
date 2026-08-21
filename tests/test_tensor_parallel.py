@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from ds_flash_mla_moe.moe import swiglu_expert
 from ds_flash_mla_moe.tensor_parallel import (
     TensorParallelReport,
     tensor_parallel_swiglu_forward,
@@ -19,19 +20,23 @@ def _inputs(*, dtype: torch.dtype = torch.float64, hidden: int = 8) -> tuple[tor
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_logical_tensor_parallel_swiglu_matches_full_high_precision_oracle(
-    tp_size: int, dtype: torch.dtype
+@pytest.mark.parametrize(
+    ("dtype", "rtol", "atol"),
+    [
+        (torch.float16, 1e-3, 1e-5),
+        (torch.bfloat16, 1.6e-2, 1e-5),
+        (torch.float32, 1e-5, 1e-6),
+        (torch.float64, 1e-12, 1e-12),
+    ],
+)
+def test_logical_tensor_parallel_swiglu_matches_existing_expert_oracle(
+    tp_size: int,
+    dtype: torch.dtype,
+    rtol: float,
+    atol: float,
 ) -> None:
     x, w1, w2, w3 = _inputs(dtype=dtype)
-    accumulation_dtype = torch.float64 if dtype == torch.float64 else torch.float32
-    expected = torch.nn.functional.linear(
-        torch.nn.functional.silu(
-            torch.nn.functional.linear(x.to(accumulation_dtype), w1.to(accumulation_dtype))
-        )
-        * torch.nn.functional.linear(x.to(accumulation_dtype), w3.to(accumulation_dtype)),
-        w2.to(accumulation_dtype),
-    ).to(dtype)
+    expected = swiglu_expert(x, w1, w2, w3)
 
     actual, report = tensor_parallel_swiglu_forward(
         x,
@@ -42,7 +47,7 @@ def test_logical_tensor_parallel_swiglu_matches_full_high_precision_oracle(
         return_report=True,
     )
 
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     assert actual.dtype == dtype
     assert not actual.requires_grad
     assert report.to_dict() == {
@@ -55,20 +60,6 @@ def test_logical_tensor_parallel_swiglu_matches_full_high_precision_oracle(
         "shard_hidden_size": 8 // tp_size,
         "accumulation_dtype": "float64" if dtype == torch.float64 else "float32",
     }
-
-
-def test_tensor_parallel_uses_float32_accumulation_for_low_precision() -> None:
-    x, w1, w2, w3 = _inputs(dtype=torch.float16)
-    expected = torch.nn.functional.linear(
-        torch.nn.functional.silu(torch.nn.functional.linear(x.float(), w1.float()))
-        * torch.nn.functional.linear(x.float(), w3.float()),
-        w2.float(),
-    ).half()
-
-    actual, report = tensor_parallel_swiglu_forward(x, w1, w2, w3, tp_size=4, return_report=True)
-
-    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
-    assert report.accumulation_dtype == "float32"
 
 
 @pytest.mark.parametrize("tp_size", [0, 3, 8, True])

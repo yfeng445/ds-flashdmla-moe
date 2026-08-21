@@ -76,6 +76,7 @@ class OneSidedCell:
         capacity: int,
         initial_generation: int = 0,
         max_generation: int = (1 << 63) - 1,
+        pe_count: int | None = None,
     ) -> None:
         if not isinstance(key, CellKey):
             raise TypeError("key must be a CellKey")
@@ -93,8 +94,13 @@ class OneSidedCell:
             or max_generation < initial_generation
         ):
             raise ValueError("max_generation must be an integer at least initial_generation")
+        if pe_count is not None:
+            _positive_integer(pe_count, "pe_count")
+            if key.producer_pe >= pe_count or key.consumer_pe >= pe_count:
+                raise ProtocolError(f"cell PE ids must be in [0, {pe_count})")
         self._key = key
         self._max_generation = max_generation
+        self._pe_count = pe_count
         self._generation = initial_generation
         self._state = CellState.EMPTY
         self._count = 0
@@ -206,6 +212,8 @@ class OneSidedCell:
                 raise ProtocolError(f"route identity {name} must be a non-negative integer")
         if identity.generation != generation:
             raise ProtocolError("route identity generation does not match the cell generation")
+        if self._pe_count is not None and identity.source_pe >= self._pe_count:
+            raise ProtocolError(f"route identity source_pe must be in [0, {self._pe_count})")
         if row_index in self._rows:
             raise ProtocolError(f"duplicate payload row {row_index}")
         if any(row.identity == identity for row in self._rows.values()):
@@ -280,6 +288,12 @@ class OneSidedProtocol:
     def cell_capacity(self) -> int:
         return self._cell_capacity
 
+    @property
+    def cell_keys(self) -> tuple[CellKey, ...]:
+        """Return stable keys for cells opened in this registry."""
+
+        return tuple(sorted(self._cells))
+
     def _validate_key(self, key: CellKey) -> None:
         if not isinstance(key, CellKey):
             raise TypeError("key must be a CellKey")
@@ -298,6 +312,7 @@ class OneSidedProtocol:
             capacity=self._cell_capacity,
             initial_generation=initial_generation,
             max_generation=self._max_generation,
+            pe_count=self._pe_count,
         )
         self._cells[key] = cell
         return cell

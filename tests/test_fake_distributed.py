@@ -9,7 +9,7 @@ from ds_flash_mla_moe.fake_distributed import (
     SimulationError,
     SimulationReport,
 )
-from ds_flash_mla_moe.one_sided_protocol import RouteIdentity
+from ds_flash_mla_moe.one_sided_protocol import CellKey, CellState, RouteIdentity
 
 
 def _route(
@@ -86,6 +86,64 @@ def test_simulator_uses_stable_owner_local_expert_slots() -> None:
     assert simulator.local_experts(1) == (3,)
     assert simulator.local_experts(2) == (0, 2, 5)
     assert [simulator.local_slot(i) for i in range(6)] == [0, 0, 1, 0, 1, 2]
+
+
+def test_local_route_uses_disjoint_dispatch_and_return_cells() -> None:
+    simulator = FakeDistributedMoE(pe_count=1, expert_owner=(0,), cell_capacity=1)
+
+    simulator.dispatch_and_return((_route(0, 0, 0, 1.0),))
+
+    assert simulator.protocol.cell_keys == (
+        CellKey(0, 0, 0, 0, 0),
+        CellKey(0, 0, 1, 0, 0),
+    )
+    for key in simulator.protocol.cell_keys:
+        cell = simulator.protocol.cell(key)
+        assert cell.state is CellState.EMPTY
+        assert cell.generation == 1
+
+
+def test_bidirectional_routes_do_not_alias_opposite_protocol_phases() -> None:
+    simulator = FakeDistributedMoE(
+        pe_count=2,
+        expert_owner=(1, 0),
+        cell_capacity=1,
+    )
+    routes = (_route(0, 0, 0, 1.0), _route(1, 0, 1, 2.0))
+
+    simulator.dispatch_and_return(routes)
+
+    assert simulator.protocol.cell_keys == (
+        CellKey(0, 1, 0, 0, 0),
+        CellKey(0, 1, 1, 0, 0),
+        CellKey(1, 0, 0, 0, 0),
+        CellKey(1, 0, 1, 0, 0),
+    )
+
+
+def test_simulator_reuses_cells_next_generation_and_advances_zero_count_cells() -> None:
+    simulator = FakeDistributedMoE(
+        pe_count=2,
+        expert_owner=(1, 0),
+        cell_capacity=1,
+    )
+    first_routes = (_route(0, 0, 0, 1.0), _route(1, 0, 1, 2.0))
+    simulator.dispatch_and_return(first_routes)
+    first_cells = {key: simulator.protocol.cell(key) for key in simulator.protocol.cell_keys}
+
+    second = simulator.dispatch_and_return(
+        (_route(0, 0, 0, 3.0, generation=1),),
+        generation=1,
+    )
+
+    assert second.report.dispatch_cell_count == 2
+    assert second.report.return_cell_count == 2
+    assert simulator.protocol.cell_keys == tuple(first_cells)
+    for key, original_cell in first_cells.items():
+        reused = simulator.protocol.cell(key)
+        assert reused is original_cell
+        assert reused.state is CellState.EMPTY
+        assert reused.generation == 2
 
 
 def test_simulator_accepts_empty_round_and_reports_zero_cells() -> None:
@@ -227,3 +285,8 @@ def test_simulator_rejects_invalid_expert_result_without_completing_round() -> N
         )
 
     assert simulator.completed_rounds == 0
+    assert simulator.protocol.cell_keys == ()
+
+    retried = simulator.dispatch_and_return((_route(0, 0, 0, 2.0),))
+    torch.testing.assert_close(retried.routes[0].payload, torch.tensor([2.0]))
+    assert simulator.completed_rounds == 1
