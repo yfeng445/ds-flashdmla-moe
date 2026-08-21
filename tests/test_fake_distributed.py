@@ -9,7 +9,13 @@ from ds_flash_mla_moe.fake_distributed import (
     SimulationError,
     SimulationReport,
 )
-from ds_flash_mla_moe.one_sided_protocol import CellKey, CellState, RouteIdentity
+from ds_flash_mla_moe.one_sided_protocol import (
+    CellKey,
+    CellState,
+    OneSidedCell,
+    PayloadRow,
+    RouteIdentity,
+)
 
 
 def _route(
@@ -227,6 +233,82 @@ def test_simulator_rejects_cell_overflow_atomically() -> None:
     assert simulator.completed_rounds == 0
 
 
+def test_simulator_rejects_overflow_before_calling_expert() -> None:
+    simulator = FakeDistributedMoE(
+        pe_count=2,
+        expert_owner=(1,),
+        cell_capacity=1,
+    )
+    routes = (_route(0, 0, 0, 1.0), _route(0, 1, 0, 2.0))
+    calls: list[int] = []
+
+    def observe(expert: int, payload: torch.Tensor) -> torch.Tensor:
+        calls.append(expert)
+        return payload
+
+    with pytest.raises(SimulationError, match="capacity"):
+        simulator.dispatch_and_return(routes, expert_fn=observe)
+
+    assert calls == []
+    assert simulator.completed_rounds == 0
+    assert simulator.protocol.cell_keys == ()
+
+
+def test_expert_computes_from_payload_consumed_by_dispatch_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    simulator = FakeDistributedMoE(pe_count=1, expert_owner=(0,), cell_capacity=1)
+    original_begin_read = OneSidedCell.begin_read
+
+    def inject_dispatched_value(
+        cell: OneSidedCell,
+        *,
+        actor_pe: int,
+        generation: int,
+    ) -> tuple[PayloadRow, ...]:
+        rows = original_begin_read(cell, actor_pe=actor_pe, generation=generation)
+        if cell.key.round_id != 0:
+            return rows
+        return tuple(PayloadRow(row.identity, row.row_index, row.payload + 10.0) for row in rows)
+
+    monkeypatch.setattr(OneSidedCell, "begin_read", inject_dispatched_value)
+    observed: list[torch.Tensor] = []
+
+    def compute(_expert: int, payload: torch.Tensor) -> torch.Tensor:
+        observed.append(payload.clone())
+        return payload * 2.0
+
+    result = simulator.dispatch_and_return(
+        (_route(0, 0, 0, 1.0),),
+        expert_fn=compute,
+    )
+
+    assert len(observed) == 1
+    torch.testing.assert_close(observed[0], torch.tensor([11.0]))
+    torch.testing.assert_close(result.routes[0].payload, torch.tensor([22.0]))
+
+
+def test_protocol_preflight_finishes_before_expert_callback() -> None:
+    simulator = FakeDistributedMoE(pe_count=1, expert_owner=(0,), cell_capacity=1)
+    simulator.dispatch_and_return((_route(0, 0, 0, 1.0),))
+    return_key = CellKey(0, 0, 1, 0, 0)
+    simulator.protocol.cell(return_key).begin_write(
+        actor_pe=0,
+        generation=1,
+        count=0,
+    )
+    calls: list[int] = []
+
+    with pytest.raises(SimulationError, match="must be EMPTY"):
+        simulator.dispatch_and_return(
+            (_route(0, 0, 0, 2.0, generation=1),),
+            generation=1,
+            expert_fn=lambda expert, payload: calls.append(expert) or payload,
+        )
+
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "order",
     [
@@ -290,3 +372,28 @@ def test_simulator_rejects_invalid_expert_result_without_completing_round() -> N
     retried = simulator.dispatch_and_return((_route(0, 0, 0, 2.0),))
     torch.testing.assert_close(retried.routes[0].payload, torch.tensor([2.0]))
     assert simulator.completed_rounds == 1
+
+
+def test_expert_failure_restores_reused_cell_generations_for_retry() -> None:
+    simulator = FakeDistributedMoE(pe_count=1, expert_owner=(0,), cell_capacity=1)
+    simulator.dispatch_and_return((_route(0, 0, 0, 1.0),))
+    cells = {key: simulator.protocol.cell(key) for key in simulator.protocol.cell_keys}
+
+    with pytest.raises(ValueError, match="compute failed"):
+        simulator.dispatch_and_return(
+            (_route(0, 0, 0, 2.0, generation=1),),
+            generation=1,
+            expert_fn=lambda _expert, _payload: (_ for _ in ()).throw(ValueError("compute failed")),
+        )
+
+    assert simulator.completed_rounds == 1
+    for key, cell in cells.items():
+        assert simulator.protocol.cell(key) is cell
+        assert cell.state is CellState.EMPTY
+        assert cell.generation == 1
+
+    retried = simulator.dispatch_and_return(
+        (_route(0, 0, 0, 3.0, generation=1),),
+        generation=1,
+    )
+    torch.testing.assert_close(retried.routes[0].payload, torch.tensor([3.0]))

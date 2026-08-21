@@ -14,6 +14,7 @@ from torch import Tensor
 
 from .one_sided_protocol import (
     CellKey,
+    CellState,
     OneSidedCell,
     OneSidedProtocol,
     RouteIdentity,
@@ -253,12 +254,11 @@ class FakeDistributedMoE:
         generation: int,
         phase_round_id: int,
     ) -> tuple[tuple[OneSidedCell, tuple[_CellRoute, ...]], ...]:
-        phase_keys = {
-            key
-            for key in self._protocol.cell_keys
-            if key.round_id == phase_round_id and key.buffer_slot == 0
-        }
-        all_keys = tuple(sorted(phase_keys | groups.keys()))
+        all_keys, phase_keys = self._preflight_cells(
+            groups,
+            generation=generation,
+            phase_round_id=phase_round_id,
+        )
         cells: dict[CellKey, OneSidedCell] = {}
         for key in all_keys:
             rows = groups.get(key, ())
@@ -290,6 +290,33 @@ class FakeDistributedMoE:
                 count=len(groups.get(key, ())),
             )
         return tuple((cells[key], groups.get(key, ())) for key in all_keys)
+
+    def _preflight_cells(
+        self,
+        groups: dict[CellKey, tuple[_CellRoute, ...]],
+        *,
+        generation: int,
+        phase_round_id: int,
+    ) -> tuple[tuple[CellKey, ...], set[CellKey]]:
+        phase_keys = {
+            key
+            for key in self._protocol.cell_keys
+            if key.round_id == phase_round_id and key.buffer_slot == 0
+        }
+        all_keys = tuple(sorted(phase_keys | groups.keys()))
+        for key in all_keys:
+            self._protocol.validate_cell_key(key)
+            if key in phase_keys:
+                cell = self._protocol.cell(key)
+                if cell.state is not CellState.EMPTY:
+                    raise SimulationError(f"protocol cell {key} must be EMPTY before an iteration")
+                if cell.generation != generation:
+                    direction = "stale" if generation < cell.generation else "future"
+                    raise SimulationError(
+                        f"{direction} generation {generation} for protocol cell {key}; "
+                        f"expected {cell.generation}"
+                    )
+        return all_keys, phase_keys
 
     @staticmethod
     def _consume_cells(
@@ -328,9 +355,10 @@ class FakeDistributedMoE:
     ) -> SimulationResult:
         """Dispatch, compute, and restore routes by identity, not arrival order.
 
-        ``expert_fn`` is preflighted on private payload clones before the
-        persistent protocol is mutated. This keeps invalid expert results
-        atomic with respect to cell generations.
+        Structural and protocol preflight completes before ``expert_fn`` is
+        called. Expert computation consumes the payload cloned out of the
+        dispatch cell. Any exception restores the persistent protocol to its
+        pre-iteration state.
         """
 
         selected_generation = self._completed_rounds if generation is None else generation
@@ -345,56 +373,86 @@ class FakeDistributedMoE:
         identities = tuple(indexed)
         dispatch_delivery = self._validated_order(delivery_order, identities, "delivery_order")
         return_delivery = self._validated_order(return_order, identities, "return_order")
-        compute = expert_fn if expert_fn is not None else lambda _expert, payload: payload
-        computed: dict[RouteIdentity, ReturnedRoute] = {}
-        for identity, route in indexed.items():
-            value = compute(route.global_expert_id, route.payload.detach().clone())
-            if not isinstance(value, Tensor):
-                raise SimulationError("expert_fn must return a torch.Tensor")
-            computed[identity] = ReturnedRoute(
-                identity=identity,
-                global_expert_id=route.global_expert_id,
-                payload=value.detach().clone(),
-            )
-
         dispatch_groups, dispatch_positions = self._group_routes(
             route_tuple,
             returning=False,
         )
-
-        returned_values = tuple(computed[identity] for identity in identities)
+        return_placeholders = tuple(
+            ReturnedRoute(
+                identity=identity,
+                global_expert_id=route.global_expert_id,
+                payload=route.payload,
+            )
+            for identity, route in indexed.items()
+        )
         return_groups, return_positions = self._group_routes(
-            returned_values,
+            return_placeholders,
             returning=True,
         )
-        dispatch_cells = self._execute_cells(
+        self._preflight_cells(
             dispatch_groups,
-            dispatch_positions,
-            indexed,
-            dispatch_delivery,
             generation=selected_generation,
             phase_round_id=self._DISPATCH_ROUND_ID,
         )
-        dispatched = self._consume_cells(dispatch_cells, generation=selected_generation)
-        if dispatched.keys() != indexed.keys():
-            raise SimulationError("dispatch protocol did not preserve every route identity")
-
-        return_cells = self._execute_cells(
+        self._preflight_cells(
             return_groups,
-            return_positions,
-            computed,
-            return_delivery,
             generation=selected_generation,
             phase_round_id=self._RETURN_ROUND_ID,
         )
-        consumed_returns = self._consume_cells(return_cells, generation=selected_generation)
-        restored = {
-            identity: route
-            for identity, route in consumed_returns.items()
-            if isinstance(route, ReturnedRoute)
-        }
-        if restored.keys() != computed.keys():
-            raise SimulationError("return protocol did not preserve every route identity")
+        checkpoint = self._protocol._checkpoint()
+        try:
+            dispatch_cells = self._execute_cells(
+                dispatch_groups,
+                dispatch_positions,
+                indexed,
+                dispatch_delivery,
+                generation=selected_generation,
+                phase_round_id=self._DISPATCH_ROUND_ID,
+            )
+            dispatched = self._consume_cells(
+                dispatch_cells,
+                generation=selected_generation,
+            )
+            if dispatched.keys() != indexed.keys() or not all(
+                isinstance(route, LogicalRoute) for route in dispatched.values()
+            ):
+                raise SimulationError("dispatch protocol did not preserve every route identity")
+
+            compute = expert_fn if expert_fn is not None else lambda _expert, payload: payload
+            computed: dict[RouteIdentity, ReturnedRoute] = {}
+            for identity in identities:
+                route = dispatched[identity]
+                value = compute(route.global_expert_id, route.payload)
+                if not isinstance(value, Tensor):
+                    raise SimulationError("expert_fn must return a torch.Tensor")
+                computed[identity] = ReturnedRoute(
+                    identity=identity,
+                    global_expert_id=route.global_expert_id,
+                    payload=value.detach().clone(),
+                )
+
+            return_cells = self._execute_cells(
+                return_groups,
+                return_positions,
+                computed,
+                return_delivery,
+                generation=selected_generation,
+                phase_round_id=self._RETURN_ROUND_ID,
+            )
+            consumed_returns = self._consume_cells(
+                return_cells,
+                generation=selected_generation,
+            )
+            restored = {
+                identity: route
+                for identity, route in consumed_returns.items()
+                if isinstance(route, ReturnedRoute)
+            }
+            if restored.keys() != computed.keys():
+                raise SimulationError("return protocol did not preserve every route identity")
+        except BaseException:
+            self._protocol._restore(checkpoint)
+            raise
 
         restored_routes = tuple(restored[identity] for identity in sorted(restored))
         self._completed_rounds += 1

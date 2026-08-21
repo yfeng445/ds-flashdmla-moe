@@ -60,6 +60,14 @@ class CellSnapshot:
     route_identities: tuple[RouteIdentity, ...]
 
 
+@dataclass(frozen=True)
+class _CellCheckpoint:
+    state: CellState
+    generation: int
+    count: int
+    rows: tuple[PayloadRow, ...]
+
+
 def _positive_integer(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -147,6 +155,30 @@ class OneSidedCell:
             row_indices=tuple(row.row_index for row in rows),
             route_identities=tuple(row.identity for row in rows),
         )
+
+    def _checkpoint(self) -> _CellCheckpoint:
+        return _CellCheckpoint(
+            state=self._state,
+            generation=self._generation,
+            count=self._count,
+            rows=tuple(
+                PayloadRow(row.identity, row.row_index, row.payload.detach().clone())
+                for row in (self._rows[index] for index in sorted(self._rows))
+            ),
+        )
+
+    def _restore(self, checkpoint: _CellCheckpoint) -> None:
+        self._state = checkpoint.state
+        self._generation = checkpoint.generation
+        self._count = checkpoint.count
+        self._rows = {
+            row.row_index: PayloadRow(
+                row.identity,
+                row.row_index,
+                row.payload.detach().clone(),
+            )
+            for row in checkpoint.rows
+        }
 
     def _require_actor(self, actor_pe: int, *, producer: bool) -> None:
         expected = self._key.producer_pe if producer else self._key.consumer_pe
@@ -294,7 +326,9 @@ class OneSidedProtocol:
 
         return tuple(sorted(self._cells))
 
-    def _validate_key(self, key: CellKey) -> None:
+    def validate_cell_key(self, key: CellKey) -> None:
+        """Validate a key without opening or mutating a protocol cell."""
+
         if not isinstance(key, CellKey):
             raise TypeError("key must be a CellKey")
         OneSidedCell._validate_key_fields(key)
@@ -304,7 +338,7 @@ class OneSidedProtocol:
             raise ProtocolError(f"consumer_pe must be in [0, {self._pe_count})")
 
     def open_cell(self, key: CellKey, *, initial_generation: int = 0) -> OneSidedCell:
-        self._validate_key(key)
+        self.validate_cell_key(key)
         if key in self._cells:
             raise ProtocolError(f"cell {key} already exists")
         cell = OneSidedCell(
@@ -318,8 +352,26 @@ class OneSidedProtocol:
         return cell
 
     def cell(self, key: CellKey) -> OneSidedCell:
-        self._validate_key(key)
+        self.validate_cell_key(key)
         try:
             return self._cells[key]
         except KeyError as error:
             raise ProtocolError(f"unknown cell {key}") from error
+
+    def _checkpoint(
+        self,
+    ) -> tuple[tuple[CellKey, OneSidedCell, _CellCheckpoint], ...]:
+        return tuple((key, cell, cell._checkpoint()) for key, cell in sorted(self._cells.items()))
+
+    def _restore(
+        self,
+        checkpoint: tuple[tuple[CellKey, OneSidedCell, _CellCheckpoint], ...],
+    ) -> None:
+        retained = {key for key, _cell, _state in checkpoint}
+        for key in tuple(self._cells):
+            if key not in retained:
+                del self._cells[key]
+        for key, cell, state in checkpoint:
+            if self._cells.get(key) is not cell:
+                raise RuntimeError("protocol checkpoint cell identity changed")
+            cell._restore(state)
