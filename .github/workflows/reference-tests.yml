@@ -21,7 +21,7 @@ jobs:
       - run: python -m pip install -e '.[test]'
       - run: ruff format --check src tests examples benchmarks setup.py
       - run: ruff check src tests examples benchmarks setup.py
-      - run: pytest
+      - run: python -m pytest
       - name: Run tail-shape GEMM validator
         if: matrix.python-version == '3.12'
         run: >-
