@@ -124,6 +124,19 @@ DS_FLASH_BUILD_CUDA=1 python -m pip install --no-build-isolation .
 pytest -ra
 ```
 
+The explicit teaching backends keep their implementation differences visible:
+
+| Backend | CTA ownership | K/V movement | Online-softmax state |
+|---|---|---|---|
+| `fa1` | one CTA per batch/head, K/V-outer | synchronous FP32 shared tile | FP32 global workspace between K/V tiles |
+| `fa2` | one CTA per query tile | synchronous FP32 shared tile | FP32 registers until the final store |
+| `fa3` | one CTA per query tile | asynchronous double-buffered FP16 shared stages | FP32 registers until the final store |
+
+`fa3` is a forward-only pipeline teaching kernel, not production
+FlashAttention-3: it does not claim TMA/WGMMA, warp specialization, FP8, or a
+measured speedup. Explicit `fa1`/`fa2`/`fa3` requests fail on unsupported inputs
+or missing native operators; `auto` does not select these teaching paths.
+
 The attention kernel accepts contiguous FP16, BF16, or FP32 tensors with a
 shared dtype and shape `[B, H, S, D]`. It supports right-aligned causal attention
 and `S_q != S_k`, but not explicit masks. Dot products, online-softmax state, and

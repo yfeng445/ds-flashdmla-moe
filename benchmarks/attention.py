@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
             "blockwise",
             "fa1",
             "fa2",
+            "fa3",
             "sdpa",
             "flash-attn-4",
         ),

@@ -33,6 +33,7 @@ AttentionBenchmarkBackend = Literal[
     "blockwise",
     "fa1",
     "fa2",
+    "fa3",
     "sdpa",
     "flash-attn-4",
 ]
@@ -83,14 +84,15 @@ class AttentionBenchmarkConfig:
             "blockwise",
             "fa1",
             "fa2",
+            "fa3",
             "sdpa",
             "flash-attn-4",
         }:
             raise ValueError(
-                "backend must be auto, cuda, cuda_rowwise, reference, blockwise, fa1, fa2, "
+                "backend must be auto, cuda, cuda_rowwise, reference, blockwise, fa1, fa2, fa3, "
                 "sdpa, or flash-attn-4"
             )
-        if self.backend in {"fa1", "fa2"}:
+        if self.backend in {"fa1", "fa2", "fa3"}:
             try:
                 device_type = torch.device(self.device).type
             except RuntimeError as error:
@@ -482,11 +484,16 @@ def benchmark_attention(config: AttentionBenchmarkConfig) -> dict[str, Any]:
         notes.append(
             "latency includes the BHSD-to-BSHD layout adapter and contiguous BHSD output copy"
         )
-    elif config.backend in {"fa1", "fa2"}:
+    elif config.backend in {"fa1", "fa2", "fa3"}:
         notes.append(
             f"backend={config.backend} is a repository teaching kernel using FP32 accumulation "
             "and no Tensor Cores"
         )
+        if config.backend == "fa3":
+            notes.append(
+                "backend=fa3 demonstrates double-buffered asynchronous K/V staging; it is not "
+                "a production Hopper/Blackwell FA3 implementation"
+            )
     report = {
         "schema_version": 1,
         "configuration": asdict(config),

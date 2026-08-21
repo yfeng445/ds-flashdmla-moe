@@ -20,6 +20,8 @@ TORCH_LIBRARY(ds_flash_mla_moe, m) {
   m.def(
       "attention_fa2_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor");
   m.def(
+      "attention_fa3_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor");
+  m.def(
       "attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v, bool causal, float scale) -> (Tensor, Tensor, Tensor)");
   m.def(
       "route_pack(Tensor x, Tensor route_weights, Tensor expert_indices, Tensor expert_owner, int world_size) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");

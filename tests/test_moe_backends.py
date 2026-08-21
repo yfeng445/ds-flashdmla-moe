@@ -93,6 +93,7 @@ def test_cuda_build_gate_includes_formal_attention_and_whole_layer_moe_ops() -> 
     for operator in (
         "attention_fa1_forward",
         "attention_fa2_forward",
+        "attention_fa3_forward",
         "deepseek_moe_forward",
         "deepseek_moe_forward_fused",
         "deepseek_moe_forward_persistent",

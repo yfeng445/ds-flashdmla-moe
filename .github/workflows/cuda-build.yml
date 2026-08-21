@@ -59,6 +59,7 @@ jobs:
               "attention_forward",
               "attention_fa1_forward",
               "attention_fa2_forward",
+              "attention_fa3_forward",
               "attention_backward",
               "route_pack",
               "route_combine",

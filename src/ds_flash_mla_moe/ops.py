@@ -30,8 +30,9 @@ AttentionBackend = Literal[
     "blockwise",
     "fa1",
     "fa2",
+    "fa3",
 ]
-NativeAttentionBackend = Literal["cuda_rowwise", "fa1", "fa2"]
+NativeAttentionBackend = Literal["cuda_rowwise", "fa1", "fa2", "fa3"]
 GEMMBackend = Literal["auto", "cuda", "reference"]
 MLABackend = Literal["auto", "cuda", "reference"]
 
@@ -93,6 +94,9 @@ _FA1_FORWARD_SCHEMA = (
 )
 _FA2_FORWARD_SCHEMA = (
     "attention_fa2_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor"
+)
+_FA3_FORWARD_SCHEMA = (
+    "attention_fa3_forward(Tensor q, Tensor k, Tensor v, bool causal, float scale) -> Tensor"
 )
 _BACKWARD_SCHEMA = (
     "attention_backward(Tensor grad_output, Tensor q, Tensor k, Tensor v, "
@@ -176,6 +180,7 @@ _SCHEMAS = {
     "attention_forward": _FORWARD_SCHEMA,
     "attention_fa1_forward": _FA1_FORWARD_SCHEMA,
     "attention_fa2_forward": _FA2_FORWARD_SCHEMA,
+    "attention_fa3_forward": _FA3_FORWARD_SCHEMA,
     "attention_backward": _BACKWARD_SCHEMA,
     "route_pack": _ROUTE_PACK_SCHEMA,
     "route_combine": _ROUTE_COMBINE_SCHEMA,
@@ -250,7 +255,7 @@ def _fake_formal_attention_forward(
     torch._check(
         not any(tensor.requires_grad for tensor in (q, k, v)),
         lambda: (
-            "formal FA1/FA2 forward kernels are forward-only and do not accept "
+            "teaching FA1/FA2/FA3 forward kernels are forward-only and do not accept "
             "requires_grad tensors"
         ),
     )
@@ -1240,6 +1245,9 @@ torch.library.register_fake(
 torch.library.register_fake(
     "ds_flash_mla_moe::attention_fa2_forward", _fake_formal_attention_forward
 )
+torch.library.register_fake(
+    "ds_flash_mla_moe::attention_fa3_forward", _fake_formal_attention_forward
+)
 torch.library.register_fake("ds_flash_mla_moe::route_pack", _fake_route_pack)
 torch.library.register_fake("ds_flash_mla_moe::route_combine", _fake_route_combine)
 torch.library.register_fake("ds_flash_mla_moe::tiled_gemm", _fake_tiled_gemm)
@@ -1762,6 +1770,7 @@ _ATTENTION_OPERATOR = {
     "cuda_rowwise": "attention_forward",
     "fa1": "attention_fa1_forward",
     "fa2": "attention_fa2_forward",
+    "fa3": "attention_fa3_forward",
 }
 
 
@@ -1771,7 +1780,7 @@ def cuda_attention_backend_available(
     """Return whether the selected native attention backend can execute."""
 
     if backend not in _ATTENTION_OPERATOR:
-        raise ValueError("native attention backend must be cuda_rowwise, fa1, or fa2")
+        raise ValueError("native attention backend must be cuda_rowwise, fa1, fa2, or fa3")
     return (
         _NATIVE_EXTENSION_LOADED
         and torch.cuda.is_available()
@@ -2366,17 +2375,19 @@ def _attention_backend_ineligibility_reason(
     *,
     attn_mask: Tensor | None,
 ) -> str | None:
-    if backend in {"fa1", "fa2"} and any(t.requires_grad for t in (q, k, v)):
+    if backend in {"fa1", "fa2", "fa3"} and any(t.requires_grad for t in (q, k, v)):
         return f"{backend} is forward-only and does not accept requires_grad tensors"
     if q.ndim != 4:
         return "the CUDA kernel requires [batch, heads, sequence, dimension] tensors"
     supported = (
         {torch.float16}
-        if backend in {"fa1", "fa2"}
+        if backend in {"fa1", "fa2", "fa3"}
         else {torch.float16, torch.bfloat16, torch.float32}
     )
     if q.dtype not in supported:
-        rendered = "float16" if backend in {"fa1", "fa2"} else "float16, bfloat16, or float32"
+        rendered = (
+            "float16" if backend in {"fa1", "fa2", "fa3"} else "float16, bfloat16, or float32"
+        )
         return f"{backend} supports {rendered}"
     if k.dtype != q.dtype or v.dtype != q.dtype:
         return "q, k, and v must have the same dtype"
@@ -2384,8 +2395,8 @@ def _attention_backend_ineligibility_reason(
         return "the CUDA kernel requires contiguous tensors"
     if attn_mask is not None:
         return "the CUDA kernel does not support an explicit attention mask"
-    if backend in {"fa1", "fa2"} and (q.shape[-1] > 128 or v.shape[-1] > 128):
-        return "formal FA1/FA2 currently require head_dim <= 128 and value_dim <= 128"
+    if backend in {"fa1", "fa2", "fa3"} and (q.shape[-1] > 128 or v.shape[-1] > 128):
+        return "teaching FA1/FA2/FA3 require head_dim <= 128 and value_dim <= 128"
     if not _NATIVE_EXTENSION_LOADED:
         return "the native extension is not installed"
     if any(t.device.type != "cuda" for t in (q, k, v)):
@@ -2422,9 +2433,20 @@ def flash_attention_forward(
     """Dispatch attention to a strict backend or the automatic row-wise fallback."""
 
     _validate_attention_inputs(q, k, v)
-    valid = {"auto", "cuda", "cuda_rowwise", "reference", "blockwise", "fa1", "fa2"}
+    valid = {
+        "auto",
+        "cuda",
+        "cuda_rowwise",
+        "reference",
+        "blockwise",
+        "fa1",
+        "fa2",
+        "fa3",
+    }
     if backend not in valid:
-        raise ValueError("backend must be auto, cuda_rowwise, reference, blockwise, fa1, or fa2")
+        raise ValueError(
+            "backend must be auto, cuda_rowwise, reference, blockwise, fa1, fa2, or fa3"
+        )
     if backend == "cuda":
         warnings.warn(
             "backend='cuda' is deprecated; use backend='cuda_rowwise'",
