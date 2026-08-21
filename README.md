@@ -1,7 +1,9 @@
-# DeepSeek Flash MLA + MoE
+# AI Infra Kernel Lab
 
-A correctness-first study and implementation of the two sparse-compute building
-blocks used by DeepSeek-style language models:
+A correctness-first PyTorch/CUDA lab for FlashAttention, DeepSeek MLA/MoE,
+expert parallelism, reproducible benchmarks, and HPC-for-AI notes. The current
+implementation track centers on two sparse-compute building blocks used by
+DeepSeek-style language models:
 
 - Multi-head Latent Attention (MLA), with FlashAttention-inspired kernels.
 - Group-limited Mixture-of-Experts (MoE), including a correctness-first

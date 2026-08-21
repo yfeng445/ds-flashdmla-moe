@@ -26,7 +26,7 @@ test = ["numpy>=1.26", "pytest>=8", "ruff>=0.9"]
 cuda-build = ["ninja>=1.11"]
 
 [project.urls]
-Repository = "https://github.com/yfeng445/ds-flashdmla-moe"
+Repository = "https://github.com/yfeng445/ai-infra-kernel-lab"
 
 [tool.setuptools.packages.find]
 where = ["src"]
