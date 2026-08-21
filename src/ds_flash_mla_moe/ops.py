@@ -120,6 +120,11 @@ _GROUPED_TOPK_SCHEMA = (
     "grouped_topk(Tensor x, Tensor gate_weight, int topk, int n_groups, "
     "int topk_groups, Tensor? score_bias, float route_scale) -> (Tensor, Tensor)"
 )
+_DEEPSEEK_MOE_FORWARD_SCHEMA = (
+    "deepseek_moe_forward(Tensor x, Tensor gate_weight, Tensor expert_w1, "
+    "Tensor expert_w2, Tensor expert_w3, int topk, int n_groups, "
+    "int topk_groups, Tensor? score_bias, float route_scale) -> Tensor"
+)
 _MLA_ABSORBED_ATTENTION_SCHEMA = (
     "mla_absorbed_attention(Tensor q_nope, Tensor q_pe, Tensor kv, Tensor pe, "
     "Tensor key_up, Tensor value_up, Tensor query_positions, Tensor key_positions, "
@@ -168,6 +173,7 @@ _SCHEMAS = {
     "swiglu_experts": _SWIGLU_EXPERTS_SCHEMA,
     "expert_major_pack": _EXPERT_MAJOR_PACK_SCHEMA,
     "grouped_topk": _GROUPED_TOPK_SCHEMA,
+    "deepseek_moe_forward": _DEEPSEEK_MOE_FORWARD_SCHEMA,
     "mla_absorbed_attention": _MLA_ABSORBED_ATTENTION_SCHEMA,
     "mla_query_projection": _MLA_QUERY_PROJECTION_SCHEMA,
     "mla_query_lora_projection": _MLA_QUERY_LORA_PROJECTION_SCHEMA,
@@ -844,6 +850,53 @@ def _fake_grouped_topk(
     )
 
 
+def _fake_deepseek_moe_forward(
+    x: Tensor,
+    gate_weight: Tensor,
+    expert_w1: Tensor,
+    expert_w2: Tensor,
+    expert_w3: Tensor,
+    topk: int,
+    n_groups: int,
+    topk_groups: int,
+    score_bias: Tensor | None,
+    route_scale: float,
+) -> Tensor:
+    tensors = (x, gate_weight, expert_w1, expert_w2, expert_w3)
+    floating_tensors = tensors if score_bias is None else (*tensors, score_bias)
+    torch._check(
+        not any(tensor.requires_grad for tensor in floating_tensors),
+        lambda: (
+            "the DeepSeek MoE forward operator is forward-only and does not accept "
+            "requires_grad tensors"
+        ),
+    )
+    torch._check(x.ndim == 2 and gate_weight.ndim == 2)
+    torch._check(expert_w1.ndim == 3 and expert_w2.ndim == 3 and expert_w3.ndim == 3)
+
+    experts, model_dim = gate_weight.shape
+    hidden = expert_w1.shape[1]
+    torch._check(experts > 0 and hidden > 0 and model_dim > 0)
+    torch._check(x.shape[1] == model_dim)
+    torch._check(expert_w1.shape == (experts, hidden, model_dim))
+    torch._check(expert_w2.shape == (experts, model_dim, hidden))
+    torch._check(expert_w3.shape == (experts, hidden, model_dim))
+
+    torch._check(all(tensor.is_floating_point() for tensor in floating_tensors))
+    torch._check(all(tensor.dtype == x.dtype for tensor in floating_tensors))
+    torch._check(all(tensor.device == x.device for tensor in floating_tensors))
+    torch._check(all(tensor.is_contiguous() for tensor in floating_tensors))
+    if score_bias is not None:
+        torch._check(score_bias.shape == (experts,))
+
+    torch._check(n_groups > 0 and experts % n_groups == 0)
+    torch._check(1 <= topk_groups <= n_groups)
+    torch._check(1 <= topk <= experts)
+    torch._check(topk <= topk_groups * (experts // n_groups))
+    torch._check(math.isfinite(route_scale))
+    return x.new_empty(x.shape)
+
+
 def _fake_mla_absorbed_attention(
     q_nope: Tensor,
     q_pe: Tensor,
@@ -1177,6 +1230,9 @@ torch.library.register_fake("ds_flash_mla_moe::tiled_gemm", _fake_tiled_gemm)
 torch.library.register_fake("ds_flash_mla_moe::swiglu_experts", _fake_swiglu_experts)
 torch.library.register_fake("ds_flash_mla_moe::expert_major_pack", _fake_expert_major_pack)
 torch.library.register_fake("ds_flash_mla_moe::grouped_topk", _fake_grouped_topk)
+torch.library.register_fake(
+    "ds_flash_mla_moe::deepseek_moe_forward", _fake_deepseek_moe_forward
+)
 torch.library.register_fake(
     "ds_flash_mla_moe::mla_absorbed_attention", _fake_mla_absorbed_attention
 )

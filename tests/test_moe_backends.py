@@ -5,13 +5,15 @@ from collections.abc import Callable
 import pytest
 import torch
 from torch import Tensor
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from ds_flash_mla_moe import (
     cuda_moe_available,
     deepseek_moe_forward,
     deepseek_moe_reference,
-    moe_ops,
 )
+from ds_flash_mla_moe import moe_ops as facade_ops
+from ds_flash_mla_moe import ops as moe_ops
 
 TOKENS = 7
 MODEL_DIM = 5
@@ -20,6 +22,251 @@ EXPERTS = 4
 TOPK = 2
 GROUPS = 2
 TOPK_GROUPS = 1
+
+
+def _raw_moe_inputs(
+    *,
+    tokens: int = TOKENS,
+    model_dim: int = MODEL_DIM,
+    hidden: int = HIDDEN,
+    experts: int = EXPERTS,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cpu",
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    options = {"dtype": dtype, "device": device}
+    return (
+        torch.empty(tokens, model_dim, **options),
+        torch.empty(experts, model_dim, **options),
+        torch.empty(experts, hidden, model_dim, **options),
+        torch.empty(experts, model_dim, hidden, **options),
+        torch.empty(experts, hidden, model_dim, **options),
+    )
+
+
+def _call_raw_moe(
+    inputs: tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
+    *,
+    topk: int = TOPK,
+    n_groups: int = GROUPS,
+    topk_groups: int = TOPK_GROUPS,
+    score_bias: Tensor | None = None,
+    route_scale: float = 1.0,
+) -> Tensor:
+    return torch.ops.ds_flash_mla_moe.deepseek_moe_forward.default(
+        *inputs,
+        topk,
+        n_groups,
+        topk_groups,
+        score_bias,
+        route_scale,
+    )
+
+
+def _noncontiguous_empty_like(tensor: Tensor) -> Tensor:
+    return torch.empty(
+        (*tensor.shape, 2),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )[..., 0]
+
+
+def test_raw_moe_operator_schema_is_always_defined() -> None:
+    assert moe_ops._operator_is_defined("deepseek_moe_forward")
+
+
+@pytest.mark.parametrize(
+    "dispatch_key",
+    ("CPU", "AutogradCUDA", "CompositeExplicitAutograd", "CompositeImplicitAutograd"),
+)
+def test_raw_moe_operator_has_only_forward_native_dispatch_policy(
+    dispatch_key: str,
+) -> None:
+    assert not torch._C._dispatch_has_kernel_for_dispatch_key(  # type: ignore[attr-defined]
+        "ds_flash_mla_moe::deepseek_moe_forward",
+        dispatch_key,
+    )
+
+
+@pytest.mark.parametrize("tokens", [0, TOKENS])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_raw_moe_fake_propagates_flattened_output_metadata(
+    tokens: int,
+    with_bias: bool,
+) -> None:
+    with FakeTensorMode():
+        inputs = _raw_moe_inputs(tokens=tokens)
+        score_bias = (
+            torch.empty(EXPERTS, dtype=inputs[0].dtype, device=inputs[0].device)
+            if with_bias
+            else None
+        )
+
+        output = _call_raw_moe(inputs, score_bias=score_bias)
+
+        assert output.shape == (tokens, MODEL_DIM)
+        assert output.dtype == inputs[0].dtype
+        assert output.device == inputs[0].device
+        assert output.stride() == (MODEL_DIM, 1)
+        assert output.is_contiguous()
+
+
+@pytest.mark.parametrize(
+    ("index", "shape"),
+    [
+        (0, (1, TOKENS, MODEL_DIM)),
+        (1, (EXPERTS, 1, MODEL_DIM)),
+        (2, (EXPERTS, HIDDEN)),
+        (3, (EXPERTS, MODEL_DIM)),
+        (4, (EXPERTS, HIDDEN, MODEL_DIM, 1)),
+    ],
+)
+def test_raw_moe_fake_rejects_invalid_input_ranks(
+    index: int,
+    shape: tuple[int, ...],
+) -> None:
+    with FakeTensorMode():
+        inputs = list(_raw_moe_inputs())
+        inputs[index] = torch.empty(shape, dtype=torch.float32)
+
+        with pytest.raises(RuntimeError):
+            _call_raw_moe(tuple(inputs))
+
+
+@pytest.mark.parametrize(
+    ("index", "shape"),
+    [
+        (0, (TOKENS, MODEL_DIM + 1)),
+        (1, (EXPERTS + 1, MODEL_DIM)),
+        (1, (EXPERTS, MODEL_DIM + 1)),
+        (2, (EXPERTS + 1, HIDDEN, MODEL_DIM)),
+        (2, (EXPERTS, HIDDEN + 1, MODEL_DIM)),
+        (2, (EXPERTS, HIDDEN, MODEL_DIM + 1)),
+        (3, (EXPERTS + 1, MODEL_DIM, HIDDEN)),
+        (3, (EXPERTS, MODEL_DIM + 1, HIDDEN)),
+        (3, (EXPERTS, MODEL_DIM, HIDDEN + 1)),
+        (4, (EXPERTS + 1, HIDDEN, MODEL_DIM)),
+        (4, (EXPERTS, HIDDEN + 1, MODEL_DIM)),
+        (4, (EXPERTS, HIDDEN, MODEL_DIM + 1)),
+    ],
+)
+def test_raw_moe_fake_rejects_inconsistent_dimensions(
+    index: int,
+    shape: tuple[int, ...],
+) -> None:
+    with FakeTensorMode():
+        inputs = list(_raw_moe_inputs())
+        inputs[index] = torch.empty(shape, dtype=torch.float32)
+
+        with pytest.raises(RuntimeError):
+            _call_raw_moe(tuple(inputs))
+
+
+@pytest.mark.parametrize(
+    ("experts", "hidden", "model_dim"),
+    [(0, HIDDEN, MODEL_DIM), (EXPERTS, 0, MODEL_DIM), (EXPERTS, HIDDEN, 0)],
+)
+def test_raw_moe_fake_rejects_nonpositive_model_dimensions(
+    experts: int,
+    hidden: int,
+    model_dim: int,
+) -> None:
+    with FakeTensorMode(), pytest.raises(RuntimeError):
+        _call_raw_moe(
+            _raw_moe_inputs(
+                experts=experts,
+                hidden=hidden,
+                model_dim=model_dim,
+            )
+        )
+
+
+def test_raw_moe_fake_rejects_nonfloating_inputs() -> None:
+    with FakeTensorMode(), pytest.raises(RuntimeError):
+        _call_raw_moe(_raw_moe_inputs(dtype=torch.int64))
+
+
+@pytest.mark.parametrize("index", range(5))
+def test_raw_moe_fake_rejects_mismatched_input_dtypes(index: int) -> None:
+    with FakeTensorMode():
+        inputs = list(_raw_moe_inputs())
+        inputs[index] = torch.empty(inputs[index].shape, dtype=torch.float64)
+
+        with pytest.raises(RuntimeError):
+            _call_raw_moe(tuple(inputs))
+
+
+def test_raw_moe_fake_rejects_mismatched_input_devices() -> None:
+    with FakeTensorMode():
+        inputs = list(_raw_moe_inputs())
+        inputs[1] = torch.empty(inputs[1].shape, dtype=torch.float32, device="meta")
+
+        with pytest.raises(RuntimeError):
+            _call_raw_moe(tuple(inputs))
+
+
+@pytest.mark.parametrize("index", range(6))
+def test_raw_moe_fake_rejects_noncontiguous_inputs(index: int) -> None:
+    with FakeTensorMode():
+        inputs = list(_raw_moe_inputs())
+        score_bias = torch.empty(EXPERTS, dtype=torch.float32)
+        if index < len(inputs):
+            inputs[index] = _noncontiguous_empty_like(inputs[index])
+        else:
+            score_bias = _noncontiguous_empty_like(score_bias)
+
+        with pytest.raises(RuntimeError):
+            _call_raw_moe(tuple(inputs), score_bias=score_bias)
+
+
+@pytest.mark.parametrize("failure", ["shape", "dtype", "device"])
+def test_raw_moe_fake_rejects_invalid_score_bias(failure: str) -> None:
+    with FakeTensorMode():
+        inputs = _raw_moe_inputs()
+        if failure == "shape":
+            score_bias = torch.empty(EXPERTS, 1, dtype=torch.float32)
+        elif failure == "dtype":
+            score_bias = torch.empty(EXPERTS, dtype=torch.float64)
+        else:
+            score_bias = torch.empty(EXPERTS, dtype=torch.float32, device="meta")
+
+        with pytest.raises(RuntimeError):
+            _call_raw_moe(inputs, score_bias=score_bias)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"topk": 0},
+        {"topk": EXPERTS + 1},
+        {"topk": 3, "n_groups": GROUPS, "topk_groups": TOPK_GROUPS},
+        {"n_groups": 0},
+        {"n_groups": 3},
+        {"n_groups": GROUPS, "topk_groups": 0},
+        {"n_groups": GROUPS, "topk_groups": GROUPS + 1},
+        {"route_scale": float("nan")},
+        {"route_scale": float("inf")},
+        {"route_scale": float("-inf")},
+    ],
+)
+def test_raw_moe_fake_rejects_invalid_routing_configuration(
+    overrides: dict[str, int | float],
+) -> None:
+    with FakeTensorMode(), pytest.raises(RuntimeError):
+        _call_raw_moe(_raw_moe_inputs(), **overrides)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("index", range(6))
+def test_raw_moe_fake_rejects_requires_grad_inputs(index: int) -> None:
+    with FakeTensorMode():
+        inputs = list(_raw_moe_inputs())
+        score_bias = torch.empty(EXPERTS, dtype=torch.float32)
+        if index < len(inputs):
+            inputs[index].requires_grad_(True)
+        else:
+            score_bias.requires_grad_(True)
+
+        with pytest.raises(RuntimeError, match="forward-only"):
+            _call_raw_moe(tuple(inputs), score_bias=score_bias)
 
 
 def _moe_inputs(
@@ -381,7 +628,7 @@ def test_cuda_moe_available_queries_whole_layer_operator(monkeypatch) -> None:
         return False
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(moe_ops, "_operator_has_cuda_kernel", has_cuda_kernel)
+    monkeypatch.setattr(facade_ops, "_operator_has_cuda_kernel", has_cuda_kernel)
 
     assert not cuda_moe_available()
     assert operators == ["deepseek_moe_forward"]
@@ -397,10 +644,10 @@ def test_eligible_auto_calls_native_once(monkeypatch) -> None:
         native_calls += 1
         return expected
 
-    monkeypatch.setattr(moe_ops, "_cuda_moe_ineligibility_reason", lambda *a, **k: None)
-    monkeypatch.setattr(moe_ops, "_call_cuda_moe", call_native)
+    monkeypatch.setattr(facade_ops, "_cuda_moe_ineligibility_reason", lambda *a, **k: None)
+    monkeypatch.setattr(facade_ops, "_call_cuda_moe", call_native)
     monkeypatch.setattr(
-        moe_ops,
+        facade_ops,
         "deepseek_moe_packed_reference",
         lambda *a, **k: pytest.fail("reference fallback"),
     )
@@ -421,16 +668,16 @@ def test_ineligible_auto_calls_packed_reference_once(monkeypatch) -> None:
         return expected
 
     monkeypatch.setattr(
-        moe_ops,
+        facade_ops,
         "_cuda_moe_ineligibility_reason",
         lambda *a, **k: "not eligible",
     )
     monkeypatch.setattr(
-        moe_ops,
+        facade_ops,
         "_call_cuda_moe",
         lambda *a, **k: pytest.fail("native dispatch"),
     )
-    monkeypatch.setattr(moe_ops, "deepseek_moe_packed_reference", call_reference)
+    monkeypatch.setattr(facade_ops, "deepseek_moe_packed_reference", call_reference)
 
     actual = deepseek_moe_forward(*inputs, topk=TOPK, backend="auto")
 
@@ -441,14 +688,14 @@ def test_ineligible_auto_calls_packed_reference_once(monkeypatch) -> None:
 
 def test_selected_cuda_failure_is_not_retried(monkeypatch) -> None:
     inputs = _moe_inputs(dtype=torch.float32)
-    monkeypatch.setattr(moe_ops, "_cuda_moe_ineligibility_reason", lambda *a, **k: None)
+    monkeypatch.setattr(facade_ops, "_cuda_moe_ineligibility_reason", lambda *a, **k: None)
     monkeypatch.setattr(
-        moe_ops,
+        facade_ops,
         "_call_cuda_moe",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("launch failed")),
     )
     monkeypatch.setattr(
-        moe_ops,
+        facade_ops,
         "deepseek_moe_packed_reference",
         lambda *a, **k: pytest.fail("fallback"),
     )
@@ -459,14 +706,14 @@ def test_selected_cuda_failure_is_not_retried(monkeypatch) -> None:
 def test_reference_backend_ignores_native_eligibility(monkeypatch) -> None:
     inputs = _moe_inputs(dtype=torch.float32)
     expected = torch.full_like(inputs[0], 7.0)
-    monkeypatch.setattr(moe_ops, "_cuda_moe_ineligibility_reason", lambda *a, **k: None)
+    monkeypatch.setattr(facade_ops, "_cuda_moe_ineligibility_reason", lambda *a, **k: None)
     monkeypatch.setattr(
-        moe_ops,
+        facade_ops,
         "_call_cuda_moe",
         lambda *a, **k: pytest.fail("native dispatch"),
     )
     monkeypatch.setattr(
-        moe_ops,
+        facade_ops,
         "deepseek_moe_packed_reference",
         lambda *a, **k: expected,
     )
@@ -481,7 +728,7 @@ def test_reference_backend_ignores_native_eligibility(monkeypatch) -> None:
 def test_reference_backend_never_invokes_native_for_cuda_tensors(monkeypatch) -> None:
     inputs = _moe_inputs(dtype=torch.float32, device="cuda")
     monkeypatch.setattr(
-        moe_ops,
+        facade_ops,
         "_call_cuda_moe",
         lambda *a, **k: pytest.fail("native dispatch"),
     )
