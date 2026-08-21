@@ -233,6 +233,7 @@ def _fake_formal_attention_forward(
     torch._check(q.dtype == torch.float16)
     torch._check(k.dtype == q.dtype and v.dtype == q.dtype)
     torch._check(q.shape[-1] <= 128 and v.shape[-1] <= 128)
+    torch._check(k.shape[-2] > 0)
     return output
 
 

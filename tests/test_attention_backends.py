@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import ds_flash_mla_moe.ops as attention_ops
 from ds_flash_mla_moe import flash_attention_forward
@@ -59,3 +60,17 @@ def test_cuda_alias_warns_and_uses_rowwise_contract() -> None:
 def test_formal_operator_schemas_exist_without_native_extension() -> None:
     assert attention_ops._operator_is_defined("attention_fa1_forward")
     assert attention_ops._operator_is_defined("attention_fa2_forward")
+
+
+@pytest.mark.parametrize(
+    "operator_name", ["attention_fa1_forward", "attention_fa2_forward"]
+)
+def test_formal_operator_fake_rejects_zero_key_length(operator_name: str) -> None:
+    with FakeTensorMode():
+        q = torch.randn(1, 2, 3, 5, dtype=torch.float16)
+        k = torch.randn(1, 2, 0, 5, dtype=torch.float16)
+        v = torch.randn(1, 2, 0, 4, dtype=torch.float16)
+        operator = getattr(torch.ops.ds_flash_mla_moe, operator_name).default
+
+        with pytest.raises(RuntimeError):
+            operator(q, k, v, False, 0.5)
