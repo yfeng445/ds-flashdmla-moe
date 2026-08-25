@@ -161,7 +161,7 @@ finite `[-448, 448]` encodings as explicit `uint8` payload bits. Both
 forward-only. Explicit `backend="cuda"` requests fail when the format, device,
 shape, dtype, or native operator is unavailable; only `auto` may fall back. The
 native scalar kernels accumulate/output FP32 and make no Tensor Core or speedup
-claim. See [the quantization chapter](docs/chapters/09-fp8-int8-quantization.md).
+claim. See [the quantization chapter](docs/courses/NEU_INFO_7375/chapters/09-fp8-int8-quantization.md).
 
 `swiglu_experts_expert_major(..., backend="cuda")` accepts contiguous FP16 or FP32
 expert-major rows, an int64 offsets vector, and local `[E_l,D_h,D]`/
@@ -250,9 +250,13 @@ Both reports retain raw timing/trace facts and make no speedup claim.
 │   ├── quantization/             # scalar FP8/INT8 forward experiments
 │   └── experimental/attention/   # unverified course-era CUDA prototypes
 ├── benchmarks/                   # structured latency and environment reports
-├── docs/                         # textbook-style notes and reading guide
+├── docs/
+│   ├── courses/NEU_INFO_7375/   # syllabus, notes, chapters, sources, exercises
+│   ├── interviews/              # topic-based interview Q&A
+│   └── papers/                  # paper index, originals, and translations
 ├── examples/                     # runnable reference examples
 ├── src/ds_flash_mla_moe/         # supported Python specifications
+├── superpowers/                  # historical design and implementation records
 ├── tests/                        # numerical and semantic contracts
 └── validation/                   # checked-in hardware validation snapshots
 ```
@@ -571,10 +575,12 @@ visibility, or multi-GPU behavior was verified.
 
 ## Learning material
 
-The [`docs/`](docs/index.md) directory is organized as a compact textbook. It
-starts from stable online softmax, derives MLA and DeepSeekMoE, and then maps the
-equations to CUDA and distributed execution. It also contains a curated reading
-list rather than copies of course PDFs or books.
+The [`docs/`](docs/index.md) directory is organized into
+[courses](docs/courses/NEU_INFO_7375/index.md),
+[interview Q&A](docs/interviews/index.md), and
+[papers and references](docs/papers/index.md). The current course starts from
+stable online softmax, derives MLA and DeepSeekMoE, and then maps the equations
+to CUDA and distributed execution.
 
 ## Attribution
 
