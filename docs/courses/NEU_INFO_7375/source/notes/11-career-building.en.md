@@ -126,10 +126,3 @@ plan from a real job description. Links change quickly, so refresh them through
 project sites, community job boards, and company career pages. Decompose each
 description into problem domain, programming stack, distributed or hardware
 requirements, performance-validation expectations, and optional skills.
-
-## Relation to the General Guide
-
-The [AI Infrastructure Knowledge and Interview Guide](../../../../interviews/index.md)
-reorganizes these career topics together with attention, MLA, MoE,
-communication, inference, and performance analysis. This file preserves the
-source page's topic order and coverage.

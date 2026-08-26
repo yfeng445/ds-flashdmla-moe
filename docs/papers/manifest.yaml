@@ -1,0 +1,61 @@
+schema_version: 1
+generated_on: "2026-08-26"
+
+rights:
+  repository_license_applies: false
+  note: >-
+    These PDFs are external works and retain their original rights. Their presence
+    in this repository does not relicense them under the repository MIT License.
+
+collections:
+  - id: career-vault-infra
+    source_repository: /Users/allen/Documents/GitHub/career-vault
+    source_revision: 74ea0f53b169
+    source_root: 八股/Infra/papers
+    copied_byte_for_byte: true
+    source_path_rule: "八股/Infra/papers/{target_basename}"
+    file_count: 60
+    original_count: 44
+    translation_count: 16
+    translation_status: ai-generated-unreviewed
+    target_roots:
+      - attention-kernels
+      - mla-transformers
+      - moe
+      - distributed-training
+      - serving
+      - scaling-foundations
+
+  - id: neu-flashmoe-v3
+    source_repository: /Users/allen/Documents/GitHub/NEU
+    source_revision: 737a59d70030
+    copied_byte_for_byte: true
+    file_count: 2
+    version: arXiv:2506.04667v3
+    original_source: 3/INFO 7375/week_11/FlashMoE - Fast Distributed MoE in a Single Kernel.pdf
+    translation_source: 3/INFO 7375/week_11/FlashMoE：在单一内核中的快速分布式混合专家.pdf
+    original_target: moe/originals/FlashMoE - Fast Distributed MoE in a Single Kernel.pdf
+    translation_target: moe/translations/zh-CN/FlashMoE - 在单一内核中的快速分布式混合专家.pdf
+    translation_status: ai-generated-unreviewed
+
+  - id: neu-pmpp-4e
+    source_repository: /Users/allen/Documents/GitHub/NEU
+    source_revision: 737a59d70030
+    file_count: 18
+    original_count: 1
+    translation_count: 17
+    original_source: 3/INFO 7375/PMPP 4th. ed.pdf
+    original_target: books/pmpp-4e/original/programming-massively-parallel-processors-4e.pdf
+    watermark_preserved: true
+    translation_sources:
+      - 3/INFO 7375/_pmpp_ch/ch1.pdf through ch16.pdf
+      - 3/INFO 7375/week_07/第20章 异构计算集群编程：CUDA 流简介.pdf
+    translation_target_root: books/pmpp-4e/translations/zh-CN
+    translation_status: ai-generated-unreviewed-partial
+
+expected_totals:
+  pdf_files: 80
+  research_originals: 45
+  research_translations: 17
+  book_originals: 1
+  book_translations: 17

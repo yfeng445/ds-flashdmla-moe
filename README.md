@@ -252,7 +252,6 @@ Both reports retain raw timing/trace facts and make no speedup claim.
 ├── benchmarks/                   # structured latency and environment reports
 ├── docs/
 │   ├── courses/NEU_INFO_7375/   # syllabus, notes, chapters, sources, exercises
-│   ├── interviews/              # topic-based interview Q&A
 │   └── papers/                  # paper index, originals, and translations
 ├── examples/                     # runnable reference examples
 ├── src/ds_flash_mla_moe/         # supported Python specifications
@@ -575,9 +574,8 @@ visibility, or multi-GPU behavior was verified.
 
 ## Learning material
 
-The [`docs/`](docs/index.md) directory is organized into
-[courses](docs/courses/NEU_INFO_7375/index.md),
-[interview Q&A](docs/interviews/index.md), and
+The [`docs/`](docs/index.md) directory is a technical library organized into
+[courses](docs/courses/NEU_INFO_7375/index.md) and
 [papers and references](docs/papers/index.md). The current course starts from
 stable online softmax, derives MLA and DeepSeekMoE, and then maps the equations
 to CUDA and distributed execution.

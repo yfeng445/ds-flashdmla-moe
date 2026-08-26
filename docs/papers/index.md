@@ -1,97 +1,83 @@
 # AI Infra 论文与参考资料
 
-本目录用于保存 AI Infra 相关论文的可合法分发原文、翻译件、阅读笔记和索引。当前先按主题列出原始论文、官方代码和适合补基础的教材，便于建立可追溯的实现依据。
+本目录保存与本项目相关的论文原文、中文译件和 PMPP 第四版参考资料。当前馆藏共
+80 份 PDF：45 份研究原文、17 份研究译件、1 份 PMPP4 原书和 17 份 PMPP4
+中文章节。
 
-新增材料时应记录论文标题、作者、原始链接、版本或发布日期，以及原文授权信息。翻译件还应标注对应原文版本和翻译状态；无法确认再分发权限时，只保留外部链接和原创阅读笔记。
+现有中文件均来自历史课程资料，尚未完成人工逐页审校。文件名中的 `ai-draft`
+表示 AI 初译，`ai-summary` 表示摘要或节译；没有这些后缀的历史译件也应按
+“AI 生成、未审校”理解。仓库的 MIT License 不覆盖这些外部作品。
 
-## 并行计算与 CUDA 基础
+- [完整馆藏目录](catalog.md)
+- [来源与迁移清单](manifest.yaml)
+- [PMPP4 原书与章节说明](books/pmpp-4e/README.md)
 
-1. David B. Kirk, Wen-mei W. Hwu, Izzat El Hajj，*Programming Massively
-   Parallel Processors: A Hands-on Approach*，第 4 版。重点阅读线程组织、内存层次、
-   tiling、reduction、scan 和性能分析章节。
-2. Jesper Larsson Träff，*Lectures on Parallel Computing*。用于理解并行代价模型、
-   MPI 与集合通信。
-3. [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
-   与 [CUDA C++ Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)。
-4. [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/)，只在需要核对
-   指令语义时查阅，不建议从头通读。
-5. [Hopper Tuning Guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/) 与
-   [Tensor Memory Accelerator programming guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/#asynchronous-data-copies-using-the-tensor-memory-accelerator-tma)，
-   用于继续学习 TMA、异步 transaction barrier 与 Hopper 资源限制。
-6. CUDA Programming Guide 的
-   [Warp Matrix Functions（固定 CUDA 12.0 文档）](https://docs.nvidia.com/cuda/archive/12.0.0/cuda-c-programming-guide/index.html#warp-matrix-functions)，
-   用于核对 WMMA 的 warp 一致执行、内存对齐、leading dimension 与支持的混合精度 tile。
-7. [Asynchronous Data Copies](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html)，
-   用于区分同步 shared staging、`memcpy_async` 与 Hopper TMA，不把 WMMA 本身误写成异步
-   数据流水线。
+## 馆藏结构
 
-## Attention 与在线 Softmax
+| 主题 | 原文 | 中文件 | 入口 |
+| --- | ---: | ---: | --- |
+| Attention 与 GPU kernel | 7 | 5 | [`attention-kernels/`](attention-kernels/) |
+| MLA 与 Transformer | 7 | 3 | [`mla-transformers/`](mla-transformers/) |
+| MoE 与通信融合 | 10 | 8 | [`moe/`](moe/) |
+| 分布式训练与分片 | 14 | 0 | [`distributed-training/`](distributed-training/) |
+| 推理与 serving | 5 | 1 | [`serving/`](serving/) |
+| Scaling 与低精度 | 2 | 0 | [`scaling-foundations/`](scaling-foundations/) |
+| PMPP 第四版 | 1 | 17 | [`books/pmpp-4e/`](books/pmpp-4e/) |
 
-1. Milakov, Gimelshein，
-   [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867)。
-2. Dao et al.，
-   [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135)。
-3. Dao，
-   [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691)。
-4. Shah et al.，
-   [FlashAttention-3](https://arxiv.org/abs/2407.08608)。
-5. [FlashAttention 官方实现与测试](https://github.com/Dao-AILab/flash-attention)。
+## 当前实现主线
 
-## Transformer 与 MLA
+### CUDA、Attention 与 MLA
 
-1. Jurafsky, Martin，
-   [Speech and Language Processing](https://web.stanford.edu/~jurafsky/slp3/)，重点补充
-   embeddings、neural networks、LLM 与 Transformer 章节。
-2. DeepSeek-AI，
-   [DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model](https://arxiv.org/abs/2405.04434)。
-3. DeepSeek-AI，
-   [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437)。
-4. [DeepSeek-V3 官方 inference reference](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py)，
-   用于核对 MLA 的 NoPE/RoPE 拆分、latent cache 与 weight absorption。
+1. [PMPP 第四版原书](<books/pmpp-4e/original/programming-massively-parallel-processors-4e.pdf>)
+   → [Online Softmax](<attention-kernels/originals/Online normalizer calculation for softmax.pdf>)
+   → [FlashAttention](<attention-kernels/originals/FlashAttention - Fast and Memory-Efficient Exact Attention with IO-Awareness.pdf>)。
+2. [FlashAttention-2](<attention-kernels/originals/FlashAttention-2 - Faster Attention with Better Parallelism and Work Partitioning.pdf>)
+   → [Hopper/CUTLASS case study](<attention-kernels/originals/A Case Study in CUDA Kernel Fusion - Implementing FlashAttention-2 on NVIDIA Hopper Architecture using the CUTLASS Library.pdf>)
+   → [ThunderKittens](<attention-kernels/originals/ThunderKittens - Simple, Fast, and Adorable AI Kernels.pdf>)。
+3. [RoFormer](<mla-transformers/originals/RoFormer - Enhanced Transformer with Rotary Position Embedding.pdf>)
+   → [DeepSeek-V2](<mla-transformers/originals/DeepSeek-V2 - A Strong, Economical, and Efficient Mixture-of-Experts Language Model.pdf>)
+   → [DeepSeek-V3](<mla-transformers/originals/DeepSeek-V3 Technical Report.pdf>)
+   → [TransMLA](<mla-transformers/originals/TransMLA - Multi-Head Latent Attention Is All You Need.pdf>)。
 
-## MoE 与分布式执行
+### MoE、通信与分布式训练
 
-1. Shazeer et al.，
-   [Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer](https://arxiv.org/abs/1701.06538)。
-2. Lepikhin et al.，
-   [GShard](https://arxiv.org/abs/2006.16668)。
-3. Fedus et al.，
-   [Switch Transformers](https://arxiv.org/abs/2101.03961)。
-4. Dai et al.，
-   [DeepSeekMoE](https://arxiv.org/abs/2401.06066)。
-5. Wang et al.，
-   [Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts](https://arxiv.org/abs/2408.15664)。
-6. [NCCL User Guide](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/)，重点阅读
-   point-to-point、group calls、stream semantics 与 collective 操作。
-7. [NVSHMEM Memory Model](https://docs.nvidia.com/nvshmem/api/gen/mem-model.html)、
-   [Memory Ordering](https://docs.nvidia.com/nvshmem/api/gen/api/ordering.html) 与
-   [Signaling Operations](https://docs.nvidia.com/nvshmem/api/gen/api/signal.html)，用于核对
-   symmetric address、fence/quiet、put-with-signal 和 wait/test 语义。
-8. Aimuyo, Oh, Singh，
-   [FlashMoE: Fast Distributed MoE in a Single Kernel](https://arxiv.org/abs/2506.04667)，
-   以及[官方实现](https://github.com/osayamenja/FlashMoE)。
-9. [Triton-distributed](https://github.com/ByteDance-Seed/Triton-distributed)，用于继续研究
-   tile-centric 通信—计算重叠、task scheduling 与 distributed megakernel。
+1. [Sparsely-Gated MoE](<moe/originals/Outrageously Large Neural Networks - The Sparsely-Gated Mixture-of-Experts Layer.pdf>)
+   → [GShard](<moe/originals/GShard - Scaling Giant Models with Conditional Computation and Automatic Sharding.pdf>)
+   → [Switch Transformer](<moe/originals/Switch Transformers - Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.pdf>)
+   → [DeepSeekMoE](<moe/originals/DeepSeekMoE - Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models.pdf>)。
+2. [CCFuser](<moe/originals/Harnessing Inter-GPU Shared Memory for Seamless MoE Communication-Computation Fusion.pdf>)
+   → [FlashDMoE v2](<moe/originals/FlashDMoE - Fast Distributed MoE in a Single Kernel.pdf>)
+   → [FlashMoE v3](<moe/originals/FlashMoE - Fast Distributed MoE in a Single Kernel.pdf>)。
+3. [Megatron-LM](<distributed-training/originals/Megatron-LM - Training Multi-Billion Parameter Language Models Using Model Parallelism.pdf>)
+   → [PyTorch FSDP](<distributed-training/originals/PyTorch FSDP - Experiences on Scaling Fully Sharded Data Parallel.pdf>)
+   → [SimpleFSDP](<distributed-training/originals/SimpleFSDP - Simpler Fully Sharded Data Parallel with torch.compile.pdf>)
+   → [Hecate](<moe/originals/Hecate - Unlocking Efficient Sparse Model Training via Fully Sharded Sparse Data Parallelism.pdf>)。
 
-## PyTorch 扩展与验证
+### Serving 与低精度
 
-1. [PyTorch Custom C++ and CUDA Operators](https://pytorch.org/tutorials/advanced/cpp_custom_ops.html)。
-2. [`torch.utils.cpp_extension`](https://docs.pytorch.org/docs/stable/cpp_extension.html)。
-3. [`torch.library.opcheck`](https://docs.pytorch.org/docs/stable/library.html#torch.library.opcheck)
-   与 `torch.autograd.gradcheck`，用于验证注册、fake tensor、autograd 和数值梯度。
-4. [PyTorch C++/CUDA extension 官方示例](https://github.com/pytorch/extension-cpp)，用于核对
-   dispatcher 注册、动态库加载和 ahead-of-time build 的最小结构。
-5. [PyTorch Distributed：同步与异步 collective](https://docs.pytorch.org/docs/stable/distributed.html#synchronous-and-asynchronous-collective-operations)，
-   用于核对 NCCL `async_op`、`Work.wait()`、CUDA stream 依赖和多 communicator 顺序约束。
-6. [ProcessGroupNCCL 环境变量](https://docs.pytorch.org/docs/stable/torch_nccl_environment_variables.html)，
-   用于区分默认的 stream dependency 与 `TORCH_NCCL_BLOCKING_WAIT` 所启用的 host-blocking
-   调试行为。
+1. [PagedAttention](<serving/originals/Efficient Memory Management for Large Language Model Serving with PagedAttention.pdf>)
+   → [Attention Sinks](<serving/originals/Efficient Streaming Language Models with Attention Sinks.pdf>)
+   → [AlpaServe](<serving/originals/AlpaServe - Statistical Multiplexing with Model Parallelism for Deep Learning Serving.pdf>)。
+2. [Training Compute-Optimal Large Language Models](<scaling-foundations/originals/Training Compute-Optimal Large Language Models.pdf>)
+   → [Scaling Laws for Precision](<scaling-foundations/originals/Scaling Laws for Precision.pdf>)。
 
-## 推荐路径
+## 版本与译件说明
 
-- CUDA 初学者：PMPP → 在线 Softmax → FlashAttention 1。
-- 熟悉 CUDA、准备实现 MLA：FlashAttention 2 → DeepSeek-V2 → DeepSeek-V3 reference。
-- 准备实现 EP：DeepSeekMoE → MPI collective 基础 → NCCL point-to-point/group calls。
-- 准备实现 one-sided EP：已验证的 EP reference → NVSHMEM memory model/ordering/signaling
-  → FlashMoE → 最小双 GPU data/flag 实验。
-- 做性能报告前：CUDA Best Practices → Nsight Compute/Nsight Systems 官方指南。
+- arXiv `2506.04667v2` 使用标题 **FlashDMoE**；`v3` 政名为
+  **FlashMoE**。两个版本及各自中文件均保留，不互相覆盖。
+- BabelDOC 和 ChatGPT/WeasyPrint 生成件仅作为阅读辅助，不作为权威术语来源。
+- FlashAttention-3、ThunderKittens 和 PMPP4 第 20 章中文件属于节译或摘要。
+- PMPP4 中文资料现有第 1–16 章和第 20 章；第 17–19、21–23 章缺失。
+
+## 权威外部资料
+
+- [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
+  与 [CUDA C++ Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)
+- [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+- [NCCL User Guide](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/)
+- [NVSHMEM Memory Model](https://docs.nvidia.com/nvshmem/api/gen/mem-model.html)
+- [FlashAttention 官方实现](https://github.com/Dao-AILab/flash-attention)
+- [FlashMoE 官方实现](https://github.com/osayamenja/FlashMoE)
+
+新增本地资料时，应同步更新 `catalog.md` 和 `manifest.yaml`，记录上游来源、版本、
+翻译状态和权利归属。公开再分发前仍需按单份材料核对许可。
