@@ -1,6 +1,6 @@
 # NEU INFO 7375：High Performance Computing for AI
 
-本目录把 INFO 7375 课程材料、HPC for AI 十一周补充笔记，以及本仓库围绕数学定义、reference、CUDA 接口和验证边界编写的专题讲义放在同一个课程单元中。
+本目录把 INFO 7375 课程材料、HPC for AI 前十周技术补充笔记，以及本仓库围绕数学定义、reference、CUDA 接口和验证边界编写的专题讲义放在同一个课程单元中。
 
 - [课程大纲](syllabus.md)：以官方 PDF 为准，记录课程目标、先修要求、教材、14 周计划与作业组织方式。
 - [英文源文档入口](source/index.en.md)：保留公开补充材料的英文结构化版本。
@@ -8,11 +8,11 @@
 - 集合原始页面：[HPC for AI](https://distinct-capricorn-c04.notion.site/HPC-for-AI-20d88315b6b480538083fbe724df2902)
 - 整理日期：2026-08-17。
 
-> 这是课程资料的仓库快照。课程安排、项目状态、工具版本与岗位链接都可能继续变化，应以原页面及相应官方资料为准。
+> 这是课程技术资料的仓库快照。课程安排、项目状态与工具版本可能继续变化，应以原页面及相应官方资料为准。
 
-## 十一周补充笔记
+## 十周技术补充笔记
 
-这些笔记保留公开 Notion 补充系列的页面顺序，不替代官方 PDF 的 14 周课程安排，也不与其逐周对应。
+这些笔记保留公开 Notion 补充系列前十周技术页面的顺序，不替代官方 PDF 的 14 周课程安排，也不与其逐周对应。非技术主题不纳入本 lab。
 
 | 周次 | 主题 | 学习作用 |
 | --- | --- | --- |
@@ -26,7 +26,6 @@
 | 8 | [数据并行与专家并行](notes/08-data-expert-parallelism.md) | 理解 MoE routing、两次 All-to-All 和 DP/TP/EP 混合数据流。 |
 | 9 | [序列并行与 Ring Attention](notes/09-sequence-parallelism.md) | 学习 blockwise exact attention、K/V 环传输及异步 tile pipeline。 |
 | 10 | [推理系统](notes/10-inference-systems.md) | 连接 prefill/decode、KV cache、PagedAttention 与 continuous batching。 |
-| 11 | [职业能力建设](notes/11-career-building.md) | 通过社区、开源、论文复现、系统练习和岗位分析构建长期能力。 |
 
 ## 专题讲义
 
@@ -60,7 +59,6 @@
 - CUDA/kernel：1 → 2 → 3 → 4 → 5 → 6；
 - 分布式 MoE：1 → 7 → 8；
 - 长上下文与推理：4 → 9 → 10；
-- 完成任一技术路线后阅读第 11 周，把知识转化为复现、开源和持续学习计划；
 - 阅读专题讲义时，先运行 `examples/reference_demo.py`，再手算极小输入、修改 shape 或 mask 让测试失败，最后进入 kernel 优化。
 
 ## 符号约定

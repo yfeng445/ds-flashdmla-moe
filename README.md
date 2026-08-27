@@ -17,6 +17,17 @@ then tested and benchmarked before it becomes part of the supported API.
 The textbook begins with GPU execution, tiled GEMM, memory reuse, and
 producer-consumer pipelines before applying those ideas to attention and MoE.
 
+## Scope
+
+This repository is a pure AI infrastructure lab. It contains technical
+explanations, executable references, native operators, tests, benchmarks, and
+validation evidence.
+
+Interview preparation, resumes, job analysis, personal project pitches, and
+other career material are intentionally out of scope. Implementation claims in
+external notes should be checked against this repository's current code,
+tests, and validation snapshots.
+
 ## Project status
 
 | Area | Reference | Tested | CUDA | Distributed |

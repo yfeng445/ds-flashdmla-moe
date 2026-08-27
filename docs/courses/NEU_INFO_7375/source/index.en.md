@@ -5,13 +5,13 @@
 - Course syllabus: [INFO 7375: High Performance Computing for AI](syllabus.en.md)
 - Chinese collection: [HPC for AI course notes](../index.md)
 
-This directory preserves an English-only structured version of eleven public
-supplemental Notion weekly pages. It retains topic hierarchy, equations, system
+This directory preserves an English-only structured version of the first ten
+technical supplemental Notion weekly pages. It retains topic hierarchy, equations, system
 data flows, assignment directions, and stable references without copying Notion
 interface artifacts, attachments, or temporary download links.
 
 > This is a snapshot prepared on August 17, 2026. Course organization, project
-> status, tool versions, and job links may change; consult the original pages
+> status and tool versions may change; consult the original pages
 > and official sources for current information.
 
 ## Weekly Navigation
@@ -28,16 +28,12 @@ interface artifacts, attachments, or temporary download links.
 | 8 | [Data and Expert Parallelism](notes/08-data-expert-parallelism.en.md) | Explains MoE routing, two All-to-All operations, and hybrid DP, TP, and EP flow. |
 | 9 | [Sequence Parallelism and Ring Attention](notes/09-sequence-parallelism.en.md) | Covers blockwise exact attention, K/V ring rotation, and asynchronous tile pipelines. |
 | 10 | [Inference Systems](notes/10-inference-systems.en.md) | Connects prefill and decode, KV cache, PagedAttention, and continuous batching. |
-| 11 | [Career Building](notes/11-career-building.en.md) | Builds a long-term path through communities, open source, reproduction, systems practice, and job analysis. |
 
 ## Suggested Paths
 
 - CUDA and kernels: 1, 2, 3, 4, 5, 6;
 - distributed MoE: 1, 7, 8;
 - long context and inference: 4, 9, 10;
-- after any technical path, use Week 11 to convert knowledge into reproduction,
-  open-source participation, and a continuing study plan.
-
 These weekly pages preserve the organization of the supplemental Notion
 collection; they are neither a replacement for nor a week-by-week expansion of
 the official PDF's 14-week schedule. The topic chapters elsewhere in the
